@@ -55,5 +55,3 @@ SN3 trains full-precision models on a frozen arch (compression out of scope by d
 ## Migration & timeline
 
 sn40's validator, KOTH statistics, held-out rotation, fraud gates, dashboard, and publishing pipeline all carry over — this is a re-aim of a running system, not a rebuild. Rung 1 (GLM-4-9B, 4-bit + ternary tiers) live within weeks of green light; current miners migrate by pointing their agents at a new objective.
-
-**Ask:** your read on the scoring function and tier structure — and when the first compressed-GLM leaderboard is live, a signal boost.
