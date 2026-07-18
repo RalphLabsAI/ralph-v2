@@ -22,12 +22,34 @@ Rung 2 is the headline: a frontier-class 106B agentic model on a single consumer
 Per bit-tier (1.58 / 2 / 4-bit), king-of-the-hill:
 
 ```
-score = held-out quality (CE + small benchmark suite)     — hard quality floor vs teacher
-gate  = effective-bits audit                              — codebooks, scales, outliers,
-                                                            embeddings all counted; per-tensor
-                                                            cardinality checks kill fake-ternary
-bonus = measured decode tok/s in a pinned container       — real speed, not theoretical
+score = capability retention vs teacher (see covering set) — hard floor, per-domain
+gate  = effective-bits audit                               — codebooks, scales, outliers,
+                                                             embeddings all counted; per-tensor
+                                                             cardinality checks kill fake-ternary
+bonus = measured decode tok/s in a pinned container        — real speed, not theoretical
 ```
+
+## The covering set — the problem that killed distillation KOTH v1
+
+Distillation contests fail when the eval is narrow: students learn the teacher's *style* on
+the eval slice, win on KL/CE, and lose the actual capabilities. v2 therefore never scores
+imitation — it scores **verifiable capability retention**:
+
+- **Multi-domain, verifiable basket** — math with checkable answers, code scored by
+  execution, knowledge QA, long-context retrieval, instruction-following with programmatic
+  checkers. Style cannot pass a unit test.
+- **Per-domain retention ratio** (student/teacher), aggregated by **soft-min** — sacrificing
+  any one capability tanks the score. No domain left behind.
+- **Naive-quantization control** — every candidate must beat a round-to-nearest int4
+  baseline on retention; matching the teacher's tone is worth nothing against the control.
+- **Secret, rotated sampling + fresh items** — domains are public, samples are secret,
+  rotated on schedule, and partly *generated fresh* (seeded item generators +
+  post-training-cutoff documents). This is the exact machinery that caught an
+  eval-memorization king on sn40 in production.
+- **Paraphrase-invariant slice** — a portion of items scored under paraphrase; style
+  mimicry collapses under rewording, capability survives.
+
+KL-to-teacher is kept as a *diagnostic* only. It never enters the score.
 
 Crown moves when a challenger beats the tier king past a noise-floor margin (bootstrap-LCB, same statistics SN3 uses). Emissions split score-proportionally across the Pareto frontier — miners iterate and resubmit continuously; no one-shot registrations, no winner-take-all cliff.
 
