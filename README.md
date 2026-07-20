@@ -8,8 +8,8 @@ downloadable open model.
 **Reference point:** PrismML's Ternary Bonsai showed what one lab gets from 1.58-bit
 models (9× smaller, ~5× faster, HF-trending). v2 makes that a standing market: a
 permissionless swarm doing it to GLM, continuously, producing a *family* of runnable
-open checkpoints — with an anti-gaming design built from the autopsy of the last team
-that tried distillation-KOTH and failed.
+open checkpoints — with an anti-gaming design built from the public lessons of earlier
+distillation-KOTH attempts.
 
 ## Objective
 
@@ -32,11 +32,10 @@ Rung 2 is the headline: a frontier-class 106B agentic model on a single consumer
 
 Distillation contests die when they score *imitation* (KL / distribution-match to the
 teacher): students learn the teacher's **style** — its "let me reconsider…" filler —
-win the metric, and lose the actual capabilities. (This is not hypothetical; see the
-Distil autopsy in [`docs/distil-v1-postmortem.md`](docs/distil-v1-postmortem.md) — a
-KL-winning king that looped one phrase 102× on "hi" and scored *worse than the
-untrained base on 5/5 benchmarks*.) v2 never scores imitation. It scores **verifiable
-capability retention**:
+win the metric, and lose the actual capabilities. (This is not hypothetical; earlier
+distillation subnets documented it in their own public post-mortems — see
+[`docs/prior-art-and-lessons.md`](docs/prior-art-and-lessons.md).) v2 never scores
+imitation. It scores **verifiable capability retention**:
 
 ```
 gate   effective-bits audit        — bits/params/dtype recomputed from the LOADED
@@ -132,10 +131,11 @@ and it fuses three things no other subnet can assemble: a fresh commit-then-gene
 *verifiable* eval, reward-indifference-to-copies (economic, not detection), and a
 tiered family of downloadable artifacts.
 
-## Honest open problems — to prove on testnet before locking
+## Honest open problems — to prove before locking
 
 The design is not claimed solved. Three problems are genuinely open and will be
-prototyped and measured on testnet *before* any public capability claim:
+prototyped and measured on the live subnet in a low-stakes shadow mode *before* any
+public capability claim:
 
 1. **Covering-set breadth / capability laundering.** A miner could distill from a
    smuggled frontier-model corpus and win narrow math/code without truly compressing
@@ -153,5 +153,6 @@ prototyped and measured on testnet *before* any public capability claim:
 
 sn40's validator, KOTH statistics, held-out rotation, fraud gates, bundle encryption,
 dashboard, and signed publishing pipeline all carry over — this is a re-aim of a
-running system, not a rebuild. Rung 1 (GLM-4-9B, one bit tier) prototyped on testnet
-first to settle the open problems above, then mainnet.
+running system, not a rebuild. Rung 1 (GLM-4-9B, one bit tier) ships to the live subnet
+in shadow mode first — scoring runs and the frontier is published, but the open problems
+above are measured and settled before crowns carry full emission weight.
