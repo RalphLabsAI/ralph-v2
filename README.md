@@ -1,12 +1,23 @@
 # SN40 v2 — The Model Compression Subnet
 
-**One line:** miners compete to compress frontier open models — starting with GLM — into low-bit checkpoints that run on hardware people actually own; the best quality-per-bit model wears the crown.
+**One line:** miners compete to compress frontier open models — starting with GLM —
+into low-bit checkpoints that run on hardware people actually own; the best
+capability-per-bit model in each size tier wears a crown, and every crown ships as a
+downloadable open model.
 
-**Reference point:** PrismML's Ternary Bonsai showed what one lab gets from 1.58-bit models (9× smaller, ~5× faster, HF-trending). v2 makes that a standing market: a permissionless swarm doing it to GLM, continuously, with every winner shipped as an open checkpoint.
+**Reference point:** PrismML's Ternary Bonsai showed what one lab gets from 1.58-bit
+models (9× smaller, ~5× faster, HF-trending). v2 makes that a standing market: a
+permissionless swarm doing it to GLM, continuously, producing a *family* of runnable
+open checkpoints — with an anti-gaming design built from the autopsy of the last team
+that tried distillation-KOTH and failed.
 
 ## Objective
 
-Fix a teacher model. Miners submit **student checkpoints** — quantized/distilled versions of the teacher — into per-bit-budget tiers. The validator scores the artifact itself. Nothing about the miner's process needs to be trusted or verified: download the checkpoint, measure it.
+Fix a teacher model. Miners submit **student checkpoints** — quantized/distilled
+versions of the teacher — into size/bit tiers. The validator scores the artifact
+itself on fresh, verifiable tasks. Nothing about the miner's private training process
+is trusted or inspected: download the checkpoint, measure what it can do, measure how
+small and fast it is.
 
 **Teacher ladder** (all MIT-licensed):
 
@@ -17,63 +28,130 @@ Fix a teacher model. Miners submit **student checkpoints** — quantized/distill
 
 Rung 2 is the headline: a frontier-class 106B agentic model on a single consumer GPU.
 
-## Scoring
+## Scoring — capability, not imitation
 
-Per bit-tier (1.58 / 2 / 4-bit), king-of-the-hill:
+Distillation contests die when they score *imitation* (KL / distribution-match to the
+teacher): students learn the teacher's **style** — its "let me reconsider…" filler —
+win the metric, and lose the actual capabilities. (This is not hypothetical; see the
+Distil autopsy in [`docs/distil-v1-postmortem.md`](docs/distil-v1-postmortem.md) — a
+KL-winning king that looped one phrase 102× on "hi" and scored *worse than the
+untrained base on 5/5 benchmarks*.) v2 never scores imitation. It scores **verifiable
+capability retention**:
 
 ```
-score = capability retention vs teacher (see covering set) — hard floor, per-domain
-gate  = effective-bits audit                               — codebooks, scales, outliers,
-                                                             embeddings all counted; per-tensor
-                                                             cardinality checks kill fake-ternary
-bonus = measured decode tok/s in a pinned container        — real speed, not theoretical
+gate   effective-bits audit        — bits/params/dtype recomputed from the LOADED
+                                      state dict, never metadata; serialized-bytes
+                                      after canonical recompression (kills zero-pad,
+                                      sparse-stuffing, fp16-outlier "fake ternary")
+gate   safety + sanity             — safetensors only, no miner *.py (RCE ban),
+                                      anti-finetune probe (grad-explosion / absurd
+                                      norms), degeneracy probe (loop rate / length
+                                      blowup on trivial prompts)
+score  capability on FRESH tasks   — see below
+bonus  measured decode tok/s       — on pinned hardware, plausibility-ceilinged
 ```
 
-## The covering set — the problem that killed distillation KOTH v1
+**The score is downstream capability on freshly-minted, machine-checkable tasks** —
+math with checkable answers, code scored by execution, templated reasoning
+(GSM-Symbolic style, with NoOp distractors), tool-call/format tasks with programmatic
+checkers. Style cannot pass a unit test. Retention is measured *relative to the pinned
+GLM teacher run through the identical harness every round* (a live control row), so
+"retention" means the student kept what the teacher had — not that it maxed a narrow
+benchmark.
 
-Distillation contests fail when the eval is narrow: students learn the teacher's *style* on
-the eval slice, win on KL/CE, and lose the actual capabilities. v2 therefore never scores
-imitation — it scores **verifiable capability retention**:
+**Fresh by construction (commit-then-generate).** The eval items for a round are
+generated *after* the round's checkpoint hashes are committed — from seeded procedural
+generators and post-cutoff documents. There is no static answer key to memorize and
+nothing to harvest; the secret set never exists on a miner-reachable box and is deleted
+after the round. A paraphrase-invariant slice and a stale-vs-fresh diff-in-diff (our
+GPT-2-control method, which caught a real memorization king on sn40) flag any model
+whose gains are benchmark-recovery rather than genuine compression.
 
-- **Multi-domain, verifiable basket** — math with checkable answers, code scored by
-  execution, knowledge QA, long-context retrieval, instruction-following with programmatic
-  checkers. Style cannot pass a unit test.
-- **Per-domain retention ratio** (student/teacher), aggregated by **soft-min** — sacrificing
-  any one capability tanks the score. No domain left behind.
-- **Naive-quantization control** — every candidate must beat a round-to-nearest int4
-  baseline on retention; matching the teacher's tone is worth nothing against the control.
-- **Secret, rotated sampling + fresh items** — domains are public, samples are secret,
-  rotated on schedule, and partly *generated fresh* (seeded item generators +
-  post-training-cutoff documents). This is the exact machinery that caught an
-  eval-memorization king on sn40 in production.
-- **Paraphrase-invariant slice** — a portion of items scored under paraphrase; style
-  mimicry collapses under rewording, capability survives.
+## Anti-gaming — economics, not detection
 
-KL-to-teacher is kept as a *diagnostic* only. It never enters the score.
+The last team proved you **cannot detect** copying on a shared public base — every
+fingerprint detector either failed on legit fine-tunes or got weaponized. v2 makes
+copying and gaming *unprofitable* instead:
 
-Crown moves when a challenger beats the tier king past a noise-floor margin (bootstrap-LCB, same statistics SN3 uses). Emissions split score-proportionally across the Pareto frontier — miners iterate and resubmit continuously; no one-shot registrations, no winner-take-all cliff.
+- **Tiered multi-slot king-of-the-hill.** One crown per size/bit tier (e.g. sub-1B /
+  sub-3B / sub-7B, or 1.58 / 2 / 4-bit). Within a tier the ranking is a **total
+  order** (capability retention above the effective-bits gate) — no undefined
+  "Pareto partial order" stalls. Across tiers you get a downloadable *family*.
+- **A copy earns nothing.** Dethroning requires being *strictly better* — higher
+  retention at equal-or-smaller budget, past a margin **well above the noise floor**
+  (bootstrap-LCB, paired against the incumbent on the same fresh items). A copy of the
+  king ties; a tie pays zero; micro-shaving is below the margin. No detector to evade.
+- **Margin over a naive-quant control.** Emission share ∝ (retention − round-to-nearest
+  baseline at that budget). Shipping the obvious quantization, or a copy of it, has
+  ~zero expected value; every emitted TAO is attached to demonstrated algorithmic delta.
+- **First-committer-owns-hash + delayed reveal.** Sealed commit-then-reveal (Ralph's
+  X25519 bundle encryption); the winning artifact publishes only after a delay window,
+  so the live king isn't copyable mid-round; the earliest on-chain commit of a given
+  content hash wins, which DQs the *later* committer only (no griefing).
+- **Anti-grind economics** (the only defenses that held for the last team):
+  one-eval-per-registration, a per-coldkey round cap, and a bond/fee for extra
+  submissions *refunded when the submission improves the miner's own best* — spam and
+  best-of-N crown-farming become strictly unprofitable; honest iteration stays cheap.
+- **Never-shrink ratchet + headroom pay.** The retention floor only rises; payout
+  scales with distance above it, so a saturated tier self-retires (emission migrates to
+  unsaturated tiers) instead of Goodharting on noise.
 
-## Why it can't be gamed (short version)
+## Where confidential compute fits (and where it doesn't)
 
-All scoring machinery is running today on sn40 and has caught real fraud in production:
-- **Secret, rotated held-out sets** + control-model diff-in-diff — caught an eval-memorization king in July; neighbors evaluating on public corpora are exposed to exactly this.
-- **Throughput plausibility ceiling** (hardware-calibrated MFU bound) — caught a forged-wall-clock king in July.
-- **Effective-bits audit** — a "ternary" model smuggling fp16 outliers fails intake.
-- And because students are small, **anyone can re-run the scoring** on one modest GPU — every verdict is independently checkable, and the full history renders live at ralphlabs.ai.
+We asked the hard question directly and researched it: **CC-attested proof bundles do
+NOT solve the gaming problem.** They prove *computational integrity* — that the
+official eval ran on real hardware over a sealed set — but an attested run of a
+gameable objective just faithfully certifies a gamed model. And miner-run CC is a trap:
+the miner owns the box, so "sealed from the miner" is outside the hardware vendor's
+threat model (enclave memory is extractable by the box owner), and miner-run eval would
+delete the one-eval-per-registration defense.
 
-A kernel track (sandboxed miner-submitted CUDA/Triton, correctness-gated against the dequantized reference) makes the speed numbers real — low-bit is only fast with real kernels, so kernels are part of the competition.
-
-## Positioning vs the family
-
-SN3 trains full-precision models on a frozen arch (compression out of scope by design). SN97 fine-tunes a fixed 35B, quantization banned. SN120 runs RL environments on full-size students. **Nobody in the ecosystem owns the efficiency axis.** v2 is the missing quadrant: same proven KOTH shell, competing on quality-per-bit.
+So the core eval is **validator-side** — which is cheap *because the students are
+small* (that is exactly what structurally fixes the eval-economics death that bankrupted
+the last attempt). CC has one honest, optional role: **phase-2 throughput
+attestation** — proving "this student really runs this fast on genuine hardware," a
+non-forgeable version of the tok/s bonus, which reuses Ralph's existing TDX+H100-CC
+stack. Nice-to-have, not the security foundation.
 
 ## Deliverables & narrative
 
-- Every crowned king ships as an **open runnable checkpoint** (safetensors + GGUF) on HF, Apache-2.0/MIT.
-- Public leaderboard: quality-per-bit Pareto frontier, live at ralphlabs.ai.
+- Every crowned king ships as an **open runnable checkpoint** (safetensors + GGUF) on
+  HF, Apache-2.0/MIT — a *family* across tiers, not one model.
+- Public leaderboard: capability-per-bit frontier, live at ralphlabs.ai, every verdict
+  independently re-runnable on one modest GPU (signed audit trail).
 - Standing demo: **"run the king"** — this week's best compressed GLM, on your laptop.
-- Recurring headline, on tap with every crown: *"Bittensor's swarm just compressed GLM another X% with no quality loss."*
+- Recurring headline, on tap with every crown: *"Bittensor's swarm just put a
+  frontier-class model on your laptop / phone."*
+
+## Positioning vs the family
+
+SN3 trains full-precision models on a frozen arch (compression out of scope by design).
+SN97 fine-tunes a fixed 35B, quantization banned. SN120 runs RL environments on
+full-size students. **Nobody owns the efficiency axis.** v2 is the missing quadrant —
+and it fuses three things no other subnet can assemble: a fresh commit-then-generate
+*verifiable* eval, reward-indifference-to-copies (economic, not detection), and a
+tiered family of downloadable artifacts.
+
+## Honest open problems — to prove on testnet before locking
+
+The design is not claimed solved. Three problems are genuinely open and will be
+prototyped and measured on testnet *before* any public capability claim:
+
+1. **Covering-set breadth / capability laundering.** A miner could distill from a
+   smuggled frontier-model corpus and win narrow math/code without truly compressing
+   GLM. Only eval *breadth* plus teacher-relative retention defeats it. The honest
+   promise is **"verifiable retention of checkable capability,"** not "broad
+   capability" — the state of the art forces this tradeoff, and we will not overclaim.
+2. **Dethrone margin vs noise.** The strict-improvement margin must sit well above
+   measurement noise, or micro-shaving flips crowns. Calibrate empirically.
+3. **Eval-cost scaling.** As the covering set widens, run a tiered cheapest-first
+   funnel (bits audit → safety/degeneracy → small slice → full suite only for
+   survivors); GLM must stay validator-hostable — never a cloud-API dependency in the
+   scoring path.
 
 ## Migration & timeline
 
-sn40's validator, KOTH statistics, held-out rotation, fraud gates, dashboard, and publishing pipeline all carry over — this is a re-aim of a running system, not a rebuild. Rung 1 (GLM-4-9B, 4-bit + ternary tiers) live within weeks of green light; current miners migrate by pointing their agents at a new objective.
+sn40's validator, KOTH statistics, held-out rotation, fraud gates, bundle encryption,
+dashboard, and signed publishing pipeline all carry over — this is a re-aim of a
+running system, not a rebuild. Rung 1 (GLM-4-9B, one bit tier) prototyped on testnet
+first to settle the open problems above, then mainnet.
