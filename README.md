@@ -13,11 +13,17 @@ distillation-KOTH attempts.
 
 ## Objective
 
-Fix a teacher model. Miners submit **student checkpoints** — quantized/distilled
-versions of the teacher — into size/bit tiers. The validator scores the artifact
-itself on fresh, verifiable tasks. Nothing about the miner's private training process
-is trusted or inspected: download the checkpoint, measure what it can do, measure how
-small and fast it is.
+Fix a **(teacher, permitted student-base) pair**. Miners submit **student
+checkpoints** — quantized/distilled versions of the teacher — into size/bit tiers. The
+validator scores the artifact itself on fresh, verifiable tasks. Nothing about the
+miner's private training process is trusted or inspected: download the checkpoint,
+measure what it can do, measure how small and fast it is.
+
+The pair is pinned, not just the teacher, because **match beats strength**: OpenThoughts
+([arXiv:2506.04178](https://arxiv.org/abs/2506.04178), Table 8) found QwQ-32B a better
+teacher than DeepSeek-R1 *in every domain* despite being the weaker model — "models with
+better performance are not necessarily better teachers." Leaving the pairing to miners
+would make our teacher choice, not miner skill, the dominant term in every score.
 
 **Teacher ladder** (all MIT-licensed):
 
@@ -46,17 +52,46 @@ gate   safety + sanity             — safetensors only, no miner *.py (RCE ban)
                                       anti-finetune probe (grad-explosion / absurd
                                       norms), degeneracy probe (loop rate / length
                                       blowup on trivial prompts)
-score  capability on FRESH tasks   — see below
+gate   pass@16 >= base             — mode-collapse detector; pass@1 alone cannot see it
+score  capability on FRESH tasks   — normalized retention, per compute (see below)
 bonus  measured decode tok/s       — on pinned hardware, plausibility-ceilinged
 ```
+
+**No KL in the reward. Any KL you like in your trainer.** Scoring never uses
+distribution-match, logit-matching or an LLM judge — but nothing stops a miner training
+with reverse-KL on-policy distillation, and they should: Qwen3
+([arXiv:2505.09388](https://arxiv.org/abs/2505.09388), Table 21) beat RL on *every*
+metric at 1,800 GPU-hours versus 17,920. Banning imitation as a **method** would outlaw
+the state of the art; we only refuse to **pay** for it.
+
+**pass@16 is a gate, not a weighted term.** A student can lift pass@1 while pass@k stays
+flat or drops — capability sharpening that reads as progress
+([arXiv:2505.14216](https://arxiv.org/abs/2505.14216): "RLVR enhances overall accuracy
+(pass@1) but often fails to improve capability (pass@k)"). Fail the gate, no crown,
+regardless of score.
 
 **The score is downstream capability on freshly-minted, machine-checkable tasks** —
 math with checkable answers, code scored by execution, templated reasoning
 (GSM-Symbolic style, with NoOp distractors), tool-call/format tasks with programmatic
-checkers. Style cannot pass a unit test. Retention is measured *relative to the pinned
-GLM teacher run through the identical harness every round* (a live control row), so
-"retention" means the student kept what the teacher had — not that it maxed a narrow
-benchmark.
+checkers. Style cannot pass a unit test.
+
+Per axis, retention is **normalized against the pinned pair** —
+`(student − base) / (teacher − base)` — so an axis where the base already scores well
+can't be farmed for headroom it never had. Axes aggregate by **worst-domain soft-min**:
+sacrificing any one capability to buy another tanks the score. The per-axis cap is
+**1.25, not 1.0** — a hard 1.0 makes the crown undecidable the moment two miners reach
+teacher parity, and beating the teacher is the interesting case, not an error. Negative
+retention on any axis is an automatic reject.
+
+**Capability per compute — the denominator is part of the score.** Efficiency is the
+differentiator, so it has to be measured, and measured whole. Teacher *generation*
+compute is the same order as student *training* compute — OpenThinker3-7B took ~22,000
+H100-hours generating traces against ~25,000 A100-hours training the student — so a
+metric that meters only the training step measures under half the real cost and is
+trivially gamed by pushing effort offline into teacher sampling. The budget counts
+`teacher generation + student training + teacher scoring + rollout` FLOPs in normalized
+H100-hours, **per registration, including runs the miner discarded**. Undeclared compute
+is fraud, not an error: it forfeits the bond.
 
 **Fresh by construction (commit-then-generate).** The eval items for a round are
 generated *after* the round's checkpoint hashes are committed — from seeded procedural
@@ -148,6 +183,13 @@ public capability claim:
    funnel (bits audit → safety/degeneracy → small slice → full suite only for
    survivors); GLM must stay validator-hostable — never a cloud-API dependency in the
    scoring path.
+4. **Compute accounting is self-declared at the edges.** The budget is enforceable
+   where it can be reconciled — declared generation tokens against the published
+   throughput envelope, and re-derivation of a sampled slice against the pinned
+   teacher. Beyond that it rests on the bond, not on detection. Closed-teacher use is
+   deterred by cost-of-proof, not caught by a classifier: stylistic and
+   response-similarity signals are all defeated by paraphrasing traces through the
+   pinned open teacher, and we would rather say so than imply a detector we don't have.
 
 ## Migration & timeline
 
