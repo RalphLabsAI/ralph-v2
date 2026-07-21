@@ -188,3 +188,83 @@ def score_student(rollouts: Sequence[Rollout], glm: ModelRunner, student: ModelR
         "self_state": mean(on), "n_self": len(on),
         "points": off + on,
     }
+
+
+# --------------------------------------------------------------------------
+# Round-level: fixed points + cached GLM references (paired scoring)
+# --------------------------------------------------------------------------
+# Every submission AND the reigning king are scored on the SAME sampled points in a
+# round. That gives exact per-point pairing (for the dethrone-on-margin test) and lets
+# GLM's step + the judge's checks be computed ONCE per point and reused across all
+# miners — the amortization that keeps validator cost bounded.
+
+@dataclass(frozen=True)
+class EvalPoint:
+    rollout_idx: int
+    k: int
+    mode: str  # "teacher_state" | "self_state"
+
+
+@dataclass
+class PointRef:
+    """GLM's reference behavior at a point, computed once per round."""
+    point: EvalPoint
+    teacher_prefix: str        # the prefix both are scored from (teacher-state)
+    glm_step: str
+    checks: list = field(default_factory=list)   # rubric checks, judge-dependent
+
+
+def sample_points(experience: Sequence[Rollout], n: int, self_frac: float, seed: int) -> list[EvalPoint]:
+    import random
+    rng = random.Random(seed)
+    usable = [i for i, r in enumerate(experience) if len(r.steps) >= 2]
+    pts: list[EvalPoint] = []
+    for _ in range(n):
+        ri = rng.choice(usable)
+        k = rng.randint(1, len(experience[ri].steps) - 1)
+        mode = "self_state" if rng.random() < self_frac else "teacher_state"
+        pts.append(EvalPoint(ri, k, mode))
+    return pts
+
+
+def prepare_refs(points: Sequence[EvalPoint], experience: Sequence[Rollout],
+                 glm: ModelRunner, judge: StepJudge, max_new_tokens: int = 512) -> list[PointRef]:
+    """Compute GLM's step + rubric checks per point, once. Self-state points defer the
+    prefix to scoring time (it depends on the student), so only teacher-state refs are
+    fully cached here; self-state caches just GLM's checks-from-its-own-step later."""
+    refs: list[PointRef] = []
+    for p in points:
+        r = experience[p.rollout_idx]
+        if p.mode == "teacher_state":
+            prefix = r.prefix(p.k)
+            glm_step = glm.generate([prefix], max_new_tokens)[0]
+            checks = judge.make_checks(prefix, glm_step) if isinstance(judge, RubricJudge) else []
+            refs.append(PointRef(p, prefix, glm_step, checks))
+        else:
+            refs.append(PointRef(p, "", "", []))  # filled per-student at scoring time
+    return refs
+
+
+def score_on_points(points: Sequence[EvalPoint], refs: Sequence[PointRef],
+                    experience: Sequence[Rollout], glm: ModelRunner, student: ModelRunner,
+                    judge: StepJudge, max_new_tokens: int = 512) -> list[StepPoint]:
+    """Score one student on the fixed round points, reusing cached teacher-state refs."""
+    out: list[StepPoint] = []
+    for p, ref in zip(points, refs):
+        r = experience[p.rollout_idx]
+        if p.mode == "teacher_state":
+            student_step = student.generate([ref.teacher_prefix], max_new_tokens)[0]
+            if isinstance(judge, RubricJudge) and ref.checks:
+                agr = judge.grade(ref.teacher_prefix, ref.checks, student_step)
+            else:
+                agr = judge.agreement(ref.teacher_prefix, ref.glm_step, student_step)
+        else:
+            # self-state: student builds its own prefix, GLM acts in that state
+            sp = r.context
+            for _ in range(p.k):
+                sp = sp + "\n" + student.generate([sp], max_new_tokens)[0]
+            glm_here = glm.generate([sp], max_new_tokens)[0]
+            student_here = student.generate([sp], max_new_tokens)[0]
+            agr = judge.agreement(sp, glm_here, student_here)
+        out.append(StepPoint(r.id, p.k, p.mode, agr))
+    return out

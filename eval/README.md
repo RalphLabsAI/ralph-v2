@@ -57,3 +57,56 @@ score) — it is set by the weakest axis, by design.
   with measured per-axis pass rates
 - add instruction-following (programmatic checkers) and long-context axes
 - calibrate difficulty so the teacher sits near its saturation frontier
+
+---
+
+# Subnet core (the round engine)
+
+The mechanism is **const's trajectory step-agreement**: score a student by how much of
+what GLM does at a step the student also does, sampled over (rollout, step) pairs from a
+large experience pile. No fixed test set, no RL env on the validator. See `trajectory.py`
+and the `teacher_state` / `self_state` note there.
+
+```
+python -m eval.sim_round     # full KOTH loop, simulated end-to-end on CPU
+```
+
+| file | role |
+|---|---|
+| `trajectory.py` | the eval substrate: sample points, cache GLM references once, score a student (paired) |
+| `koth.py` | tournament state machine: per-tier kings, **dethrone on bootstrap-LCB margin**, weights |
+| `round_engine.py` | one full round: points → refs → score every submission + the reigning king on the same points → crown → weights |
+| `sim_round.py` | multi-round proof of the dynamics |
+
+## Loop result
+
+```
+round 1: crown     king=m_good    (open throne -> best challenger)
+round 2: hold      margin_lcb=+0.000   (an EXACT copy ties -> no dethrone)
+round 3: dethrone  margin_lcb=+0.072   (a genuine improvement clears the margin)
+weights track the crown throughout
+```
+
+The `+0.000` is the anti-copy property, rigorously: the reigning king is re-scored every
+round on the same fresh points, an identical checkpoint produces identical per-point
+agreement, the paired difference is exactly zero, and zero clears no margin. No detector,
+no fingerprint — copying is simply unprofitable. Genuine improvement past the noise floor
+is the only way to dethrone.
+
+## What's built vs what remains
+
+Built and CPU-runnable: the full scoring + tournament + weight loop, model access behind
+a `ModelRunner` interface so it runs against a real pinned GLM on a GPU box unchanged.
+
+Remaining (wraps this core, reuses Ralph's existing validator):
+- chain I/O — read commitments, set weights, publish the signed round record
+- real pinned GLM teacher + rotated rubric judge on a GPU (replaces the sim models)
+- compute metering reconciliation (declared vs throughput envelope), the bond
+- the experience pile — real agentic rollouts, salted with degraded states
+
+## Superseded (kept for reference)
+
+`axes/math_gsm.py`, `axes/code_exec.py`, `adversarial.py`, `provenance.py` are the earlier
+task-set / covering-eval approach. The mechanism moved to trajectory step-agreement, which
+makes covering + provenance structural rather than bolted-on. `scoring.py` (normalized
+retention, worst-domain soft-min, bootstrap-LCB) carries over unchanged and sits under both.
