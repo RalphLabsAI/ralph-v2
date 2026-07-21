@@ -110,3 +110,37 @@ Remaining (wraps this core, reuses Ralph's existing validator):
 task-set / covering-eval approach. The mechanism moved to trajectory step-agreement, which
 makes covering + provenance structural rather than bolted-on. `scoring.py` (normalized
 retention, worst-domain soft-min, bootstrap-LCB) carries over unchanged and sits under both.
+
+---
+
+# First real-model run (H100, ~$2)
+
+Qwen2.5-7B as teacher + judge, 0.5B base, 3B & 1.5B students as stand-ins. Goal: does the
+mechanism work outside simulation? `python -m eval.gpu_run`.
+
+**Results / findings:**
+1. **Pipeline runs end-to-end on real models** — teacher, grounded judge, base, students,
+   the full round + KOTH loop complete on real inference. (c) validated.
+2. **The grounded judge works** — genuine YES/NO, discriminating (not rubber-stamping):
+   it says NO when a candidate step does something different, YES when it matches.
+3. **Segmentation is the #1 practical requirement** (the real finding). Naive line-based
+   splitting turned steps into bare markdown headers (`2. **Calculate the average:**`),
+   so a student continuing the header with actual content always "mismatched" → retention
+   collapsed to ~0. Fixed to content-bearing semantic steps (`rollouts_gen._split_steps`).
+   After the fix, discrimination appears: **3B student agrees with teacher steps 100%,
+   0.5B base 73%** — real capability separation, judge-verified.
+4. **Exposure-bias signal is visible even here**: full-run retention 0.519 sits below the
+   teacher-state ceiling because the self-state axis (student's own prefix) drags the
+   worst-domain soft-min down — the on-policy gap is real, faintly, even on easy tasks.
+
+**Honest limits of this run:** grade-school tasks are too easy to separate a 3B from a
+1.5B (both ceiling on teacher-state → identical 0.519); n=48 points makes the Wilson lower
+bound very conservative; judge == teacher (self-preference not controlled). **Next run:**
+harder tasks (competition math / real agentic rollouts), more points, a distinct judge
+model, and a genuinely distilled-vs-drifter student pair to measure the real exposure-bias
+gap. Raw logs in `runs/` (gitignored).
+
+**Takeaway:** the mechanism works on real models and discriminates capability. Its
+validity hinges on trajectory segmentation quality — agentic rollouts (the intended
+source) have natural step boundaries; reasoning CoT needs semantic chunking, not line
+splits. Better to learn that here than in production.

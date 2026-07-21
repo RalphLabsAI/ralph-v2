@@ -28,15 +28,46 @@ TASKS = [
 ]
 
 
-def _split_steps(text: str, max_steps: int = 8) -> list[str]:
-    """Split a solution into ordered steps. Prefer numbered/step markers; fall back to
-    non-trivial lines, then sentences."""
-    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) > 3]
-    numbered = [ln for ln in lines if re.match(r"^(step\s*\d+|[0-9]+[.)])", ln, re.I)]
-    steps = numbered or lines
+_MARKER = re.compile(r"^\s*(step\s*\d+\b|[0-9]+[.)]|#{1,6}\s|\*\*)", re.I)
+
+
+def _split_steps(text: str, max_steps: int = 8, min_chars: int = 25) -> list[str]:
+    """Split a solution into CONTENT-BEARING steps.
+
+    A step marker (numbered / "Step N" / heading / bold) opens a step that includes
+    everything up to the NEXT marker — so each step carries its actual reasoning, not a
+    bare header (a header alone can't be locally compared: the student continues it with
+    content, and 'content vs header' always mismatches). Falls back to paragraph blocks,
+    then sentence groups, and merges any fragment shorter than `min_chars` into the next.
+    """
+    lines = text.splitlines()
+    blocks, cur = [], []
+    for ln in lines:
+        if _MARKER.match(ln) and cur and any(c.strip() for c in cur):
+            blocks.append("\n".join(cur).strip())
+            cur = [ln]
+        else:
+            cur.append(ln)
+    if cur:
+        blocks.append("\n".join(cur).strip())
+    steps = [b for b in blocks if b]
+
+    if len(steps) < 2:  # no markers — paragraphs, then sentence pairs
+        steps = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) > min_chars]
     if len(steps) < 2:
-        steps = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 8]
-    return steps[:max_steps]
+        sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        steps = ["\n".join(sents[i:i + 2]) for i in range(0, len(sents), 2)]
+
+    # merge too-short fragments forward so every step has real content to compare
+    merged: list[str] = []
+    for s in steps:
+        if merged and len(s) < min_chars:
+            merged[-1] = merged[-1] + " " + s
+        elif merged and len(merged[-1]) < min_chars:
+            merged[-1] = merged[-1] + " " + s
+        else:
+            merged.append(s)
+    return merged[:max_steps]
 
 
 def generate_experience(teacher: ModelRunner, n: int | None = None,
