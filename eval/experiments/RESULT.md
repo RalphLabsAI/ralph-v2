@@ -33,3 +33,21 @@ into `../trajectory.py` on a GPU box (pinned GLM teacher + a rotated rubric judg
 **What it does NOT prove yet.** That real compressed GLM students actually exhibit this
 gap, and how large it is. That is the GPU experiment: run the harness against GLM with
 a known-good distill vs a known-drifting one and measure the real off/on divergence.
+
+## How this folds into the build (decision — not a debate to send)
+
+The mechanism is const's trajectory step-agreement, unchanged: sample states from a
+large experience pile, GLM takes its genuine next step, compare — no envs on the
+validator. This result is an internal refinement, not a counter-argument:
+
+- Default scoring stays **teacher-state** (prefix from the experience pile). Cheap,
+  cacheable across miners, no execution.
+- The experience pile is **salted with degraded / varied-quality states** so recovery
+  is exercised without any rollout.
+- A **self-state slice** (student builds its own prefix) is sampled only where env cost
+  is low (reasoning traces, where it's just generation).
+- Whether the salt alone suffices or the self-state slice is needed is **empirical** —
+  measured on the real GLM run, not decided in advance.
+
+Labels in `trajectory.py` use `teacher_state` / `self_state` (not "off/on-policy") to
+avoid colliding with the RL sense of those words.

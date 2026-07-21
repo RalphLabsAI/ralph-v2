@@ -5,16 +5,28 @@ sampled over (rollout, step) pairs. No fixed test set: the rollouts are the eval
 they are infinite and self-labeling, and the label is GLM's own step. This is the
 substrate; the retention/KOTH/margin scoring in scoring.py sits on top unchanged.
 
-Two evaluation modes, and the whole point of running both:
+The eval never needs an environment on the validator: sample states from a large
+fixed pile of experience, have GLM take its genuine next step, compare. The two modes
+below differ only in WHICH STATES the student is scored from.
 
-  OFF-POLICY (const's original): prefix 0->K is GLM's real trajectory. Both models
-    generate K->K+1 from GLM's context. Dense and cheap — GLM's step and the judge's
-    questions cache once per round and amortize across every miner.
+  TEACHER-STATE (the default): prefix 0->K comes from the experience pile (GLM / strong-
+    model trajectories). Both models generate K->K+1 from that context. Dense and cheap
+    — GLM's step and the judge's questions cache once per round and amortize across
+    every miner.
 
-  ON-POLICY (the addition): the STUDENT generates the prefix 0->K itself, then we ask
-    whether, in the state the student actually reached, it did what GLM would do here.
-    Catches the exposure-bias drift that teacher-forcing cannot see — the failure mode
-    that collapsed the previous distillation subnet (see experiments/exposure_bias.py).
+  SELF-STATE (a sampled slice): the student builds the prefix 0->K itself, then we ask
+    whether, in the state it actually reached, it did what GLM would do here. Scoring
+    only from teacher-states cannot see a student that imitates well from good states
+    but compounds errors from its own — measured in experiments/exposure_bias.py, and
+    the failure that collapsed the previous distillation subnet.
+
+IMPLEMENTATION DECISION (state coverage). Self-state prefixes are free for reasoning
+traces (pure generation) but need tool execution for agentic traces — the env cost the
+design deliberately avoids. So: (a) keep teacher-state as the cheap default; (b) salt
+the experience pile with degraded / varied-quality states so recovery-from-bad-states
+is exercised without any rollout; (c) sample a self-state slice only where env cost is
+low. Which of (b)/(c) is sufficient is empirical — settle it on a real GLM run, not in
+advance.
 
 Judge is grounded local comparison, never open-ended quality: "GLM did X here; did the
 student also do X?" anchored to a fresh reference GLM produced one step ago. Keep the
@@ -115,7 +127,7 @@ class SimJudge:
 class StepPoint:
     rollout_id: str
     k: int
-    mode: str            # "off_policy" | "on_policy"
+    mode: str            # "teacher_state" | "self_state"
     agreement: float
     meta: dict = field(default_factory=dict)
 
@@ -128,7 +140,7 @@ def off_policy_point(rollout: Rollout, k: int, glm: ModelRunner, student: ModelR
     prefix = rollout.prefix(k)
     glm_step = cached_glm_step or glm.generate([prefix], max_new_tokens)[0]
     student_step = student.generate([prefix], max_new_tokens)[0]
-    return StepPoint(rollout.id, k, "off_policy",
+    return StepPoint(rollout.id, k, "teacher_state",
                      judge.agreement(prefix, glm_step, student_step),
                      {"cached": cached_glm_step is not None})
 
@@ -144,7 +156,7 @@ def on_policy_point(rollout: Rollout, k: int, glm: ModelRunner, student: ModelRu
         student_prefix = student_prefix + "\n" + nxt
     glm_here = glm.generate([student_prefix], max_new_tokens)[0]      # what GLM would do in the student's state
     student_here = student.generate([student_prefix], max_new_tokens)[0]
-    return StepPoint(rollout.id, k, "on_policy",
+    return StepPoint(rollout.id, k, "self_state",
                      judge.agreement(student_prefix, glm_here, student_here), {})
 
 
@@ -172,7 +184,7 @@ def score_student(rollouts: Sequence[Rollout], glm: ModelRunner, student: ModelR
                 off.append(off_policy_point(r, k, glm, student, judge))
     mean = lambda xs: sum(p.agreement for p in xs) / len(xs) if xs else 0.0
     return {
-        "off_policy": mean(off), "n_off": len(off),
-        "on_policy": mean(on), "n_on": len(on),
+        "teacher_state": mean(off), "n_teacher": len(off),
+        "self_state": mean(on), "n_self": len(on),
         "points": off + on,
     }
