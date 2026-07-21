@@ -22,12 +22,13 @@ class HFRunner:
 
     def __init__(self, model_id: str, device: str = "auto", dtype: str = "bfloat16",
                  revision: str | None = None, name: str | None = None,
-                 trust_remote_code: bool = False):
+                 trust_remote_code: bool = False, batch_size: int = 8):
         self.model_id = model_id
         self.revision = revision
         self.name = name or model_id
         self._device, self._dtype = device, dtype
         self._trust = trust_remote_code   # OK for OUR pinned teacher/judge; never for miner output
+        self._batch_size = batch_size
         self._model = None
         self._tok = None
 
@@ -41,28 +42,39 @@ class HFRunner:
         if self.revision:
             kw["revision"] = self.revision
         self._tok = AutoTokenizer.from_pretrained(self.model_id, **kw)
+        # decoder-only generation requires LEFT padding so the newest token is at the
+        # right edge for every row; batched greedy decode is otherwise misaligned.
+        self._tok.padding_side = "left"
+        if self._tok.pad_token_id is None:
+            self._tok.pad_token = self._tok.eos_token
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_id, dtype=getattr(torch, self._dtype), device_map=self._device, **kw
         )
         self._model.eval()
 
+    def _render(self, prompt: str) -> str:
+        try:
+            return self._tok.apply_chat_template(
+                [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+        except Exception:
+            return prompt
+
     def generate(self, prompts: Sequence[str], max_new_tokens: int = 512) -> list[str]:
         self._load()
         import torch
 
+        texts = [self._render(p) for p in prompts]
         outs: list[str] = []
-        for p in prompts:
-            msgs = [{"role": "user", "content": p}]
-            try:
-                text = self._tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-            except Exception:
-                text = p
-            enc = self._tok(text, return_tensors="pt").to(self._model.device)
+        for i in range(0, len(texts), self._batch_size):
+            batch = texts[i:i + self._batch_size]
+            enc = self._tok(batch, return_tensors="pt", padding=True, truncation=False).to(self._model.device)
             with torch.no_grad():
                 # greedy: scoring must be reproducible
                 gen = self._model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
-                                           pad_token_id=self._tok.eos_token_id)
-            outs.append(self._tok.decode(gen[0][enc["input_ids"].shape[1]:], skip_special_tokens=True))
+                                           pad_token_id=self._tok.pad_token_id)
+            # left-padded -> every row's prompt ends at the same column; slice uniformly
+            new = gen[:, enc["input_ids"].shape[1]:]
+            outs.extend(self._tok.batch_decode(new, skip_special_tokens=True))
         return outs
 
 
@@ -207,6 +219,9 @@ class SafeStudentRunner(HFRunner):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         # use_safetensors=True forces the safetensors path even if other files exist
         self._tok = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=False)
+        self._tok.padding_side = "left"   # batched decoder generation, see HFRunner._load
+        if self._tok.pad_token_id is None:
+            self._tok.pad_token = self._tok.eos_token
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_id, dtype=getattr(torch, self._dtype), device_map=self._device,
             trust_remote_code=False, use_safetensors=True)
