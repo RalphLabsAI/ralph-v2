@@ -81,12 +81,15 @@ def _collate(tok, examples, max_len: int):
 
 def distill_student(student_base: str, examples: list[SFTExample], output_dir: str,
                     epochs: int = 3, lr: float = 1e-5, batch_size: int = 8,
-                    max_len: int = 1024, dtype: str = "bfloat16", seed: int = 0,
+                    max_len: int = 1024, dtype: str = "float32", seed: int = 0,
                     log=print) -> str:
     """Full-parameter SFT of `student_base` on the teacher-step targets; save safetensors.
 
     Full FT (not LoRA) so the saved checkpoint is a standalone model that loads through
-    SafeStudentRunner with no adapter merge step — exactly what a miner submits.
+    SafeStudentRunner with no adapter merge step — exactly what a miner submits. Trains
+    in fp32 (a sub-1B model leaves the 80GB box idle, and fp32 AdamW is far more stable
+    than bf16 master weights on a from-scratch SFT). Frees VRAM on exit so several
+    trainings run back-to-back without accumulating to an OOM.
     """
     import random
     import torch
@@ -97,9 +100,9 @@ def distill_student(student_base: str, examples: list[SFTExample], output_dir: s
     tok = AutoTokenizer.from_pretrained(student_base)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        student_base, dtype=getattr(torch, dtype), device_map="cuda")
-    model.gradient_checkpointing_enable()
+    model = AutoModelForCausalLM.from_pretrained(student_base, dtype=getattr(torch, dtype))
+    model.to("cuda")
+    model.config.use_cache = False
     model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
@@ -121,7 +124,10 @@ def distill_student(student_base: str, examples: list[SFTExample], output_dir: s
             running += out.loss.item()
         log(f"  epoch {ep+1}/{epochs}  mean_loss={running / max(1, steps_per_epoch):.4f}")
 
+    model.config.use_cache = True
     model.save_pretrained(output_dir, safe_serialization=True)
     tok.save_pretrained(output_dir)
     log(f"  saved -> {output_dir}")
+    del model, opt
+    torch.cuda.empty_cache()
     return output_dir
