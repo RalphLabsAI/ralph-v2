@@ -1,1 +1,4 @@
 eval/runs/
+__pycache__/
+*.pyc
+.env

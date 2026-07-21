@@ -179,3 +179,35 @@ class SimNaiveQuant(SimOracle):
     def __init__(self, items_by_prompt, teacher_acc: float = 0.85, ratio: float = 0.55,
                  seed: int = 5, name: str = "naive-quant-control(sim)"):
         super().__init__(items_by_prompt, accuracy=teacher_acc * ratio, seed=seed, name=name)
+
+
+class SafeStudentRunner(HFRunner):
+    """HFRunner locked down for UNTRUSTED miner checkpoints — defense in depth beyond
+    the intake file-gate. Refuses to load anything but safetensors, forces
+    trust_remote_code=False, and rejects a checkpoint dir containing forbidden files at
+    construction time (never reaches from_pretrained if a pickle/.py is present)."""
+
+    def __init__(self, ckpt_dir: str, device: str = "auto", dtype: str = "bfloat16",
+                 name: str | None = None):
+        from pathlib import Path
+        from .gates import FORBIDDEN_FILES
+        d = Path(ckpt_dir)
+        bad = [p.name for p in d.rglob("*") if p.is_file() and p.suffix.lower() in FORBIDDEN_FILES]
+        if bad:
+            raise ValueError(f"refusing to load: forbidden files present {bad}")
+        if not list(d.rglob("*.safetensors")):
+            raise ValueError("refusing to load: no safetensors weights")
+        super().__init__(str(d), device=device, dtype=dtype,
+                         name=name or f"student:{d.name}", trust_remote_code=False)
+
+    def _load(self):
+        if self._model is not None:
+            return
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        # use_safetensors=True forces the safetensors path even if other files exist
+        self._tok = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=False)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_id, dtype=getattr(torch, self._dtype), device_map=self._device,
+            trust_remote_code=False, use_safetensors=True)
+        self._model.eval()
