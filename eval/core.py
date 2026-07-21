@@ -5,9 +5,18 @@ Design invariants (see ../README.md):
   * Items are GENERATED, never loaded from a static file — freshness comes from a
     seed derived from the on-chain commit hash, drawn only AFTER checkpoints are
     committed. Generators and checkers are public; seeds are not.
-  * Checkers are DETERMINISTIC. No LLM judge is ever in the scoring path.
   * A model is a black box: give it a prompt, get text back. Nothing about how the
     student was trained is inspected or trusted.
+
+  On judging (reconciled with the trajectory mechanism): the covering-set axes use
+  DETERMINISTIC checkers (math answer-match, code execution) with no model in the
+  scoring path. The trajectory mechanism (trajectory.py) uses a GROUNDED judge —
+  "GLM did X here; did the student also do X?" compared against a fresh reference GLM
+  produced one step ago. That is the reliable regime for an LLM judge (bounded local
+  comparison to a concrete reference), NOT the open-ended-quality regime that collapsed
+  the prior subnet. The invariant is therefore: no OPEN-ENDED / distribution-match /
+  self-reported judgment ever scores a crown; grounded local comparison and
+  deterministic checkers do.
 """
 from __future__ import annotations
 

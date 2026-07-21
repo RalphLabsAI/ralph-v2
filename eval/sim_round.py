@@ -44,7 +44,10 @@ class Model:
 
     @staticmethod
     def _glm_step(prefix):
-        h = abs(hash(prefix.strip().split("\n")[-1])) % len(VOCAB)
+        # stable hash (Python's hash() is per-process randomized -> flaky sim)
+        import hashlib
+        last = prefix.strip().split("\n")[-1]
+        h = int(hashlib.sha256(last.encode()).hexdigest()[:8], 16) % len(VOCAB)
         return " ".join(VOCAB[(h + j) % len(VOCAB)] for j in range(5))
 
     def generate(self, prompts, max_new_tokens=256):
