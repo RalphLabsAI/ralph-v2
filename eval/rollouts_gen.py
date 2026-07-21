@@ -71,12 +71,17 @@ def _split_steps(text: str, max_steps: int = 8, min_chars: int = 25) -> list[str
 
 
 def generate_experience(teacher: ModelRunner, n: int | None = None,
-                        max_new_tokens: int = 400) -> list[Rollout]:
-    tasks = TASKS[:n] if n else TASKS
+                        max_new_tokens: int = 400,
+                        tasks: list[tuple[str, str]] | None = None) -> list[Rollout]:
+    """Teacher-authored rollouts. `tasks` is an optional list of (prompt, domain); the
+    teacher's own multi-step answer is segmented into steps (so the steps are valid
+    distillation targets). Generation is batched via the runner."""
+    pairs = tasks if tasks is not None else [(t, "general") for t in (TASKS[:n] if n else TASKS)]
+    prompts = [p for p, _ in pairs]
+    sols = teacher.generate(prompts, max_new_tokens=max_new_tokens)
     outs: list[Rollout] = []
-    for i, task in enumerate(tasks):
-        sol = teacher.generate([task], max_new_tokens=max_new_tokens)[0]
+    for i, ((task, domain), sol) in enumerate(zip(pairs, sols)):
         steps = _split_steps(sol)
         if len(steps) >= 2:
-            outs.append(Rollout(id=f"gen{i}", context=task, steps=steps, success=True))
+            outs.append(Rollout(id=f"gen{i}", context=task, steps=steps, success=True, domain=domain))
     return outs
