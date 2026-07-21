@@ -69,7 +69,7 @@ def run_v2_epoch(
     tiers: list[Tier], tier_budgets: dict[str, TierBudget],
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     commit_window: int = 100, make_safe_runner=None,
-    pile_id: str = "pile", n_points: int = 120, self_frac: float = 0.25,
+    pile_id: str = "pile", n_points: int = 120, self_frac: float = 0.0,
 ) -> EpochResult:
     """One v2 epoch: read the sealed commit window, draw the nonce, score, write back.
 

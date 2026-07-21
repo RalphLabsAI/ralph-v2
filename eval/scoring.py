@@ -20,7 +20,12 @@ import math
 from dataclasses import dataclass
 
 RETENTION_CAP = 1.25
-SOFTMIN_P = -6.0  # in [-8, -4]; more negative == closer to a hard min
+SOFTMIN_P = -3.0  # in [-4, -2]; more negative == closer to a hard min. A real run showed
+                  # -6 lets one thin/noisy axis dominate; -3 keeps worst-domain pressure
+                  # without a single 3-point axis annihilating the aggregate.
+MIN_AXIS_N = 30   # teacher-passed items required before an axis may gate/dominate. A real
+                  # run had a 6-task axis (~3 points) flip negative on sampling noise and
+                  # sink every student's soft-min — below this an axis is not "live".
 
 
 def wilson_lower_bound(successes: int, n: int, z: float = 1.96) -> float:
@@ -34,6 +39,17 @@ def wilson_lower_bound(successes: int, n: int, z: float = 1.96) -> float:
     return max(0.0, (centre - margin) / denom)
 
 
+def wilson_upper_bound(successes: int, n: int, z: float = 1.96) -> float:
+    """Upper bound of the Wilson score interval. Returns 1.0 for n == 0."""
+    if n <= 0:
+        return 1.0
+    p = successes / n
+    denom = 1.0 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+    return min(1.0, (centre + margin) / denom)
+
+
 @dataclass
 class AxisScore:
     axis: str
@@ -45,10 +61,20 @@ class AxisScore:
     # rates on the teacher-passed subset
     retention: float
     retention_lb: float
+    retention_ub: float = 1.25
+    # `live` = this axis carries usable information this round and may gate/dominate.
+    # False for: teacher solved nothing (n==0), base already at teacher parity (no
+    # headroom), or too few teacher-passed items (n < MIN_AXIS_N). A non-live axis is
+    # EXCLUDED from aggregation rather than floored to 0 — "can't measure" must not read
+    # the same as "catastrophic failure".
+    live: bool = True
 
     @property
     def negative(self) -> bool:
-        return self.retention < 0.0
+        # interval test: only a live axis whose retention UPPER bound is still below 0
+        # (student CI entirely under base) counts as a genuine capability sacrifice. A
+        # point-estimate `retention < 0` fires on pure sampling noise at small n.
+        return self.live and self.retention_ub < 0.0
 
 
 def axis_retention(
@@ -77,36 +103,44 @@ def axis_retention(
 
     if n == 0:
         # teacher solved nothing — the axis is mis-calibrated for this pair, not a
-        # student failure. Surface it as zero-weight rather than dividing by zero.
-        return AxisScore(axis, weight, 0, 0, 0, 0, 0.0, 0.0)
+        # student failure. Not live: excluded from aggregation, not dividing by zero.
+        return AxisScore(axis, weight, 0, 0, 0, 0, 0.0, 0.0, 0.0, live=False)
 
     s_rate, b_rate = s_pass / n, b_pass / n
     t_rate = 1.0
     denom = t_rate - b_rate
     if denom <= 1e-9:
         # base already matches the teacher here: no headroom, so this axis carries
-        # no information about compression quality this round.
-        return AxisScore(axis, weight, t_pass, s_pass, b_pass, n, 0.0, 0.0)
+        # no information about compression quality this round. Not live.
+        return AxisScore(axis, weight, t_pass, s_pass, b_pass, n, 0.0, 0.0, 0.0, live=False)
 
     retention = (s_rate - b_rate) / denom
     s_lb = wilson_lower_bound(s_pass, n)
+    s_ub = wilson_upper_bound(s_pass, n)
     retention_lb = (s_lb - b_rate) / denom
+    retention_ub = (s_ub - b_rate) / denom
 
     return AxisScore(
         axis=axis, weight=weight, teacher_pass=t_pass, student_pass=s_pass,
         base_pass=b_pass, n=n,
         retention=min(retention, cap),
         retention_lb=min(retention_lb, cap),
+        retention_ub=min(retention_ub, cap),
+        # too few teacher-passed items to trust: measurable but not allowed to gate.
+        live=(n >= MIN_AXIS_N),
     )
 
 
 def soft_min(scores: list[AxisScore], p: float = SOFTMIN_P, use_lower_bound: bool = True) -> float:
-    """Weighted power-mean with p < 0 — approaches min() as p -> -inf.
+    """Weighted power-mean over LIVE axes with p < 0 — approaches min() as p -> -inf.
 
-    Values are floored just above zero because a true zero would annihilate the whole
-    power mean; a zero-retention axis should dominate the score, not erase it.
+    Only live axes (enough headroom AND enough samples) participate: a "can't measure"
+    axis is excluded, not floored, so it can't masquerade as catastrophic failure. A
+    genuinely-failed live axis IS floored just above zero (eps) so it dominates the mean
+    toward ~0 without producing inf; that near-zero is the correct signal, and the crown
+    gates (verdict / koth) must treat it as a fail, not award it on an open throne.
     """
-    live = [s for s in scores if s.n > 0 and s.weight > 0]
+    live = [s for s in scores if s.live and s.weight > 0]
     if not live:
         return 0.0
     eps = 1e-3
@@ -143,22 +177,30 @@ class Verdict:
             "reasons": self.reasons,
             "axes": [
                 {
-                    "axis": a.axis, "weight": a.weight, "n_teacher_passed": a.n,
+                    "axis": a.axis, "weight": a.weight, "n_teacher_passed": a.n, "live": a.live,
                     "student_pass": a.student_pass, "base_pass": a.base_pass,
                     "retention": round(a.retention, 6), "retention_lb": round(a.retention_lb, 6),
+                    "retention_ub": round(a.retention_ub, 6),
                 }
                 for a in self.axes
             ],
         }
 
 
-def verdict(axes: list[AxisScore], passk_ok: bool = True, passk_failures: list[str] | None = None) -> Verdict:
+def verdict(axes: list[AxisScore], passk_ok: bool = True, passk_failures: list[str] | None = None,
+            min_live_axes: int = 1) -> Verdict:
+    """Crown decision for one student. Fail-closed: a student that regresses on any live
+    axis, regresses pass@k, or has too few measurable axes is NOT crownable regardless of
+    aggregate score — this is what stops an all-failed student grabbing an open throne."""
     reasons: list[str] = []
     negative = [a.axis for a in axes if a.negative]
     if negative:
         reasons.append(f"negative retention on: {', '.join(negative)}")
     if not passk_ok:
         reasons.append(f"pass@k regressed vs base on: {', '.join(passk_failures or [])}")
+    n_live = sum(1 for a in axes if a.live)
+    if n_live < min_live_axes:
+        reasons.append(f"only {n_live} live axis/axes (< {min_live_axes}) — not enough signal to crown")
     gates = not reasons
     return Verdict(
         score=soft_min(axes) if gates else 0.0,

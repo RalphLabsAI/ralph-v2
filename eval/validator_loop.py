@@ -56,7 +56,7 @@ def run_validator_round(
     experience: list[Rollout], glm: ModelRunner, base: ModelRunner, judge: StepJudge,
     tiers: list[Tier], tier_budgets: dict[str, TierBudget],
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
-    pile_id: str = "pile", n_points: int = 120, self_frac: float = 0.25,
+    pile_id: str = "pile", n_points: int = 120, self_frac: float = 0.0,
 ) -> RoundOutcome:
     out = RoundOutcome()
 

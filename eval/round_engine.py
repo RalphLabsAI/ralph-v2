@@ -65,8 +65,13 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
               tiers: list[Tier], tournament: Tournament,
               submissions: list[tuple[Submission, ModelRunner]],
               registry: dict[str, ModelRunner] | None = None,
-              n_points: int = 120, self_frac: float = 0.25,
-              max_new_tokens: int = 256) -> RoundResult:
+              n_points: int = 120, self_frac: float = 0.0,
+              max_new_tokens: int = 256, fresh_refs: bool = True) -> RoundResult:
+    # self_frac defaults to 0: the self_state (on-policy) slice is only valid on a
+    # genuinely MULTI-TURN agentic pile, where the student's own turns form real
+    # conversation history and GLM continues naturally. On a single-response/CoT pile a
+    # re-prompted self_state restarts (the RUN-1 artifact). Raise self_frac only once a
+    # multi-turn pile is wired; until then the protocol scores teacher_state only.
     tournament.round = round_no
     # the validator PERSISTS every king's checkpoint and re-scores it each round,
     # whether or not the miner resubmits. `registry` is that persistent store; this
@@ -77,7 +82,7 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
 
     # 1-2. fixed points + cached GLM refs (once per round)
     points = sample_points(experience, n_points, self_frac, seed=commit_seed)
-    refs = prepare_refs(points, experience, glm, judge, max_new_tokens)
+    refs = prepare_refs(points, experience, glm, judge, max_new_tokens, fresh_refs=fresh_refs)
     modes = [p.mode for p in points]
 
     # base is scored once — it is the shared denominator for retention

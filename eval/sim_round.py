@@ -76,7 +76,7 @@ def main() -> int:
         "m_weak": Model("weak", 0.55, seed=11),
         "m_good": Model("good", 0.78, seed=12),
         "m_copy": Model("copy", 0.78, seed=12),   # same seed as m_good == a true copy
-        "m_better": Model("better", 0.90, seed=14),
+        "m_better": Model("better", 0.95, seed=14),
     }
 
     def sub(mid, miner, params=2_000_000_000, compute=200.0):
@@ -96,9 +96,12 @@ def main() -> int:
     registry: dict = {}   # the validator's persistent store of every king's checkpoint
     for i, subs in enumerate(rounds, start=1):
         submissions = [(s, runners[s.model_id]) for s in subs]
+        # self_frac=0: self_state is only meaningful on genuinely multi-turn agentic
+        # piles (a re-prompted single-response state restarts). This synthetic hash-based
+        # demo exercises the KOTH crown/hold/dethrone dynamics on teacher_state only.
         res = run_round(i, commit_seed=1000 + i, experience=exp, glm=glm, base=base,
                         judge=judge, tiers=tiers, tournament=tour, submissions=submissions,
-                        registry=registry, n_points=240, self_frac=0.2)
+                        registry=registry, n_points=240, self_frac=0.0)
         ev = res.events[0]
         king = tour.kings["sub-3B"]
         line = (f"round {i}: {ev['action']:<9} king={king.model_id:<9} "

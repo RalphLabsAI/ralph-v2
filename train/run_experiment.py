@@ -104,7 +104,10 @@ def main() -> int:
     log(f"scoring on {NPOINTS} held-out eval points (self_frac={SELF_FRAC}) ...")
     eval_exp = [exp[i] for i in eval_idx]
     points = sample_points(eval_exp, NPOINTS, SELF_FRAC, seed=12345)
-    refs = prepare_refs(points, eval_exp, teacher, judge, max_new_tokens=200)
+    # fresh_refs=False: this is a genuinely teacher-authored held-out EXPERIMENT pile, so
+    # the stored step r.steps[k] IS the teacher's own action (avoids the re-prompt restart
+    # artifact). NEVER do this in the live protocol — a stored reference is memorizable.
+    refs = prepare_refs(points, eval_exp, teacher, judge, max_new_tokens=200, fresh_refs=False)
 
     base = HFRunner(STUDENT_BASE, name="base", batch_size=16)
     report = {

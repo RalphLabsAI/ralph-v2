@@ -245,15 +245,18 @@ def first_step(text: str) -> str:
 
 def prepare_refs(points: Sequence[EvalPoint], experience: Sequence[Rollout],
                  glm: ModelRunner, judge: StepJudge, max_new_tokens: int = 512,
-                 fresh_refs: bool = False) -> list[PointRef]:
+                 fresh_refs: bool = True) -> list[PointRef]:
     """Reference step per point, once.
 
-    `fresh_refs=False` (default): the reference IS the pile's stored next step
-    `r.steps[k]`. For a GLM-authored pile that stored step is GLM's genuine action, so
-    this is faithful AND avoids the re-prompt restart artifact. `fresh_refs=True`
-    regenerates GLM's step from the prefix — correct only for genuinely multi-turn
-    agentic piles, where prefix(k) is real conversation history and the next turn is a
-    natural continuation (no restart). Self-state points defer to scoring time.
+    `fresh_refs=True` (PROTOCOL DEFAULT): GLM regenerates its step from the prefix. This
+    is const's design and the only safe choice for a LIVE pile — the reference is not an
+    enumerable stored label a miner can memorize. It requires a genuinely multi-turn
+    agentic pile, where prefix(k) is real conversation history and the next turn is a
+    natural continuation (a re-prompted single-response CoT prefix RESTARTS — see
+    first_step). `fresh_refs=False` uses the pile's STORED next step r.steps[k]; valid
+    ONLY for a genuinely teacher-authored held-out EXPERIMENT pile (never the live
+    protocol — a fixed stored reference is a public answer key). Self-state defers to
+    scoring time.
     """
     refs: list[PointRef] = []
     for p in points:
@@ -270,8 +273,7 @@ def prepare_refs(points: Sequence[EvalPoint], experience: Sequence[Rollout],
 
 def score_on_points(points: Sequence[EvalPoint], refs: Sequence[PointRef],
                     experience: Sequence[Rollout], glm: ModelRunner, student: ModelRunner,
-                    judge: StepJudge, max_new_tokens: int = 512,
-                    fresh_refs: bool = False) -> list[StepPoint]:
+                    judge: StepJudge, max_new_tokens: int = 512) -> list[StepPoint]:
     """Score one student on the fixed round points, reusing cached teacher-state refs.
 
     The student's generation is truncated to its first step (`first_step`) so the
