@@ -52,6 +52,7 @@ class Rollout:
     context: str
     steps: list[str]
     success: bool = True
+    domain: str = "general"   # source/domain tag; a covering pile spans many (pile.py)
 
     def prefix(self, k: int) -> str:
         return self.context + "\n" + "\n".join(self.steps[:k])
