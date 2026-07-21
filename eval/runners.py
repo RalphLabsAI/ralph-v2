@@ -21,11 +21,13 @@ class HFRunner:
     """Real inference via transformers. Lazy-imports so the harness runs without torch."""
 
     def __init__(self, model_id: str, device: str = "auto", dtype: str = "bfloat16",
-                 revision: str | None = None, name: str | None = None):
+                 revision: str | None = None, name: str | None = None,
+                 trust_remote_code: bool = False):
         self.model_id = model_id
         self.revision = revision
         self.name = name or model_id
         self._device, self._dtype = device, dtype
+        self._trust = trust_remote_code   # OK for OUR pinned teacher/judge; never for miner output
         self._model = None
         self._tok = None
 
@@ -35,7 +37,9 @@ class HFRunner:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        kw = {"revision": self.revision} if self.revision else {}
+        kw = {"trust_remote_code": self._trust}
+        if self.revision:
+            kw["revision"] = self.revision
         self._tok = AutoTokenizer.from_pretrained(self.model_id, **kw)
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_id, dtype=getattr(torch, self._dtype), device_map=self._device, **kw

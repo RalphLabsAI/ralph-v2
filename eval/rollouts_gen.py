@@ -1,0 +1,51 @@
+"""Generate an experience pile with the teacher.
+
+For a first real run we use reasoning traces (math / short coding) rather than agentic
+tool-use, so the whole thing runs on one GPU with no environment. GLM solves each task
+step by step; we split its solution into ordered steps. Each becomes a Rollout the eval
+samples (rollout, step) points from.
+"""
+from __future__ import annotations
+
+import re
+
+from .core import ModelRunner
+from .trajectory import Rollout
+
+TASKS = [
+    "A train travels 60 km in the first hour and 90 km in the second. What is its average speed? Reason step by step.",
+    "Compute the sum of all integers from 1 to 50, showing your steps.",
+    "A rectangle has perimeter 34 and width 6. Find its area, step by step.",
+    "If 3 painters paint 3 fences in 3 hours, how long for 9 painters to paint 9 fences? Explain each step.",
+    "Write a Python function is_palindrome(s) that ignores case and spaces, and explain each step before the code.",
+    "Solve for x: 2x + 7 = 3x - 4. Show every step.",
+    "A shirt costs 40 after a 20% discount. What was the original price? Step by step.",
+    "How many 3-digit numbers are divisible by 7? Reason it out step by step.",
+    "Write a Python function that returns the second-largest distinct value in a list, explaining each step first.",
+    "A tank fills in 12 minutes with pipe A and 18 with pipe B. How long with both open? Step by step.",
+    "Find the greatest common divisor of 84 and 126, showing the steps.",
+    "Convert 3/8 to a decimal and then to a percentage, step by step.",
+]
+
+
+def _split_steps(text: str, max_steps: int = 8) -> list[str]:
+    """Split a solution into ordered steps. Prefer numbered/step markers; fall back to
+    non-trivial lines, then sentences."""
+    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) > 3]
+    numbered = [ln for ln in lines if re.match(r"^(step\s*\d+|[0-9]+[.)])", ln, re.I)]
+    steps = numbered or lines
+    if len(steps) < 2:
+        steps = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 8]
+    return steps[:max_steps]
+
+
+def generate_experience(teacher: ModelRunner, n: int | None = None,
+                        max_new_tokens: int = 400) -> list[Rollout]:
+    tasks = TASKS[:n] if n else TASKS
+    outs: list[Rollout] = []
+    for i, task in enumerate(tasks):
+        sol = teacher.generate([task], max_new_tokens=max_new_tokens)[0]
+        steps = _split_steps(sol)
+        if len(steps) >= 2:
+            outs.append(Rollout(id=f"gen{i}", context=task, steps=steps, success=True))
+    return outs

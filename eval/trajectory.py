@@ -268,3 +268,25 @@ def score_on_points(points: Sequence[EvalPoint], refs: Sequence[PointRef],
             agr = judge.agreement(sp, glm_here, student_here)
         out.append(StepPoint(r.id, p.k, p.mode, agr))
     return out
+
+
+class GroundedJudge:
+    """A single grounded yes/no per point: "GLM did X here; does the student's step do
+    the same?" More robust to parse than the N-question rubric, so it's the judge for
+    the first real-model runs. Grounded to a fresh GLM reference == the reliable regime
+    for an LLM judge. Keep the judge model != GLM to avoid self-preference."""
+    name = "grounded-judge"
+
+    def __init__(self, judge: ModelRunner):
+        self.judge = judge
+
+    def agreement(self, prefix: str, reference_step: str, candidate_step: str) -> float:
+        prompt = (
+            "Two responses continue the same context. Does the CANDIDATE accomplish "
+            "essentially the same thing as the REFERENCE at this step — same key action, "
+            "same result? Answer with a single word: YES or NO.\n\n"
+            f"CONTEXT (end):\n{prefix[-1200:]}\n\n"
+            f"REFERENCE:\n{reference_step[:1200]}\n\nCANDIDATE:\n{candidate_step[:1200]}\n\nANSWER:"
+        )
+        out = self.judge.generate([prompt], max_new_tokens=8)[0].strip().lower()
+        return 1.0 if out.startswith("y") or "yes" in out[:12] else 0.0
