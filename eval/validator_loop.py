@@ -26,6 +26,7 @@ from .intake import intake
 from .koth import Submission, Tier, Tournament
 from .round_engine import run_round
 from .round_record import build_round_record, RoundRecord
+from .seeds import derive_seed
 from .trajectory import Rollout, StepJudge, sample_points
 
 
@@ -72,8 +73,10 @@ def run_validator_round(
         subs.append((sub, runner))
         out.accepted.append(c.hotkey)
 
-    # 2-3. score (accepted + reigning king, same fresh points) + crown + weights
-    commit_seed = int(commit_root[-8:], 16) if all(ch in "0123456789abcdef" for ch in commit_root[-8:]) else abs(hash(commit_root)) % (1 << 31)
+    # 2-3. score (accepted + reigning king, same fresh points) + crown + weights.
+    # The seed BINDS the nonce: points do not exist until commitments are locked and the
+    # chain nonce is drawn, so no miner can pre-fit to this round's points (seeds.py).
+    commit_seed = derive_seed(commit_root, round_nonce, "points")
     res = run_round(round_no, commit_seed, experience, glm, base, judge, tiers, tournament,
                     subs, registry=registry, n_points=n_points, self_frac=self_frac)
     out.weights = res.weights
