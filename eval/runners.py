@@ -200,7 +200,7 @@ class SafeStudentRunner(HFRunner):
     construction time (never reaches from_pretrained if a pickle/.py is present)."""
 
     def __init__(self, ckpt_dir: str, device: str = "auto", dtype: str = "bfloat16",
-                 name: str | None = None):
+                 name: str | None = None, batch_size: int = 8):
         from pathlib import Path
         from .gates import FORBIDDEN_FILES
         d = Path(ckpt_dir)
@@ -210,7 +210,8 @@ class SafeStudentRunner(HFRunner):
         if not list(d.rglob("*.safetensors")):
             raise ValueError("refusing to load: no safetensors weights")
         super().__init__(str(d), device=device, dtype=dtype,
-                         name=name or f"student:{d.name}", trust_remote_code=False)
+                         name=name or f"student:{d.name}", trust_remote_code=False,
+                         batch_size=batch_size)
 
     def _load(self):
         if self._model is not None:
