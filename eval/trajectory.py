@@ -228,17 +228,39 @@ def sample_points(experience: Sequence[Rollout], n: int, self_frac: float, seed:
     return pts
 
 
+def first_step(text: str) -> str:
+    """Truncate a generation to its FIRST coherent step.
+
+    Re-prompted on a partial trajectory, an instruct model tends to RESTART the whole
+    solution rather than continue (confirmed on real models: a student that correctly
+    emits only step k+1 was scored 0 against a teacher reference that restarted at step
+    1). Comparing step-to-step — the student's first emitted step vs the reference step —
+    removes that restart artifact: a genuine single-step continuation stays intact, and a
+    restart-from-scratch collapses to its (wrong-for-this-state) first line.
+    """
+    from .rollouts_gen import _split_steps
+    segs = _split_steps(text)
+    return segs[0] if segs else text.strip()
+
+
 def prepare_refs(points: Sequence[EvalPoint], experience: Sequence[Rollout],
-                 glm: ModelRunner, judge: StepJudge, max_new_tokens: int = 512) -> list[PointRef]:
-    """Compute GLM's step + rubric checks per point, once. Self-state points defer the
-    prefix to scoring time (it depends on the student), so only teacher-state refs are
-    fully cached here; self-state caches just GLM's checks-from-its-own-step later."""
+                 glm: ModelRunner, judge: StepJudge, max_new_tokens: int = 512,
+                 fresh_refs: bool = False) -> list[PointRef]:
+    """Reference step per point, once.
+
+    `fresh_refs=False` (default): the reference IS the pile's stored next step
+    `r.steps[k]`. For a GLM-authored pile that stored step is GLM's genuine action, so
+    this is faithful AND avoids the re-prompt restart artifact. `fresh_refs=True`
+    regenerates GLM's step from the prefix — correct only for genuinely multi-turn
+    agentic piles, where prefix(k) is real conversation history and the next turn is a
+    natural continuation (no restart). Self-state points defer to scoring time.
+    """
     refs: list[PointRef] = []
     for p in points:
         r = experience[p.rollout_idx]
         if p.mode == "teacher_state":
             prefix = r.prefix(p.k)
-            glm_step = glm.generate([prefix], max_new_tokens)[0]
+            glm_step = first_step(glm.generate([prefix], max_new_tokens)[0]) if fresh_refs else r.steps[p.k]
             checks = judge.make_checks(prefix, glm_step) if isinstance(judge, RubricJudge) else []
             refs.append(PointRef(p, prefix, glm_step, checks))
         else:
@@ -248,24 +270,31 @@ def prepare_refs(points: Sequence[EvalPoint], experience: Sequence[Rollout],
 
 def score_on_points(points: Sequence[EvalPoint], refs: Sequence[PointRef],
                     experience: Sequence[Rollout], glm: ModelRunner, student: ModelRunner,
-                    judge: StepJudge, max_new_tokens: int = 512) -> list[StepPoint]:
-    """Score one student on the fixed round points, reusing cached teacher-state refs."""
+                    judge: StepJudge, max_new_tokens: int = 512,
+                    fresh_refs: bool = False) -> list[StepPoint]:
+    """Score one student on the fixed round points, reusing cached teacher-state refs.
+
+    The student's generation is truncated to its first step (`first_step`) so the
+    comparison is step-to-step: a student that correctly continues matches the reference
+    step; one that restarts the whole solution is caught."""
     out: list[StepPoint] = []
     for p, ref in zip(points, refs):
         r = experience[p.rollout_idx]
         if p.mode == "teacher_state":
-            student_step = student.generate([ref.teacher_prefix], max_new_tokens)[0]
+            student_step = first_step(student.generate([ref.teacher_prefix], max_new_tokens)[0])
             if isinstance(judge, RubricJudge) and ref.checks:
                 agr = judge.grade(ref.teacher_prefix, ref.checks, student_step)
             else:
                 agr = judge.agreement(ref.teacher_prefix, ref.glm_step, student_step)
         else:
-            # self-state: student builds its own prefix, GLM acts in that state
+            # self-state: student builds its own prefix one step at a time, GLM acts in
+            # that state fresh. Valid only for multi-turn agentic piles (a re-prompted
+            # CoT state restarts); each hop is truncated to a single step.
             sp = r.context
             for _ in range(p.k):
-                sp = sp + "\n" + student.generate([sp], max_new_tokens)[0]
-            glm_here = glm.generate([sp], max_new_tokens)[0]
-            student_here = student.generate([sp], max_new_tokens)[0]
+                sp = sp + "\n" + first_step(student.generate([sp], max_new_tokens)[0])
+            glm_here = first_step(glm.generate([sp], max_new_tokens)[0])
+            student_here = first_step(student.generate([sp], max_new_tokens)[0])
             agr = judge.agreement(sp, glm_here, student_here)
         out.append(StepPoint(r.id, p.k, p.mode, agr))
     return out
