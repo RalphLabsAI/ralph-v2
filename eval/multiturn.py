@@ -192,6 +192,56 @@ def _agree_batch(states: list, student: Agent) -> list[float]:
     return out
 
 
+@dataclass(frozen=True)
+class EnvPoint:
+    env_idx: int
+    k: int
+    mode: str            # "teacher_state" | "self_state"
+
+
+def sample_env_points(pile: list[MTRollout], n: int, self_frac: float, seed: int) -> list[EnvPoint]:
+    """Fresh (env, depth, mode) points for a round. The pile is the eval — points do not
+    exist until sampled from the commit-seed, so a miner cannot pre-fit to them."""
+    import random
+    rng = random.Random(seed)
+    usable = [i for i, r in enumerate(pile) if len(r.states) >= 3]
+    pts: list[EnvPoint] = []
+    for _ in range(n):
+        ei = rng.choice(usable)
+        k = rng.randint(1, len(pile[ei].states) - 2)
+        mode = "self_state" if rng.random() < self_frac else "teacher_state"
+        pts.append(EnvPoint(ei, k, mode))
+    return pts
+
+
+def score_points(pile: list[MTRollout], points: list[EnvPoint], student: Agent) -> list[float]:
+    """Per-point agreement for a fixed point set (aligned to `points`), so every
+    submission and the king are scored on the SAME points — the exact pairing the
+    dethrone bootstrap needs. teacher_state: act from the teacher's state[k]. self_state:
+    roll the student k steps on its OWN actions, then act. Batched by mode."""
+    out: list[float | None] = [None] * len(points)
+
+    # teacher_state points: independent, batch them all
+    ts = [(i, pile[p.env_idx].states[p.k]) for i, p in enumerate(points)
+          if p.mode == "teacher_state" and p.k < len(pile[p.env_idx].states)
+          and not pile[p.env_idx].states[p.k].solved]
+    for (i, _), a in zip(ts, _agree_batch([s for _, s in ts], student)):
+        out[i] = a
+
+    # self_state points: roll each env forward on the student's own actions to depth k
+    ss = [(i, p) for i, p in enumerate(points) if p.mode == "self_state"]
+    for i, p in ss:
+        s = pile[p.env_idx].states[0]
+        ok = True
+        for _ in range(p.k):
+            if s.solved:
+                ok = False
+                break
+            s, _, _ = G.step(s, student.act(s))
+        out[i] = _agree_batch([s], student)[0] if (ok and not s.solved) else 1.0
+    return [0.0 if v is None else v for v in out]
+
+
 def score_exposure(rollouts: list[MTRollout], student: Agent,
                    k_buckets: list[int], self_state: bool = True) -> ExposureResult:
     """Agreement at each depth k, for teacher_state and (optionally) self_state.
