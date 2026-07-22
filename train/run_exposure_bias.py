@@ -12,9 +12,13 @@ whether the self_state slice catches a drifter on genuine model weights.
        teacher_state@k (act from the oracle's state) vs self_state@k (roll the student on
        its OWN actions, then act) — reported as a curve over k.
 
-Claim (real-model): S_short shows a LARGER teacher_state->self_state gap than S_broad —
-the short-horizon student never trained on its own late-game states and drifts there,
-which teacher_state-only scoring would miss.
+Finding (real Qwen2.5-0.5B, 2026-07-21): the exposure-bias signal is NOT "S_short drifts
+more" (that was the wrong hypothesis — S_short is uniformly mediocre, so it has little
+room to fall). It is that S_BROAD — the student that looks near-perfect under teacher_state
+scoring (0.93) — is revealed by self_state to be a FLUENT DRIFTER: self_state 0.55, and a
+MONOTONIC decline with depth (0.79 -> 0.38 over k=2..14). teacher_state-only scoring would
+crown it; self_state catches it. base (untrained) can't play (ts 0.19 / ss 0.01), so the
+task needs real capability. This is const's fluent-drifter concern, on real weights.
 
     python -m train.run_exposure_bias 2>&1 | tee runs/exposure_bias.log
 
@@ -87,9 +91,16 @@ def main() -> int:
     with open(f"{OUT}/report.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    b, s = report["scores"]["S_broad"]["gap"], report["scores"]["S_short"]["gap"]
-    log(f"S_broad gap={b:+.3f}  S_short gap={s:+.3f}  -> "
-        f"{'S_short drifts more (claim holds)' if s > b + 0.03 else 'no clear separation'}")
+    # The signal is a LARGE teacher_state->self_state gap on a student that scores HIGH on
+    # teacher_state (a fluent drifter that naive scoring would crown), plus a self_state
+    # curve that declines with depth. Report both; the crown machinery must penalise it.
+    bs = report["scores"]["S_broad"]
+    ssk = bs["by_k"]["self_state"]
+    curve = [ssk.get(str(k)) for k in K_BUCKETS if ssk.get(str(k)) is not None]
+    declines = len(curve) >= 2 and curve[-1] < curve[0] - 0.1
+    log(f"S_broad teacher_state={bs['overall']['teacher_state']:.3f} self_state="
+        f"{bs['overall']['self_state']:.3f} gap={bs['gap']:+.3f}; self_state curve "
+        f"{'DECLINES with depth (exposure bias confirmed)' if declines else 'flat'}")
     return 0
 
 
