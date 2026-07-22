@@ -59,6 +59,31 @@ class HFRunner:
         except Exception:
             return prompt
 
+    def generate_chat(self, message_lists: Sequence[list], max_new_tokens: int = 32) -> list[str]:
+        """One assistant turn per conversation. `message_lists` is a batch of
+        [{role, content}, ...]; the chat template + add_generation_prompt make the model
+        CONTINUE the conversation (produce the next turn), never restart. This is the
+        multi-turn path — a genuine agent turn, used by the gridworld ModelAgent."""
+        self._load()
+        import torch
+
+        texts = []
+        for msgs in message_lists:
+            try:
+                texts.append(self._tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+            except Exception:
+                texts.append("\n".join(m.get("content", "") for m in msgs))
+        outs: list[str] = []
+        for i in range(0, len(texts), self._batch_size):
+            batch = texts[i:i + self._batch_size]
+            enc = self._tok(batch, return_tensors="pt", padding=True, truncation=False).to(self._model.device)
+            with torch.no_grad():
+                gen = self._model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
+                                           pad_token_id=self._tok.pad_token_id)
+            new = gen[:, enc["input_ids"].shape[1]:]
+            outs.extend(self._tok.batch_decode(new, skip_special_tokens=True))
+        return outs
+
     def generate(self, prompts: Sequence[str], max_new_tokens: int = 512) -> list[str]:
         self._load()
         import torch

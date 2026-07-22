@@ -90,6 +90,47 @@ def familiar_states(pile: "list[MTRollout]") -> set:
     return fam
 
 
+class ModelAgent:
+    """Wraps an HFRunner as a gridworld agent. The observation is Markov, so one turn =
+    act on the current observation. Used for real (teacher/student) models on a GPU."""
+
+    def __init__(self, runner, name: str | None = None):
+        self.runner = runner
+        self.name = name or getattr(runner, "name", "model")
+
+    def _prompt(self, state) -> list:
+        return [{"role": "user",
+                 "content": (f"You are in a gridworld. Reach 'G'. Doors 'D<c>' need the "
+                             f"matching key 'K<c>' (stand on it and 'take'). Actions: "
+                             f"{', '.join(G.ACTIONS)}. Reply with ONLY the next action.\n"
+                             f"{G.observe(state)}")}]
+
+    def act(self, state) -> str:
+        out = self.runner.generate_chat([self._prompt(state)], max_new_tokens=8)[0]
+        return G.parse_action(out) or "north"
+
+    def act_batch(self, states) -> list:
+        outs = self.runner.generate_chat([self._prompt(s) for s in states], max_new_tokens=8)
+        return [G.parse_action(o) or "north" for o in outs]
+
+
+def sft_examples_from_pile(pile: "list[MTRollout]", max_k: int | None = None) -> list:
+    """(observation -> optimal action) SFT pairs for distilling a grid agent. max_k caps
+    the horizon (the exposure-bias drifter trains only on early states)."""
+    from train.distill import SFTExample
+    ex = []
+    for r in pile:
+        hi = len(r.actions) if max_k is None else min(len(r.actions), max_k)
+        for i in range(hi):
+            s = r.states[i]
+            opt = G.oracle_optimal_actions(s)
+            if not opt:
+                continue
+            prompt = ModelAgent(None)._prompt(s)[0]["content"]
+            ex.append(SFTExample(prompt=prompt, target=sorted(opt)[0], domain="grid", k=i))
+    return ex
+
+
 @dataclass
 class MTRollout:
     id: str
@@ -133,42 +174,67 @@ class ExposureResult:
     overall: dict = field(default_factory=dict)
 
 
-def _agree(state, student: Agent) -> float:
-    """1.0 if the student's action from `state` is optimal (in the teacher/oracle set)."""
-    opt = G.oracle_optimal_actions(state)
-    if not opt:
-        return 1.0   # already at goal / no move improves — vacuous, skip upstream
-    return 1.0 if student.act(state) in opt else 0.0
+def _acts(student: Agent, states: list) -> list:
+    """Batch the student's actions over many states (uses act_batch if available)."""
+    if not states:
+        return []
+    if hasattr(student, "act_batch"):
+        return student.act_batch(states)
+    return [student.act(s) for s in states]
+
+
+def _agree_batch(states: list, student: Agent) -> list[float]:
+    scored = [(i, s) for i, s in enumerate(states) if G.oracle_optimal_actions(s)]
+    acts = _acts(student, [s for _, s in scored])
+    out = [1.0] * len(states)   # vacuous (at goal / no improving move) counts as agree
+    for (i, s), a in zip(scored, acts):
+        out[i] = 1.0 if a in G.oracle_optimal_actions(s) else 0.0
+    return out
 
 
 def score_exposure(rollouts: list[MTRollout], student: Agent,
                    k_buckets: list[int], self_state: bool = True) -> ExposureResult:
     """Agreement at each depth k, for teacher_state and (optionally) self_state.
 
-    teacher_state@k: student acts from the teacher's state at step k.
-    self_state@k:    student is rolled k steps on ITS OWN actions, then scored at the
-                     state it reached — the exposure-bias measurement.
+    teacher_state@k: student acts from the teacher's state at step k (batched across
+                     rollouts). In-distribution states — measures raw capability.
+    self_state@k:    all rollouts are rolled forward IN LOCKSTEP on the student's own
+                     actions (one batched act() per step across every rollout), and the
+                     student is scored at the drifted state it reached — the exposure-bias
+                     measurement. Lockstep => ~max(k_buckets) batched calls, not k*n.
     """
     res = ExposureResult(by_k={"teacher_state": {}, "self_state": {}})
+    kset = set(k_buckets)
+
+    # teacher_state: batch every rollout's step-k state
     for k in k_buckets:
-        ts, ss = [], []
-        for r in rollouts:
-            if k < len(r.states) and not r.states[k].solved:
-                ts.append(_agree(r.states[k], student))
-            if self_state:
-                s = r.states[0]
-                ok = True
-                for _ in range(k):
-                    if s.solved:
-                        ok = False
-                        break
-                    s, _, _ = G.step(s, student.act(s))
-                if ok and not s.solved:
-                    ss.append(_agree(s, student))
-        if ts:
-            res.by_k["teacher_state"][k] = round(sum(ts) / len(ts), 4)
-        if self_state and ss:
-            res.by_k["self_state"][k] = round(sum(ss) / len(ss), 4)
+        states = [r.states[k] for r in rollouts if k < len(r.states) and not r.states[k].solved]
+        if states:
+            ag = _agree_batch(states, student)
+            res.by_k["teacher_state"][k] = round(sum(ag) / len(ag), 4)
+
+    # self_state: lockstep rollout across all rollouts, scoring at each k in kset
+    if self_state:
+        cur = [r.states[0] for r in rollouts]
+        alive = [True] * len(rollouts)
+        maxk = max(k_buckets)
+        for k in range(maxk + 1):
+            if k in kset:
+                idx = [i for i in range(len(cur)) if alive[i] and not cur[i].solved]
+                if idx:
+                    ag = _agree_batch([cur[i] for i in idx], student)
+                    res.by_k["self_state"][k] = round(sum(ag) / len(ag), 4)
+            if k == maxk:
+                break
+            # advance every alive rollout one step on the student's own action
+            live_idx = [i for i in range(len(cur)) if alive[i] and not cur[i].solved]
+            acts = _acts(student, [cur[i] for i in live_idx])
+            for i, a in zip(live_idx, acts):
+                cur[i], _, _ = G.step(cur[i], a)
+            for i in range(len(cur)):
+                if alive[i] and cur[i].solved:
+                    alive[i] = False
+
     for mode in ("teacher_state", "self_state"):
         vals = list(res.by_k[mode].values())
         res.overall[mode] = round(sum(vals) / len(vals), 4) if vals else None
