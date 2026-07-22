@@ -98,7 +98,48 @@ def run_v2_epoch(
         pile_id=pile_id, n_points=n_points, self_frac=self_frac,
     )
 
-    # write-back: crown per tier, then weights, then the auditable record.
+    return _write_back(chain, tiers, tournament, outcome, round_no)
+
+
+def run_v2_env_epoch(
+    chain: ChainIO, round_no: int,
+    pile, base_agent, teacher,
+    tiers: list[Tier], tier_budgets: dict[str, TierBudget],
+    tournament: Tournament, ledger: RegistrationLedger, registry: dict,
+    commit_window: int = 100, make_agent=None,
+    teacher_id: str = "glm", base_id: str = "base", pile_id: str = "env-pile",
+    n_points: int = 300, self_frac: float = 0.4,
+) -> EpochResult:
+    """One v2 epoch on the ENV substrate (the validated, production scoring path). Same
+    chain I/O as run_v2_epoch; scores via run_env_round. `make_agent(ckpt_dir) -> Agent`
+    builds the locked-down ModelAgent for an accepted checkpoint (only after gates pass).
+    The reference is the pinned `teacher` (GLM) agent — reproduce-GLM, checked by the
+    deterministic env oracle (no LLM judge)."""
+    from .validator_env_loop import CommittedSubmission as EnvCommitted, run_env_round
+
+    now = chain.current_block()
+    lo, hi = now - commit_window, now
+    commits = chain.read_commitments(lo, hi)
+    commit_root = chain.commit_root(lo, hi)
+    round_nonce = chain.block_hash(now)
+
+    committed = [
+        EnvCommitted(hotkey=c.hotkey, coldkey=c.coldkey, tier=c.tier, ckpt_dir=c.ckpt_dir,
+                     declared_compute_h100h=c.declared_compute_h100h, bond_posted=c.bond_posted,
+                     make_agent=(lambda cd=c.ckpt_dir: make_agent(cd)))
+        for c in commits
+    ]
+    outcome = run_env_round(
+        round_no, commit_root, round_nonce, committed, pile, base_agent, teacher,
+        tiers, tier_budgets, tournament, ledger, registry,
+        teacher_id=teacher_id, base_id=base_id, pile_id=pile_id,
+        n_points=n_points, self_frac=self_frac,
+    )
+    return _write_back(chain, tiers, tournament, outcome, round_no)
+
+
+def _write_back(chain: ChainIO, tiers, tournament, outcome, round_no) -> EpochResult:
+    """Crown per tier, set weights, publish the auditable record."""
     for tier in tiers:
         king = tournament.kings.get(tier.name)
         if king is not None:
@@ -106,5 +147,4 @@ def run_v2_epoch(
     chain.set_weights(outcome.weights)
     if outcome.record is not None:
         chain.publish_record(outcome.record)
-
     return EpochResult(round_no, outcome, outcome.record.sha256() if outcome.record else "")
