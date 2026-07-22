@@ -91,7 +91,10 @@ def bootstrap_lcb_diff(a: list[float], b: list[float], z_reps: int = 2000,
 class Tournament:
     """Holds the reigning king per tier and applies dethrone-on-margin each round."""
 
-    def __init__(self, tiers: list[Tier], margin: float = 0.03):
+    def __init__(self, tiers: list[Tier], margin: float = 0.05):
+        # 0.05 production floor: at the small end of eval sizes the paired bootstrap
+        # can't resolve a dethrone below ~this margin (adversarial-review Q4). Raise
+        # toward 0.07 for tiny piles, lower only with n >= ~1500 points/round.
         self.tiers = {t.name: t for t in tiers}
         self.margin = margin
         self.kings: dict[str, King] = {}

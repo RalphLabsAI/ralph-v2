@@ -183,13 +183,21 @@ def _acts(student: Agent, states: list) -> list:
     return [student.act(s) for s in states]
 
 
-def _agree_batch(states: list, student: Agent) -> list[float]:
-    scored = [(i, s) for i, s in enumerate(states) if G.oracle_optimal_actions(s)]
-    acts = _acts(student, [s for _, s in scored])
-    out = [1.0] * len(states)   # vacuous (at goal / no improving move) counts as agree
-    for (i, s), a in zip(scored, acts):
-        out[i] = 1.0 if a in G.oracle_optimal_actions(s) else 0.0
-    return out
+def _agree_batch(states: list, student: Agent, reference: Agent | None = None) -> list[float]:
+    """Per-state agreement. reference=None -> the deterministic ORACLE optimal-set
+    (validation: 'is the action optimal', tie-tolerant). reference=an Agent (production,
+    const's design) -> 'did the student take the SAME action the teacher took here',
+    exact action match. Either way no LLM judge: discrete env actions are checkable."""
+    if reference is None:
+        scored = [(i, s) for i, s in enumerate(states) if G.oracle_optimal_actions(s)]
+        acts = _acts(student, [s for _, s in scored])
+        out = [1.0] * len(states)
+        for (i, s), a in zip(scored, acts):
+            out[i] = 1.0 if a in G.oracle_optimal_actions(s) else 0.0
+        return out
+    s_acts = _acts(student, states)
+    r_acts = _acts(reference, states)
+    return [1.0 if sa == ra else 0.0 for sa, ra in zip(s_acts, r_acts)]
 
 
 @dataclass(frozen=True)
@@ -214,21 +222,22 @@ def sample_env_points(pile: list[MTRollout], n: int, self_frac: float, seed: int
     return pts
 
 
-def score_points(pile: list[MTRollout], points: list[EnvPoint], student: Agent) -> list[float]:
+def score_points(pile: list[MTRollout], points: list[EnvPoint], student: Agent,
+                 reference: Agent | None = None) -> list[float]:
     """Per-point agreement for a fixed point set (aligned to `points`), so every
     submission and the king are scored on the SAME points — the exact pairing the
     dethrone bootstrap needs. teacher_state: act from the teacher's state[k]. self_state:
-    roll the student k steps on its OWN actions, then act. Batched by mode."""
+    roll the student k steps on its OWN actions, then act. `reference` (production = the
+    pinned GLM agent) makes agreement = 'matched GLM's action'; None uses the oracle
+    optimal-set (validation). Batched by mode."""
     out: list[float | None] = [None] * len(points)
 
-    # teacher_state points: independent, batch them all
     ts = [(i, pile[p.env_idx].states[p.k]) for i, p in enumerate(points)
           if p.mode == "teacher_state" and p.k < len(pile[p.env_idx].states)
           and not pile[p.env_idx].states[p.k].solved]
-    for (i, _), a in zip(ts, _agree_batch([s for _, s in ts], student)):
+    for (i, _), a in zip(ts, _agree_batch([s for _, s in ts], student, reference)):
         out[i] = a
 
-    # self_state points: roll each env forward on the student's own actions to depth k
     ss = [(i, p) for i, p in enumerate(points) if p.mode == "self_state"]
     for i, p in ss:
         s = pile[p.env_idx].states[0]
@@ -238,7 +247,7 @@ def score_points(pile: list[MTRollout], points: list[EnvPoint], student: Agent) 
                 ok = False
                 break
             s, _, _ = G.step(s, student.act(s))
-        out[i] = _agree_batch([s], student)[0] if (ok and not s.solved) else 1.0
+        out[i] = _agree_batch([s], student, reference)[0] if (ok and not s.solved) else 1.0
     return [0.0 if v is None else v for v in out]
 
 

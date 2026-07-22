@@ -45,17 +45,22 @@ def env_round(round_no: int, commit_seed: int, pile: list[MTRollout],
               base_agent: Agent, tiers: list[Tier], tournament: Tournament,
               submissions: list[tuple[Submission, Agent]],
               registry: dict[str, Agent] | None = None,
-              n_points: int = 300, self_frac: float = 0.4) -> RoundResult:
+              n_points: int = 300, self_frac: float = 0.4,
+              teacher: Agent | None = None) -> RoundResult:
+    """`teacher` (production = the pinned GLM agent that authored the pile) is the
+    reference: agreement = 'the student took GLM's action here' — const's design, checked
+    deterministically on discrete env actions. teacher=None scores against the env oracle
+    (validation)."""
     tournament.round = round_no
     registry = registry if registry is not None else {}
     for sub, agent in submissions:
         registry[sub.model_id] = agent
 
     points = sample_env_points(pile, n_points, self_frac, seed=commit_seed)
-    base_agree = score_points(pile, points, base_agent)
+    base_agree = score_points(pile, points, base_agent, reference=teacher)
 
     def score_one(agent: Agent):
-        ag = score_points(pile, points, agent)
+        ag = score_points(pile, points, agent, reference=teacher)
         axes = _axes_from_points(points, ag, base_agree)
         return soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True), ag, axes
 
