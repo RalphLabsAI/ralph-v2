@@ -283,7 +283,8 @@ def score_on_points(points: Sequence[EvalPoint], refs: Sequence[PointRef],
     for p, ref in zip(points, refs):
         r = experience[p.rollout_idx]
         if p.mode == "teacher_state":
-            student_step = first_step(student.generate([ref.teacher_prefix], max_new_tokens)[0])
+            raw = student.generate([ref.teacher_prefix], max_new_tokens)[0]
+            student_step = first_step(raw)
             if isinstance(judge, RubricJudge) and ref.checks:
                 agr = judge.grade(ref.teacher_prefix, ref.checks, student_step)
             else:
@@ -296,9 +297,10 @@ def score_on_points(points: Sequence[EvalPoint], refs: Sequence[PointRef],
             for _ in range(p.k):
                 sp = sp + "\n" + first_step(student.generate([sp], max_new_tokens)[0])
             glm_here = first_step(glm.generate([sp], max_new_tokens)[0])
-            student_here = first_step(student.generate([sp], max_new_tokens)[0])
-            agr = judge.agreement(sp, glm_here, student_here)
-        out.append(StepPoint(r.id, p.k, p.mode, agr))
+            raw = student.generate([sp], max_new_tokens)[0]
+            agr = judge.agreement(sp, glm_here, first_step(raw))
+        # keep the RAW (un-truncated) student output for the degeneracy gate
+        out.append(StepPoint(r.id, p.k, p.mode, agr, {"out": raw}))
     return out
 
 

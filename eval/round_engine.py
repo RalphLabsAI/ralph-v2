@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .core import ModelRunner
+from .gates import degeneracy_flags
 from .koth import Scored, Submission, Tier, Tournament
 from .scoring import AxisScore, axis_retention, soft_min, verdict
 from .trajectory import (EvalPoint, Rollout, StepJudge, prepare_refs, sample_points,
@@ -90,19 +91,28 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
     base_pts = [sp.agreement for sp in score_on_points(points, refs, experience, glm, base, judge, max_new_tokens)]
 
     def score_one(runner: ModelRunner):
-        ag = [sp.agreement for sp in score_on_points(points, refs, experience, glm, runner, judge, max_new_tokens)]
-        return _retention_from_points(ag, [1.0] * len(ag), base_pts, modes)
+        sps = score_on_points(points, refs, experience, glm, runner, judge, max_new_tokens)
+        ag = [sp.agreement for sp in sps]
+        outs = [sp.meta.get("out", "") for sp in sps]
+        ret, ret_lb, per_pt, axes = _retention_from_points(ag, [1.0] * len(ag), base_pts, modes)
+        return ret, ret_lb, per_pt, axes, outs
 
-    def gate(sub: Submission, axes: list[AxisScore]) -> tuple[bool, list[str]]:
+    def gate(sub: Submission, axes: list[AxisScore], outputs: list[str]) -> tuple[bool, list[str]]:
         """All crown gates for one submission, fail-closed. Tier fit + verdict()'s
-        negative-axis (interval test) and min-live-axis checks — so a student that
-        regresses on a live axis, or has no measurable axis, CANNOT be crowned even on an
-        open throne (that path only sees Scored.valid == gates_ok and retention_lb > 0).
-        TODO: pass@k and degeneracy gates need per-point multi-sampling / raw-output
-        threading; wired as passk_ok=True here until that lands (documented gap)."""
+        negative-axis (interval test) and min-live-axis checks + a degeneracy gate
+        (looping/runaway output is a DoS, disqualified not low-scored) — so a student
+        that regresses on a live axis, has no measurable axis, or emits garbage CANNOT be
+        crowned even on an open throne (that path only sees Scored.valid).
+        TODO: pass@k gate needs per-point multi-sampling; wired as passk_ok=True until
+        that lands (documented gap)."""
         reasons: list[str] = []
         if sub.params > tournament.tiers[sub.tier].max_params:
             reasons.append("over tier param budget")
+        # degeneracy_flags returns (ok, flags): ok=True is clean. Flag on ANY reason
+        # (robust to the no-outputs edge case which returns True with a flag).
+        deg_ok, dflags = degeneracy_flags(outputs)
+        if not deg_ok or dflags:
+            reasons.append(f"degenerate output: {', '.join(dflags)}")
         v = verdict(axes, passk_ok=True)
         reasons += v.reasons
         return (not reasons), reasons
@@ -111,8 +121,8 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
     for sub, runner in submissions:
-        ret, ret_lb, per_pt, axes = score_one(runner)
-        ok, reasons = gate(sub, axes)
+        ret, ret_lb, per_pt, axes, outs = score_one(runner)
+        ok, reasons = gate(sub, axes, outs)
         s = Scored(sub=sub, retention=ret, retention_lb=ret_lb, per_point=per_pt,
                    gates_ok=ok, reasons=reasons)
         scored[sub.model_id] = s
@@ -126,7 +136,7 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
         if king is not None:
             king_runner = registry.get(king.model_id)
             if king_runner is not None:
-                ret, ret_lb, per_pt, _axes = score_one(king_runner)
+                ret, ret_lb, per_pt, _axes, _outs = score_one(king_runner)
                 king_scored = Scored(
                     sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
                     retention=ret, retention_lb=ret_lb, per_point=per_pt, gates_ok=True)
