@@ -56,22 +56,55 @@ reproducible round record → chain write-back. Crown gates live: RCE, teacher-a
 negative-axis interval test, min-live-axis fail-closed, MIN_CROWN_LB floor, degeneracy.
 The reference is reproduce-GLM (const's design), checked by the deterministic env oracle.
 
-## What is NOT yet real (the honest gaps)
+## SHIP VERDICT (adversarial review, 44 agents, 2026-07-21)
 
-- **Reproduce-GLM on real GLM playing the envs** — validated with sim/oracle references;
-  the real GLM as teacher+reference on the envs is not yet a GPU run.
-- **One env only** (gridworld) — a toy. Real-world credibility needs a suite of
-  deterministic envs exercising capabilities GLM is actually good at.
-- **pass@k gate** (needs per-point multi-sampling) and **provenance gate** (needs
-  teacher-failure points) — documented TODOs, not wired.
-- **Compute-metering reconciliation** — declared compute is stored, not yet enforced
-  against a throughput envelope.
-- **Chain integration + validator** — the ChainIO protocol is defined and the existing
-  Ralph validator satisfies it, but live integration is separate work.
-- Aggregation robustness (thin-axis pooling, base Wilson bounds) and throughput (batched
-  GLM reference) for real scale.
+**NO-GO for emission. Conditional GO for shadow after ~5 fixes, and only as an
+operator-run measurement — not a public competitive board.** The mechanism is sound and
+the differentiator is validated, but the shipped env path (a) was validated via the ORACLE
+reference while production uses GLM exact-match, (b) uses a STATIC pile that is a public
+answer key, and (c) certifies "played one toy gridworld," not "compressed GLM." None are
+fatal; all are fixable; three block a meaningful shadow and ~a dozen block emission.
+
+### Hard blockers before a trustworthy SHADOW run
+1. **Production path never GPU-run.** Validation used the oracle reference + students SFT'd
+   on oracle actions. Production uses the GLM reference + real distilled-GLM students —
+   unrun. The point of shadow is to close this; run the *corrected* path.
+2. **Pile is oracle-authored but the reference is GLM** → teacher_state scores the student
+   on the ORACLE's trajectory, which GLM never visited, breaking the exposure-bias framing.
+   **GLM must PLAY the env to author the trajectories.**
+3. **The env pile is a static, enumerable public answer key** — the commit-nonce only picks
+   *which points* to score, not the grids. A miner memorizes the full (state→GLM-action)
+   table offline and maxes both axes. **Author the grids per-round from the commit-nonce.**
+4. self_state awards a free 1.0 on early solve (multiturn.py) — exclude solved-before-k.
+5. Pick ONE crown metric (exact-match-GLM vs oracle-optimal-set) so validated == production.
+
+### Biggest real-world-credibility risk
+The crown certifies "reproduces GLM's move on one Markov-LOCAL gridworld" — a from-scratch
+tiny bot with **zero GLM lineage** can win it — yet every crown is slated to publish as
+"compressed GLM-4-9B." There is **zero measured correlation** between env-agreement and
+broad GLM-capability retention. Until closed **in code** (not posture), the board must be
+labelled "multi-step control retention (experimental)," never "compressed GLM."
+**Close it with:** (a) a broad GLM-retention gate (held-out LM-agreement / bounded
+perplexity gap) as a hard crown precondition; (b) an env SUITE across DISTINCT capabilities
+GLM is strong at, aggregated worst-first; (c) publish the env-agreement↔retention correlation.
+
+### Before emission flip (crown integrity + product truth)
+- Env suite + wire the existing math/code execution axes (currently dead in adversarial.py).
+- Broad GLM-retention gate binding the artifact to GLM.
+- `model_id = content hash`, not hotkey; persist crowned hash on-chain; reconstruct the king
+  agent from its hash each round (FAIL-CLOSED hold is done; durable reconstruct is TODO).
+- Validator-side fetch-verify-hash + commit-reveal enforcement (bait-and-switch open today).
+- Compute/effective-bits in the ranking, or drop the capability-per-compute claim until real.
+- Batch self_state + cache the teacher_state reference for real scale.
+- pass@k gate (undefinable on deterministic-greedy — redefine or drop), Wilson CI on base,
+  actually sign the record, nonce strictly after the commit window.
+
+### Fixed this pass
+Fail-closed crown (king unrescoreable → HOLD, no more open-throne steal); non-zero bond
+default (anti-grind was off); honest record reference label; earlier: crown-path gates
+(negative-axis interval, min-live, MIN_CROWN_LB, degeneracy), fresh-seed nonce binding.
 
 ## Posture
 
-Shadow-first: miners submit and see themselves ranked with zero emission at risk, then
-emission flips once the gaps above close. Nothing here promises a date.
+Shadow-first, operator-run: no emission, no public board, until the shadow blockers close.
+No "compressed GLM" claim until the capability-laundering gap is a coded gate. No dates.
