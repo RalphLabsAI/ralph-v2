@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from .core import ModelRunner
 from .koth import Scored, Submission, Tier, Tournament
-from .scoring import AxisScore, axis_retention, soft_min
+from .scoring import AxisScore, axis_retention, soft_min, verdict
 from .trajectory import (EvalPoint, Rollout, StepJudge, prepare_refs, sample_points,
                          score_on_points)
 
@@ -35,14 +35,15 @@ class RoundResult:
 
 
 def _retention_from_points(agrees: list[float], teacher_agrees: list[float],
-                           base_agrees: list[float], modes: list[str]) -> tuple[float, float, list[float]]:
-    """Aggregate per-point agreement into normalized retention.
+                           base_agrees: list[float], modes: list[str]
+                           ) -> tuple[float, float, list[float], list[AxisScore]]:
+    """Aggregate per-point agreement into normalized retention + return the axes.
 
     Two axes = the two state-coverage modes (teacher_state, self_state), each
     normalized (student-base)/(teacher-base) and combined by worst-domain soft-min so a
     student strong from good states but drifting from its own is pulled to its weaker
     mode. Per-point agreements (student) are returned aligned for the paired dethrone
-    test.
+    test; the axes are returned so the crown gates (verdict) can run on them.
     """
     axes: list[AxisScore] = []
     for mode in ("teacher_state", "self_state"):
@@ -56,8 +57,8 @@ def _retention_from_points(agrees: list[float], teacher_agrees: list[float],
         b = [base_agrees[i] >= 0.5 for i in idx]
         axes.append(axis_retention(mode, 0.5, t, s, b))
     if not axes:
-        return 0.0, 0.0, agrees
-    return soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True), agrees
+        return 0.0, 0.0, agrees, []
+    return soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True), agrees, axes
 
 
 def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
@@ -88,18 +89,32 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
     # base is scored once — it is the shared denominator for retention
     base_pts = [sp.agreement for sp in score_on_points(points, refs, experience, glm, base, judge, max_new_tokens)]
 
-    def score_one(runner: ModelRunner) -> tuple[float, float, list[float]]:
+    def score_one(runner: ModelRunner):
         ag = [sp.agreement for sp in score_on_points(points, refs, experience, glm, runner, judge, max_new_tokens)]
         return _retention_from_points(ag, [1.0] * len(ag), base_pts, modes)
+
+    def gate(sub: Submission, axes: list[AxisScore]) -> tuple[bool, list[str]]:
+        """All crown gates for one submission, fail-closed. Tier fit + verdict()'s
+        negative-axis (interval test) and min-live-axis checks — so a student that
+        regresses on a live axis, or has no measurable axis, CANNOT be crowned even on an
+        open throne (that path only sees Scored.valid == gates_ok and retention_lb > 0).
+        TODO: pass@k and degeneracy gates need per-point multi-sampling / raw-output
+        threading; wired as passk_ok=True here until that lands (documented gap)."""
+        reasons: list[str] = []
+        if sub.params > tournament.tiers[sub.tier].max_params:
+            reasons.append("over tier param budget")
+        v = verdict(axes, passk_ok=True)
+        reasons += v.reasons
+        return (not reasons), reasons
 
     # 3-4. score every submission
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
     for sub, runner in submissions:
-        ret, ret_lb, per_pt = score_one(runner)
+        ret, ret_lb, per_pt, axes = score_one(runner)
+        ok, reasons = gate(sub, axes)
         s = Scored(sub=sub, retention=ret, retention_lb=ret_lb, per_point=per_pt,
-                   gates_ok=(sub.params <= tournament.tiers[sub.tier].max_params),
-                   reasons=[] if sub.params <= tournament.tiers[sub.tier].max_params else ["over tier param budget"])
+                   gates_ok=ok, reasons=reasons)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
 
@@ -111,7 +126,7 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
         if king is not None:
             king_runner = registry.get(king.model_id)
             if king_runner is not None:
-                ret, ret_lb, per_pt = score_one(king_runner)
+                ret, ret_lb, per_pt, _axes = score_one(king_runner)
                 king_scored = Scored(
                     sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
                     retention=ret, retention_lb=ret_lb, per_point=per_pt, gates_ok=True)

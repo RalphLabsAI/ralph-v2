@@ -34,6 +34,14 @@ class Submission:
     compute_h100h: float     # declared, normalized; reconciled elsewhere
 
 
+# minimum aggregate lower-bound retention to be crownable AT ALL (open or contested).
+# soft_min floors a failed axis to eps=1e-3 to avoid a zero-division in the power mean,
+# so `retention_lb > 0` was a no-op (always true). This real floor gives it teeth: a
+# student whose worst live axis sits at/below base (aggregate LB ~eps) is not crownable,
+# so it cannot grab an open throne at a near-zero score.
+MIN_CROWN_LB = 0.02
+
+
 @dataclass
 class Scored:
     sub: Submission
@@ -45,7 +53,7 @@ class Scored:
 
     @property
     def valid(self) -> bool:
-        return self.gates_ok and self.retention_lb > 0.0
+        return self.gates_ok and self.retention_lb > MIN_CROWN_LB
 
     def per_compute(self) -> float:
         return self.retention / max(self.compute, 1e-6)
