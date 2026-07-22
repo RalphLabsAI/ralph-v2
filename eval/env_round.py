@@ -88,8 +88,19 @@ def env_round(round_no: int, commit_seed: int, pile: list[MTRollout],
     events = []
     for t in tiers:
         king = tournament.kings.get(t.name)
+        if king is not None and registry.get(king.model_id) is None:
+            # FAIL CLOSED: a reigning king exists but its agent can't be re-scored (a
+            # validator restart / registry eviction). Do NOT fall through to the
+            # open-throne branch, which would crown the best challenger with no margin
+            # test and could hand the crown to a model strictly WORSE than the king. Hold
+            # the king this round. (Durable fix: reconstruct the king agent from its
+            # on-chain checkpoint hash — TODO, needs the checkpoint store.)
+            events.append({"tier": t.name, "round": round_no, "action": "hold",
+                           "king": king.model_id, "reason": "king unavailable for re-score"})
+            tournament.kings[t.name].reign += 1
+            continue
         king_scored = None
-        if king is not None and registry.get(king.model_id) is not None:
+        if king is not None:
             ret, ret_lb, per_pt, _ = score_one(registry[king.model_id])
             king_scored = Scored(sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
                                  retention=ret, retention_lb=ret_lb, per_point=per_pt, gates_ok=True)

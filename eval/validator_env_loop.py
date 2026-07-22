@@ -80,10 +80,15 @@ def run_env_round(
         if refund:
             out.refunds[s.sub.miner] = refund
 
-    # same seed -> same points; render as record-friendly dicts (env oracle IS the judge)
+    # same seed -> same points; render as record-friendly dicts. Record the ACTUAL
+    # reference used to check agreement (the deterministic env oracle when teacher=None,
+    # else the pinned GLM agent) — not a hardcoded label — so the record is honestly
+    # reproducible.
+    ref_id = f"reproduce-glm:{getattr(teacher, 'name', teacher_id)}" if teacher is not None \
+        else "env-oracle(deterministic)"
     pts = sample_env_points(pile, n_points, self_frac, seed=commit_seed)
     pt_dicts = [{"rollout_id": p.env_idx, "k": p.k, "mode": p.mode} for p in pts]
     out.record = build_round_record(round_no, commit_root, round_nonce, teacher_id,
-                                    "env-oracle(deterministic)", base_id, pile_id,
+                                    ref_id, base_id, pile_id,
                                     pt_dicts, res.scored, res.events, res.weights)
     return out

@@ -32,7 +32,11 @@ class RegistrationLedger:
     """Per-epoch submission accounting. Rebuildable from chain state (idempotent)."""
 
     per_coldkey_round_cap: int = 2
-    base_bond: float = 0.0                # bond for a 2nd+ submission by the same hotkey
+    # bond for a 2nd+ submission by the same hotkey. NON-ZERO by default: at 0.0 the
+    # anti-grind defense is off and best-of-N crown farming within the per-coldkey cap is
+    # free (the failure that helped kill the prior team's subnet). A validator must
+    # consciously lower it, not silently inherit a disabled bond.
+    base_bond: float = 1.0
     # state
     hotkey_submissions: dict = field(default_factory=dict)      # hotkey -> count this epoch
     coldkey_submissions: dict = field(default_factory=dict)     # coldkey -> count this epoch
