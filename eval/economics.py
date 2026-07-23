@@ -44,16 +44,20 @@ class RegistrationLedger:
     bonds_held: dict = field(default_factory=dict)             # hotkey -> bond posted, pending refund
 
     def can_submit(self, hotkey: str, coldkey: str, bond_posted: float = 0.0) -> SubmitDecision:
-        if self.coldkey_submissions.get(coldkey, 0) >= self.per_coldkey_round_cap:
+        n_cold = self.coldkey_submissions.get(coldkey, 0)
+        if n_cold >= self.per_coldkey_round_cap:
             return SubmitDecision(False, reason=f"coldkey round cap {self.per_coldkey_round_cap} reached")
-        n = self.hotkey_submissions.get(hotkey, 0)
-        if n == 0:
+        # The free eval is per COLDKEY, not per hotkey: an operator that registers two
+        # hotkeys would otherwise get two FREE scored submissions and keep the better —
+        # free best-of-N, the exact grind the bond exists to tax. The coldkey is the
+        # operator-level identity, so it is the unit the bond must escalate on.
+        if n_cold == 0:
             return SubmitDecision(True, bond_required=0.0, reason="free eval")
         # resubmission: a bond is required (refunded on self-improvement)
-        need = self.base_bond * n
+        need = self.base_bond * n_cold
         if bond_posted + 1e-9 < need:
             return SubmitDecision(False, bond_required=need,
-                                  reason=f"resubmission #{n+1} requires bond {need}")
+                                  reason=f"resubmission #{n_cold+1} (coldkey) requires bond {need}")
         return SubmitDecision(True, bond_required=need, reason="bonded resubmission")
 
     def record(self, hotkey: str, coldkey: str, bond_posted: float = 0.0) -> None:

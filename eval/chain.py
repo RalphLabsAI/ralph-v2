@@ -36,9 +36,14 @@ class Commitment:
     hotkey: str
     coldkey: str
     tier: str
-    ckpt_dir: str              # local path after fetch+verify against the revealed hash
+    ckpt_dir: str              # local path; intake fetch-verifies it against the reveal
     declared_compute_h100h: float
     bond_posted: float = 0.0
+    # commit-reveal: the sealed on-chain value + what the miner revealed. intake
+    # recomputes the artifact hash and refuses a mismatch (bait-and-switch).
+    revealed_hash: str = ""
+    salt: str = ""
+    committed_value: str = ""
 
 
 @runtime_checkable
@@ -54,6 +59,10 @@ class ChainIO(Protocol):
     def get_king(self, tier: str) -> object | None: ...
     def blacklist(self, hotkey: str, reason: str) -> None: ...
     def publish_record(self, record: RoundRecord) -> None: ...
+    # settle refundable anti-grind bonds. Without this the ledger computes refunds
+    # and drops them, so the bond is never actually returned (or forfeited) on
+    # chain and the anti-grind economics are theatre.
+    def settle_bonds(self, refunds: dict) -> None: ...
 
 
 @dataclass
@@ -94,6 +103,7 @@ def run_v2_epoch(
             hotkey=c.hotkey, coldkey=c.coldkey, tier=c.tier, ckpt_dir=c.ckpt_dir,
             declared_compute_h100h=c.declared_compute_h100h, bond_posted=c.bond_posted,
             make_runner=(lambda cd=c.ckpt_dir: make_safe_runner(cd)),
+            revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value,
         )
         for c in commits
     ]
@@ -139,7 +149,8 @@ def run_v2_env_epoch(
     committed = [
         EnvCommitted(hotkey=c.hotkey, coldkey=c.coldkey, tier=c.tier, ckpt_dir=c.ckpt_dir,
                      declared_compute_h100h=c.declared_compute_h100h, bond_posted=c.bond_posted,
-                     make_agent=(lambda cd=c.ckpt_dir: make_agent(cd)))
+                     make_agent=(lambda cd=c.ckpt_dir: make_agent(cd)),
+                     revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value)
         for c in commits
     ]
     outcome = run_env_round(
@@ -158,6 +169,10 @@ def _write_back(chain: ChainIO, tiers, tournament, outcome, round_no) -> EpochRe
         if king is not None:
             chain.set_king(tier.name, king.miner, king.model_id)
     chain.set_weights(outcome.weights)
+    if getattr(outcome, "refunds", None):
+        settle = getattr(chain, "settle_bonds", None)
+        if settle is not None:
+            settle(outcome.refunds)
     if outcome.record is not None:
         chain.publish_record(outcome.record)
     return EpochResult(round_no, outcome, outcome.record.sha256() if outcome.record else "")

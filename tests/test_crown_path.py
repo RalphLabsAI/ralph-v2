@@ -323,11 +323,34 @@ def test_round_record_signature():
     assert not r2.verify_signature(), "tampered score still verified"
 
 
+def test_economics_free_eval_is_per_coldkey():
+    """The free eval must be per COLDKEY: an operator registering two hotkeys otherwise gets
+    two FREE scored submissions and keeps the better — free best-of-N, the grind the bond
+    exists to tax."""
+    from eval.economics import RegistrationLedger
+    led = RegistrationLedger(per_coldkey_round_cap=3, base_bond=1.0)
+
+    d1 = led.can_submit("hot1", "cold1")
+    assert d1.ok and d1.bond_required == 0.0, "first submission should be free"
+    led.record("hot1", "cold1")
+
+    # SAME coldkey, DIFFERENT hotkey -> must now cost a bond, not be free again
+    d2 = led.can_submit("hot2", "cold1")
+    assert not d2.ok and d2.bond_required > 0, f"second hotkey got a free eval: {d2}"
+    d2b = led.can_submit("hot2", "cold1", bond_posted=d2.bond_required)
+    assert d2b.ok, "bonded resubmission rejected"
+
+    # a genuinely different operator is still free
+    d3 = led.can_submit("hot9", "cold2")
+    assert d3.ok and d3.bond_required == 0.0
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
-             test_content_identity_and_commit_reveal, test_round_record_signature]
+             test_content_identity_and_commit_reveal, test_round_record_signature,
+             test_economics_free_eval_is_per_coldkey]
     failed = 0
     for t in tests:
         try:
