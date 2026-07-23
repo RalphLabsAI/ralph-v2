@@ -163,9 +163,39 @@ def test_numeric_first_marker():
     assert _extract_int("The total is Answer: 1946 credits.") == "1946"
 
 
+def test_diff_in_diff_gate():
+    """The genre-overfit detector must flag ONLY the student whose edge over base collapses
+    on fresh same-genre items — a genre-overfitter — and NOT an honest generalizer, a
+    uniformly weak-but-honest student, or a uniformly strong one (the controls that prove
+    the diff isolates overfit, not natural stale/fresh difficulty)."""
+    from eval.overfit_gate import diff_in_diff_gate
+    N = 300
+
+    def mask(rate, seed):
+        r = random.Random(seed)
+        return [r.random() < rate for _ in range(N)]
+
+    tp = [True] * N                       # teacher passes all (simplify)
+    base_stale, base_fresh = mask(0.30, 1), mask(0.30, 2)
+
+    def sets(s_stale, s_fresh, seed):
+        return ({"teacher_pass": tp, "student_pass": mask(s_stale, seed), "base_pass": base_stale},
+                {"teacher_pass": tp, "student_pass": mask(s_fresh, seed + 50), "base_pass": base_fresh})
+
+    ok_honest, _ = diff_in_diff_gate(*sets(0.70, 0.70, 10))          # generalizes
+    ok_overfit, info = diff_in_diff_gate(*sets(0.90, 0.45, 20))      # stale >> fresh
+    ok_weak, _ = diff_in_diff_gate(*sets(0.35, 0.35, 30))            # uniformly weak (control)
+    ok_strong, _ = diff_in_diff_gate(*sets(0.92, 0.92, 40))         # uniformly strong (control)
+
+    assert ok_honest, "honest generalizer wrongly flagged"
+    assert not ok_overfit, f"genre-overfitter not flagged: {info}"
+    assert ok_weak, "uniformly-weak control wrongly flagged (diff is a difficulty artifact!)"
+    assert ok_strong, "uniformly-strong control wrongly flagged"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
-             test_code_extractor_robust, test_numeric_first_marker]
+             test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate]
     failed = 0
     for t in tests:
         try:
