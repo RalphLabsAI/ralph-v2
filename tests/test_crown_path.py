@@ -240,10 +240,33 @@ def test_diff_in_diff_over_corpus():
     assert not ok_m, f"memorizer not flagged: {info_m}"
 
 
+def test_axis_round_overfit_precondition():
+    """A genre-overfitter with STRONGER capability retention must NOT crown: the overfit_check
+    crown precondition demotes it even though it would win the axes outright."""
+    specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
+    tiers = [Tier("t", 10 ** 12, 1.0)]
+    tour, reg = Tournament(tiers, margin=0.03), {}
+    glm = _Sim("glm", {"x": 1.0, "y": 1.0})
+    base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
+    honest = (Submission("m_h", "t", "honest", 1, 1.0), _Sim("honest", {"x": 0.85, "y": 0.85}, seed=1))
+    overfit = (Submission("m_o", "t", "overfit", 1, 1.0), _Sim("overfit", {"x": 0.95, "y": 0.95}, seed=2))
+
+    def overfit_check(sub, runner):   # flags the overfitter (in prod: diff_in_diff_over_corpus)
+        flagged = sub.model_id == "overfit"
+        return (not flagged), {"verdict": "genre-overfit" if flagged else "ok",
+                               "diff_lb": 0.55 if flagged else -0.10}
+
+    res = axis_round(1, 1, specs, glm, base, tiers, tour, [honest, overfit], registry=reg,
+                     items_per_axis=80, max_new_tokens=8, overfit_check=overfit_check)
+    assert not res.scored["overfit"].gates_ok, "flagged overfitter still crownable"
+    assert res.scored["honest"].gates_ok
+    assert tour.kings["t"].model_id == "honest", "overfitter crowned despite the gate"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
-             test_diff_in_diff_over_corpus]
+             test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition]
     failed = 0
     for t in tests:
         try:

@@ -95,7 +95,14 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
                submissions: list[tuple[Submission, ModelRunner]],
                registry: dict[str, ModelRunner] | None = None,
                items_per_axis: int = 64, max_new_tokens: int = 512,
-               items: RoundItems | None = None, base_pass: dict | None = None) -> RoundResult:
+               items: RoundItems | None = None, base_pass: dict | None = None,
+               overfit_check=None) -> RoundResult:
+    """`overfit_check(submission, runner) -> (ok, info)`: optional crown PRECONDITION — the
+    stale-vs-fresh diff-in-diff genre-overfit gate (overfit_gate.diff_in_diff_over_corpus,
+    closed over the round's timestamped corpus + pinned teacher/base). A flagged student is
+    NOT crownable regardless of its capability retention, so acing the (pre-distillable)
+    covered distribution can't buy the crown if the edge collapses on genuinely-fresh
+    same-genre documents. Skipped when None."""
     from .seeds import derive_seed
     tournament.round = round_no
     registry = registry if registry is not None else {}
@@ -133,6 +140,11 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
     for sub, runner in submissions:
         ret, ret_lb, per_pt, per_ax, axes, outs = _score_student(specs, items, base_pass, runner, max_new_tokens)
         ok, reasons = gate(sub, axes, outs)
+        if overfit_check is not None and ok:   # only run the corpus gate on a crownable student
+            of_ok, of_info = overfit_check(sub, runner)
+            if not of_ok:
+                ok = False
+                reasons = reasons + [f"genre-overfit ({of_info.get('verdict')}, diff_lb {of_info.get('diff_lb')})"]
         s = Scored(sub=sub, retention=ret, retention_lb=ret_lb, per_point=per_pt,
                    gates_ok=ok, reasons=reasons, per_axis=per_ax, axes=axes)
         scored[sub.model_id] = s
