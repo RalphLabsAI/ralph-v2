@@ -341,12 +341,37 @@ def test_economics_free_eval_is_per_coldkey():
     assert d3.ok and d3.bond_required == 0.0
 
 
+def test_multihop_axis():
+    """The stated facts must actually compose to the answer; the shortcut distractor (the
+    final relation applied directly to the start entity) must NOT be accepted, or the axis
+    is 1-hop pattern-matching wearing a multi-hop costume."""
+    import re as _re
+    from eval.axes.multihop import MultiHop
+    ax = MultiHop()
+    for seed in (0, 4, 9):
+        for d in (1, 2, 3):
+            for it in ax.generate(seed, 8, d):
+                facts = {}
+                body = it.prompt.split("Facts:\n", 1)[1].split("\n\nUsing")[0]
+                for line in body.splitlines():
+                    m = _re.match(r"The (\w+) of (\w+) is (\w+)\.", line)
+                    if m:
+                        facts[(m.group(2), m.group(1))] = m.group(3)
+                q = it.prompt.split("what is ", 1)[1].split("? Reply")[0]
+                cur = _re.search(r"of (\w+)$", q).group(1)
+                for r in _re.findall(r"the (\w+) of", q)[::-1]:   # innermost hop first
+                    cur = facts.get((cur, r))
+                assert cur == it.answer, f"facts do not compose: {cur} != {it.answer}"
+                assert ax.check(it, f"Answer: {it.answer}"), "correct answer rejected"
+                assert not ax.check(it, f"Answer: {it.meta['trap']}"), "shortcut trap accepted"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
              test_content_identity_and_commit_reveal, test_round_record_signature,
-             test_economics_free_eval_is_per_coldkey]
+             test_economics_free_eval_is_per_coldkey, test_multihop_axis]
     failed = 0
     for t in tests:
         try:

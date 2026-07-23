@@ -27,6 +27,7 @@ from eval.axes.code_exec import CodeExec
 from eval.axes.instruction import InstructionFollowing
 from eval.axes.long_context import LongContext
 from eval.axes.math_gsm import MathGSM
+from eval.axes.multihop import MultiHop
 from eval.axis_round import AxisSpec, axis_round
 from eval.koth import Submission, Tier, Tournament
 from eval.runners import HFRunner
@@ -59,6 +60,8 @@ def main() -> int:
         AxisSpec(CodeExec(), "code", weight=1.0, difficulty=2),
         AxisSpec(InstructionFollowing(), "instruction", weight=1.0, difficulty=1),
         AxisSpec(LongContext(base_facts=12), "long_context", weight=1.0, difficulty=1),
+        # second fragile axis: COMPOSITION (each hop compounds), distinct from retrieval
+        AxisSpec(MultiHop(), "multihop", weight=1.0, difficulty=1),
     ]
     tiers = [Tier("open", max_params=10**12, weight=1.0)]
     tour = Tournament(tiers, margin=0.03)
