@@ -31,28 +31,11 @@ class Manifest:
     format_version: int = 1
 
 
-def content_hash(ckpt_dir: str | Path, chunk: int = 1 << 20) -> str:
-    """Deterministic hash over the sorted .safetensors files' bytes."""
-    d = Path(ckpt_dir)
-    files = sorted(p for p in d.rglob("*.safetensors"))
-    if not files:
-        raise ValueError("no .safetensors weights to hash")
-    h = hashlib.sha256()
-    for p in files:
-        h.update(p.name.encode())
-        h.update(b"\x00")
-        with open(p, "rb") as f:
-            while True:
-                b = f.read(chunk)
-                if not b:
-                    break
-                h.update(b)
-    return h.hexdigest()
-
-
-def commit_value(chash: str, salt: str) -> str:
-    """The on-chain commitment (sealed): H(content_hash ‖ salt). Revealed later."""
-    return hashlib.sha256(f"{chash}:{salt}".encode()).hexdigest()
+# Identity MUST be byte-identical to the validator's or commit-reveal can NEVER verify.
+# This module previously hashed only *.safetensors (leaving config/tokenizer swappable
+# after commit) and sealed with a different separator than the validator — either alone
+# breaks every reveal. Both now delegate to the single shared implementation.
+from eval.identity import commit_value, content_hash  # noqa: F401  (re-exported API)
 
 
 def build_submission(ckpt_dir: str | Path, tier: str, teacher_pair: str,

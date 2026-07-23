@@ -37,6 +37,9 @@ class CommittedSubmission:
     declared_compute_h100h: float
     bond_posted: float = 0.0
     make_agent: object = None   # callable() -> Agent (ModelAgent(SafeStudentRunner) in prod)
+    revealed_hash: str = ""
+    salt: str = ""
+    committed_value: str = ""
 
 
 @dataclass
@@ -61,11 +64,13 @@ def run_env_round(
 
     subs = []
     for c in committed:
-        d = intake(c.ckpt_dir, tier_budgets[c.tier], ledger, c.hotkey, c.coldkey, c.bond_posted)
+        d = intake(c.ckpt_dir, tier_budgets[c.tier], ledger, c.hotkey, c.coldkey, c.bond_posted,
+                   revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value)
         if not d.accepted:
             out.rejected.append((c.hotkey, d.reasons))
             continue
-        sub = Submission(miner=c.hotkey, tier=c.tier, model_id=c.hotkey,
+        # model_id = CONTENT HASH (not the hotkey) — see validator_loop for why.
+        sub = Submission(miner=c.hotkey, tier=c.tier, model_id=d.content_hash,
                          params=d.inspection.params, compute_h100h=c.declared_compute_h100h)
         subs.append((sub, c.make_agent()))
         out.accepted.append(c.hotkey)

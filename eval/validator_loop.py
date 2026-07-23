@@ -39,6 +39,11 @@ class CommittedSubmission:
     declared_compute_h100h: float
     bond_posted: float = 0.0
     make_runner: object = None   # callable() -> ModelRunner (SafeStudentRunner in prod)
+    # commit-reveal (optional): when all three are set, intake fetch-verifies the artifact
+    # against the on-chain commitment before it is loaded.
+    revealed_hash: str = ""
+    salt: str = ""
+    committed_value: str = ""
 
 
 @dataclass
@@ -63,12 +68,16 @@ def run_validator_round(
     # 1. intake — fail-closed, cheapest-first; never builds a runner before gates pass
     subs = []
     for c in committed:
-        d = intake(c.ckpt_dir, tier_budgets[c.tier], ledger, c.hotkey, c.coldkey, c.bond_posted)
+        d = intake(c.ckpt_dir, tier_budgets[c.tier], ledger, c.hotkey, c.coldkey, c.bond_posted,
+                   revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value)
         if not d.accepted:
             out.rejected.append((c.hotkey, d.reasons))
             continue
         runner = c.make_runner()
-        sub = Submission(miner=c.hotkey, tier=c.tier, model_id=c.hotkey,  # id = content hash in prod
+        # model_id = CONTENT HASH (not the hotkey): binds the scored artifact to the
+        # committed one, makes koth's copy-guard content-based, and stops two subs from one
+        # hotkey colliding in the registry.
+        sub = Submission(miner=c.hotkey, tier=c.tier, model_id=d.content_hash,
                          params=d.inspection.params, compute_h100h=c.declared_compute_h100h)
         subs.append((sub, runner))
         out.accepted.append(c.hotkey)

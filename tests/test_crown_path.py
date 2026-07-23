@@ -263,10 +263,45 @@ def test_axis_round_overfit_precondition():
     assert tour.kings["t"].model_id == "honest", "overfitter crowned despite the gate"
 
 
+def test_content_identity_and_commit_reveal():
+    """model_id must be content-addressed and the scored artifact must be the committed
+    one. Covers: determinism, weights swap after commit (bait-and-switch), CONFIG swap
+    alone changing identity (the weights-only miner hash missed this), and a salt that
+    doesn't open the commitment."""
+    import tempfile
+    from pathlib import Path
+    from eval.identity import commit_value, content_hash, verify_reveal
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d)
+        (p / "model.safetensors").write_bytes(b"WEIGHTS-v1")
+        (p / "config.json").write_text('{"hidden":8}')
+        h1 = content_hash(d)
+        assert h1 == content_hash(d), "hash not deterministic"
+
+        salt, cv = "s3cr3t", commit_value(content_hash(d), "s3cr3t")
+        ok, res = verify_reveal(d, h1, salt, cv)
+        assert ok and res == h1
+
+        (p / "model.safetensors").write_bytes(b"WEIGHTS-v2")          # swap weights
+        ok, why = verify_reveal(d, h1, salt, cv)
+        assert not ok and "bait-and-switch" in why, why
+
+        (p / "model.safetensors").write_bytes(b"WEIGHTS-v1")          # restore
+        assert content_hash(d) == h1
+        (p / "config.json").write_text('{"hidden":16}')                # config-only swap
+        assert content_hash(d) != h1, "config swap left identity unchanged"
+
+        h3 = content_hash(d)
+        ok, why = verify_reveal(d, h3, "wrong-salt", commit_value(h3, salt))
+        assert not ok and "commit mismatch" in why, why
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
-             test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition]
+             test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
+             test_content_identity_and_commit_reveal]
     failed = 0
     for t in tests:
         try:

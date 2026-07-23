@@ -23,10 +23,17 @@ class IntakeDecision:
     inspection: Inspection | None = None
     bond_required: float = 0.0
     reasons: list = field(default_factory=list)
+    # content hash of the accepted artifact — the model_id used downstream. Binds the
+    # scored artifact to the committed one (bait-and-switch) and makes koth's copy-guard
+    # content-based rather than hotkey-based.
+    content_hash: str = ""
 
 
 def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | None = None,
-           hotkey: str = "", coldkey: str = "", bond_posted: float = 0.0) -> IntakeDecision:
+           hotkey: str = "", coldkey: str = "", bond_posted: float = 0.0,
+           revealed_hash: str = "", salt: str = "", committed_value: str = "") -> IntakeDecision:
+    """`revealed_hash`/`salt`/`committed_value`: when all three are supplied, the artifact
+    is fetch-verified against the on-chain commit-reveal before it is ever loaded."""
     reasons: list[str] = []
 
     # 1. economics first — cheapest, and stops spam before any file work
@@ -48,7 +55,21 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
     if not ok:
         return IntakeDecision(False, insp, reasons=tier_reasons)
 
+    # 4. identity: content-hash the artifact, and fetch-verify it against the commitment
+    #    when one was supplied. Done before any runner is built (no untrusted load yet).
+    from .identity import content_hash, verify_reveal
+    if revealed_hash and salt and committed_value:
+        ok, res = verify_reveal(ckpt_dir, revealed_hash, salt, committed_value)
+        if not ok:
+            return IntakeDecision(False, insp, reasons=[f"commit-reveal: {res}"])
+        chash = res
+    else:
+        try:
+            chash = content_hash(ckpt_dir)
+        except Exception as e:
+            return IntakeDecision(False, insp, reasons=[f"identity: {e}"])
+
     # accepted — record the submission (degeneracy + pass@k gates run later, on outputs)
     if ledger is not None:
         ledger.record(hotkey, coldkey, bond_posted)
-    return IntakeDecision(True, insp, reasons=[])
+    return IntakeDecision(True, insp, reasons=[], content_hash=chash)
