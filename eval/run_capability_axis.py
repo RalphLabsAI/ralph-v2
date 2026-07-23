@@ -25,6 +25,7 @@ import time
 
 from eval.axes.code_exec import CodeExec
 from eval.axes.instruction import InstructionFollowing
+from eval.axes.long_context import LongContext
 from eval.axes.math_gsm import MathGSM
 from eval.axis_round import AxisSpec, axis_round
 from eval.koth import Submission, Tier, Tournament
@@ -54,6 +55,8 @@ def main() -> int:
         AxisSpec(MathGSM(), "math", weight=1.0, difficulty=DIFF),
         AxisSpec(CodeExec(), "code", weight=1.0, difficulty=DIFF),
         AxisSpec(InstructionFollowing(), "instruction", weight=1.0, difficulty=DIFF),
+        # the fragile axis the current cover lacks — GLM competence gates its liveness
+        AxisSpec(LongContext(), "long_context", weight=1.0, difficulty=DIFF),
     ]
     tiers = [Tier("open", max_params=10**12, weight=1.0)]
     tour = Tournament(tiers, margin=0.03)
@@ -78,12 +81,16 @@ def main() -> int:
               "weights": res.weights, "scored": {}}
     log("=== per-student retention (worst-domain soft-min) ===")
     for mid, s in res.scored.items():
+        # per-axis teacher-passed count (len of the paired vector) — a proxy for liveness:
+        # an axis with < MIN_AXIS_N(30) teacher-passed items is non-live (GLM not competent
+        # enough on it this round) and is excluded from the worst-domain aggregate.
+        axis_n = {ax: len(v) for ax, v in s.per_axis.items()}
         report["scored"][mid] = {"retention": round(s.retention, 4),
                                  "retention_lb": round(s.retention_lb, 4),
                                  "gates_ok": s.gates_ok, "reasons": s.reasons,
-                                 "valid": s.valid}
+                                 "valid": s.valid, "axis_teacher_passed": axis_n}
         log(f"  {mid.split('/')[-1]:24} retention={s.retention:.3f} lb={s.retention_lb:.3f} "
-            f"valid={s.valid} {'' if s.gates_ok else s.reasons}")
+            f"valid={s.valid} axis_n={axis_n} {'' if s.gates_ok else s.reasons}")
 
     king = tour.kings.get("open")
     log(f"crown: {king.model_id if king else None}  weights={res.weights}")
