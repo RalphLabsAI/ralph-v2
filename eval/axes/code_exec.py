@@ -177,10 +177,18 @@ class CodeExec:
             args_list = spec["cases"](rng)
             expected = [spec["oracle"](*a) for a in args_list]
             tests = [{"args": list(a), "expect": e} for a, e in zip(args_list, expected)]
+            # NOTE: the instruction must NOT contain a literal ```python fence. It used to,
+            # and an unclosed fence in the PROMPT pushed the teacher into echoing that
+            # pattern: it emitted ```python + code, then opened ANOTHER ```python instead
+            # of closing, looping until the token cap. That produced systematic false
+            # failures and made the axis look far harder than it is (GLM measured ~42%
+            # while writing correct logic). Describe the format instead of showing it.
             prompt = (
                 f"Implement this function in Python.\n\n"
                 f"{spec['sig']}:\n    \"\"\"{spec['doc']}\"\"\"\n\n"
-                "Return ONLY the complete function definition in a ```python code block."
+                "Reply with only the complete function definition, inside a single fenced "
+                "Python code block. Close the fence. Do not repeat the block and do not "
+                "add explanation."
             )
             items.append(Item(
                 axis=self.name, prompt=prompt,
