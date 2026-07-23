@@ -54,6 +54,8 @@ class Scored:
     # dethrone test uses the WORST axis, not the pooled `per_point`, so worst-domain
     # governs dethroning as well as crown selection. Empty -> legacy pooled fallback.
     per_axis: dict = field(default_factory=dict)
+    # per-axis AxisScore objects (retention/n/live) for the record + diagnosis. Optional.
+    axes: list = field(default_factory=list)
 
     @property
     def valid(self) -> bool:

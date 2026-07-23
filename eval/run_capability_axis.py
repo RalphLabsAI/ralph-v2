@@ -86,13 +86,17 @@ def main() -> int:
         # per-axis teacher-passed count (len of the paired vector) — a proxy for liveness:
         # an axis with < MIN_AXIS_N(30) teacher-passed items is non-live (GLM not competent
         # enough on it this round) and is excluded from the worst-domain aggregate.
-        axis_n = {ax: len(v) for ax, v in s.per_axis.items()}
+        per_axis = {a.axis: {"ret": round(a.retention, 3), "n": a.n, "live": a.live,
+                             "student_pass": a.student_pass, "base_pass": a.base_pass}
+                    for a in s.axes}
         report["scored"][mid] = {"retention": round(s.retention, 4),
                                  "retention_lb": round(s.retention_lb, 4),
                                  "gates_ok": s.gates_ok, "reasons": s.reasons,
-                                 "valid": s.valid, "axis_teacher_passed": axis_n}
-        log(f"  {mid.split('/')[-1]:24} retention={s.retention:.3f} lb={s.retention_lb:.3f} "
-            f"valid={s.valid} axis_n={axis_n} {'' if s.gates_ok else s.reasons}")
+                                 "valid": s.valid, "per_axis": per_axis}
+        pa = " ".join(f"{ax}={d['ret']:.2f}({'L' if d['live'] else 'x'}{d['n']})"
+                      for ax, d in per_axis.items())
+        log(f"  {mid.split('/')[-1]:22} ret={s.retention:.3f} valid={s.valid} | {pa}"
+            f" {'' if s.gates_ok else s.reasons}")
 
     king = tour.kings.get("open")
     log(f"crown: {king.model_id if king else None}  weights={res.weights}")

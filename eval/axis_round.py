@@ -134,7 +134,7 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
         ret, ret_lb, per_pt, per_ax, axes, outs = _score_student(specs, items, base_pass, runner, max_new_tokens)
         ok, reasons = gate(sub, axes, outs)
         s = Scored(sub=sub, retention=ret, retention_lb=ret_lb, per_point=per_pt,
-                   gates_ok=ok, reasons=reasons, per_axis=per_ax)
+                   gates_ok=ok, reasons=reasons, per_axis=per_ax, axes=axes)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
 
