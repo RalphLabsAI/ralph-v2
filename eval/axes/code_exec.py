@@ -91,23 +91,30 @@ class CodeExec:
 
     @staticmethod
     def _extract_code(output: str) -> str | None:
-        """Robust code extraction. Real models emit malformed/multiple fences (```python
-        code block, a bare ``` then ```python, prose around the block); a strict fence
-        regex silently drops a CORRECT answer -> false 0 -> worst-domain soft-min inverts
-        the ranking (a capable model scored 0/22 on formatting quirks). So: match a lenient
-        fence (any info string), prefer the block that actually contains a def, and on the
-        unfenced fallback cut any trailing fence."""
-        # lenient fence: ``` + arbitrary info string (may be malformed) + newline + body
+        """Robust extraction across real output styles (checker quality is the crown's
+        floor — a fence quirk once scored capable models at 0/N). Handles: a stray leading
+        bare ``` + prose BEFORE the real ```python block (odd fence count misaligns naive
+        pairing and eats the code as a delimiter — a 1.5B failure, 0/40); imports BEFORE the
+        def (dropping them -> NameError); malformed info strings (```python code block).
+        Strategy: prefer an explicitly python-tagged block (holds imports+def and survives
+        the stray fence), then any def-containing lenient block, then an unfenced run."""
+        has_def = lambda b: re.search(r"(?:^|\n)[ \t]*def ", b) is not None
+        # 1) python-tagged block — info string may be malformed ("python code block")
+        py = re.findall(r"```[ \t]*(?:python|py)\b[^\n]*\n(.*?)```", output, re.S | re.I)
+        cand = [b for b in py if has_def(b)]
+        if cand:
+            return cand[-1]
+        # 2) any lenient fenced block containing a def
         blocks = re.findall(r"```[^\n]*\n(.*?)```", output, re.S)
-        with_def = [b for b in blocks if "def " in b]
-        if with_def:
-            return with_def[-1]
+        cand = [b for b in blocks if has_def(b)]
+        if cand:
+            return cand[-1]
+        # 3) unfenced: from the first import/def line, cut a trailing fence/prose
+        m = re.search(r"(?:^|\n)(?:import |from |def )", output)
+        if m:
+            return re.split(r"\n```", output[m.start():].lstrip("\n"))[0].strip("\n") or None
         nonempty = [b for b in blocks if b.strip()]
-        if nonempty:
-            return nonempty[-1]
-        if "def " in output:  # unfenced — take from def, drop any trailing fence/prose
-            return re.split(r"\n```", output[output.index("def "):])[0]
-        return None
+        return nonempty[-1] if nonempty else None
 
     def check(self, item: Item, output: str) -> bool:
         code = self._extract_code(output)

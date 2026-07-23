@@ -128,27 +128,44 @@ def test_long_context_checker():
 
 
 def test_code_extractor_robust():
-    """Real models emit malformed / doubled code fences; the extractor must still recover
-    the correct code. A fence quirk once scored a correct Qwen-3B at 0/22 on the code axis,
-    and worst-domain soft-min then ranked it BELOW a 1.5B (real capability run, 2026-07-23)."""
+    """Real models emit malformed/doubled fences, a stray leading bare ``` + prose, and
+    imports before the def. The extractor must still recover correct code. These exact
+    styles scored a correct 3B at 0/22 and a 1.5B at 0/40 (real capability + capture runs,
+    2026-07-23) -> worst-domain soft-min then inverted the whole ranking."""
     ax = CodeExec()
     items = {it.answer["fn"]: it for it in ax.generate(seed=1, n=3, difficulty=2)}
     cases = {
         # malformed info string: ```python code block
         "count_divisible": (" ```python code block\ndef count_divisible(nums, k):\n"
                             "    return sum(1 for x in nums if x % k == 0)\n```"),
-        # doubled fence: bare ``` then ```python
-        "running_max": (" ```\n```python\ndef running_max(nums):\n    out=[]; m=None\n"
+        # stray leading bare ``` + prose BEFORE the real block + import before def (1.5B)
+        "running_max": (" ``` The input list is small.\n```python\nfrom typing import List\n"
+                        "def running_max(nums: List[int]) -> List[int]:\n    out=[]; m=None\n"
                         "    for x in nums:\n        m = x if m is None else max(m,x)\n"
                         "        out.append(m)\n    return out\n```"),
+        # import needed by the body sits ABOVE the def (must not be dropped) (1.5B)
+        "collapse_spaces": ("Here is the code:\n```python\nimport re\n"
+                            "def collapse_spaces(s: str) -> str:\n"
+                            "    return ' '.join(re.findall(r'\\S+', s))\n```"),
     }
     for fn, out in cases.items():
         assert ax.check(items[fn], out), fn
 
 
+def test_numeric_first_marker():
+    """math/long_context must read the number after the FIRST answer marker: a model that
+    answers correctly then keeps writing (or degenerates into repeated 'Answer:' lines)
+    otherwise has the wrong number pulled from the tail (real 1.5B long_context failure)."""
+    from eval.axes.math_gsm import extract_answer
+    from eval.axes.long_context import _extract_int
+    assert extract_answer("Answer: 42\n\nHere is the working: 3 + 4 = 7 ...") == "42"
+    assert _extract_int("Answer: 2\n\nAnswer: 1\nAnswer: 1\nAnswer: 1") == "2"
+    assert _extract_int("The total is Answer: 1946 credits.") == "1946"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
-             test_code_extractor_robust]
+             test_code_extractor_robust, test_numeric_first_marker]
     failed = 0
     for t in tests:
         try:

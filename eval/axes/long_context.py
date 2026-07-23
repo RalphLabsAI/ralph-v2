@@ -44,9 +44,14 @@ _NUM = re.compile(r"-?\d+(?:,\d{3})*")
 def _extract_int(output: str) -> str | None:
     if not output:
         return None
+    # number after the FIRST answer marker (a model that answers then degenerates into
+    # repeated "Answer:" lines otherwise has the wrong one pulled from the tail).
     tail = re.split(r"(?i)(?:final answer|answer)\s*[:=]", output)
-    seg = tail[-1] if len(tail) > 1 else output
-    nums = _NUM.findall(seg)
+    if len(tail) > 1:
+        nums = _NUM.findall(tail[1])
+        if nums:
+            return nums[0].replace(",", "")
+    nums = _NUM.findall(output)
     return nums[-1].replace(",", "") if nums else None
 
 

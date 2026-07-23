@@ -135,9 +135,12 @@ def extract_answer(output: str) -> str | None:
         nums = _NUM.findall(boxed[-1])
         if nums:
             return nums[-1].replace(",", "")
+    # take the number after the FIRST answer marker, not the last: a model that states its
+    # answer then keeps writing (or degenerates into repeated "Answer:" lines) otherwise
+    # gets the wrong number pulled from the tail.
     tail = re.split(r"(?i)(?:final answer|answer)\s*[:=]", output)
     if len(tail) > 1:
-        nums = _NUM.findall(tail[-1])
+        nums = _NUM.findall(tail[1])
         if nums:
             return nums[0].replace(",", "")
     nums = _NUM.findall(output)
