@@ -1,0 +1,109 @@
+"""Capability-retention run — does the axis_round crown discriminate REAL capability?
+
+The audit found the crown was never exercised on real models at HEAD (the one real run
+tied a 3B and a 1.5B student at 0.5193). This is the capability analog of the S1 check:
+run a REAL GLM teacher + a capability LADDER of off-the-shelf students through the actual
+axis_round crown path (math + code + instruction, deterministic checkers) and confirm:
+
+  * normalized retention RANKS the students by capability (3B > 1.5B > 0.5B), and
+  * the crown goes to the most capable, while a base-equivalent "student" is gate-rejected,
+  * GLM (the teacher) is competent enough per axis that each axis is LIVE (>= MIN_AXIS_N).
+
+No distillation here — off-the-shelf Qwen models of different sizes are capability proxies;
+the point is to de-risk the CROWN MECHANISM on real models before broadening the cover.
+This is covering-first v2 groundwork (const's gate), not the drift experiment.
+
+    python -m eval.run_capability_axis 2>&1 | tee runs/cap.log
+
+Env: RALPH_TEACHER, RALPH_BASE, RALPH_STUDENTS (comma-sep), RALPH_ITEMS, RALPH_DIFF, RALPH_OUT.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+
+from eval.axes.code_exec import CodeExec
+from eval.axes.instruction import InstructionFollowing
+from eval.axes.math_gsm import MathGSM
+from eval.axis_round import AxisSpec, axis_round
+from eval.koth import Submission, Tier, Tournament
+from eval.runners import HFRunner
+
+TEACHER = os.environ.get("RALPH_TEACHER", "THUDM/glm-4-9b-chat-hf")
+BASE = os.environ.get("RALPH_BASE", "Qwen/Qwen2.5-0.5B-Instruct")
+STUDENTS = os.environ.get(
+    "RALPH_STUDENTS", "Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-1.5B-Instruct,Qwen/Qwen2.5-0.5B-Instruct"
+).split(",")
+ITEMS = int(os.environ.get("RALPH_ITEMS", "48"))
+DIFF = int(os.environ.get("RALPH_DIFF", "2"))
+MAXTOK = int(os.environ.get("RALPH_MAXTOK", "512"))
+BATCH = int(os.environ.get("RALPH_BATCH", "16"))
+OUT = os.environ.get("RALPH_OUT", "runs/cap")
+
+
+def log(*a):
+    print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+
+
+def main() -> int:
+    os.makedirs(OUT, exist_ok=True)
+    log(f"teacher={TEACHER} base={BASE} students={STUDENTS} items/axis={ITEMS} diff={DIFF}")
+
+    specs = [
+        AxisSpec(MathGSM(), "math", weight=1.0, difficulty=DIFF),
+        AxisSpec(CodeExec(), "code", weight=1.0, difficulty=DIFF),
+        AxisSpec(InstructionFollowing(), "instruction", weight=1.0, difficulty=DIFF),
+    ]
+    tiers = [Tier("open", max_params=10**12, weight=1.0)]
+    tour = Tournament(tiers, margin=0.03)
+
+    glm = HFRunner(TEACHER, name="glm", trust_remote_code=True, batch_size=BATCH)
+    base = HFRunner(BASE, name="base", batch_size=BATCH)
+
+    # capability ladder as submissions (off-the-shelf models = capability proxies)
+    subs = []
+    for i, mid in enumerate(STUDENTS):
+        r = HFRunner(mid, name=mid.split("/")[-1], batch_size=BATCH)
+        sub = Submission(miner=mid, tier="open", model_id=mid, params=1, compute_h100h=1.0)
+        subs.append((sub, r))
+
+    log("running axis_round (GLM authors refs, base + each student scored) ...")
+    res = axis_round(1, commit_seed=20260723, specs=specs, glm=glm, base=base, tiers=tiers,
+                     tournament=tour, submissions=subs, items_per_axis=ITEMS, max_new_tokens=MAXTOK)
+
+    # report
+    report = {"teacher": TEACHER, "base": BASE, "students": STUDENTS, "items": ITEMS,
+              "diff": DIFF, "n_points": res.n_points, "events": res.events,
+              "weights": res.weights, "scored": {}}
+    log("=== per-student retention (worst-domain soft-min) ===")
+    for mid, s in res.scored.items():
+        report["scored"][mid] = {"retention": round(s.retention, 4),
+                                 "retention_lb": round(s.retention_lb, 4),
+                                 "gates_ok": s.gates_ok, "reasons": s.reasons,
+                                 "valid": s.valid}
+        log(f"  {mid.split('/')[-1]:24} retention={s.retention:.3f} lb={s.retention_lb:.3f} "
+            f"valid={s.valid} {'' if s.gates_ok else s.reasons}")
+
+    king = tour.kings.get("open")
+    log(f"crown: {king.model_id if king else None}  weights={res.weights}")
+    with open(f"{OUT}/report.json", "w") as f:
+        json.dump(report, f, indent=2)
+
+    # PASS read-out: does retention rank by capability, and did the most-capable crown?
+    ladder = [mid for mid in STUDENTS]  # declared most->least capable order
+    rets = {mid: res.scored[mid].retention for mid in ladder if mid in res.scored}
+    ranked_ok = all(rets.get(ladder[i], -9) >= rets.get(ladder[i + 1], 9) - 1e-6
+                    for i in range(len(ladder) - 1) if ladder[i] in rets and ladder[i + 1] in rets)
+    crown_ok = king is not None and king.model_id == ladder[0]
+    log(f"VERDICT: retention ranks by capability={ranked_ok}; most-capable crowned={crown_ok}")
+    if ranked_ok and crown_ok:
+        log("PASS: the crown discriminates real capability on real models.")
+    else:
+        log("CHECK: ranking or crown did not track capability — inspect per-axis liveness "
+            "(GLM competence per axis) and retention above.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
