@@ -83,3 +83,38 @@ def diff_in_diff_gate(stale: dict, fresh: dict, threshold: float = 0.15,
     info.update(diff=round(r_stale - r_fresh, 4), diff_lb=round(lb, 4),
                 verdict="genre-overfit" if flagged else "ok")
     return (not flagged), info
+
+
+# ---- wiring: run the gate over a timestamped document corpus ---------------------------
+
+def score_docs(docs: list, runner, seed: int, max_new_tokens: int = 64):
+    """One deterministic reading probe per doc (aligned across models by `seed`), exact
+    numeric check. Docs without a usable probe are skipped consistently. Returns
+    (pass_mask, kept_docs)."""
+    from .corpus import check_probe, make_probe
+    probes = [(d, make_probe(d, seed)) for d in docs]
+    probes = [(d, p) for d, p in probes if p is not None]
+    if not probes:
+        return [], []
+    outs = runner.generate([p[0] for _, p in probes], max_new_tokens)
+    return [check_probe(p[1], o) for (_, p), o in zip(probes, outs)], [d for d, _ in probes]
+
+
+def diff_in_diff_over_corpus(docs: list, commit_ts: int, teacher, base, student,
+                             seed: int = 0, threshold: float = 0.15, min_n: int = 30):
+    """Wire the gate to a timestamped corpus: split at `commit_ts` into stale (pre-commit)
+    vs fresh (post-commit), one reading probe per doc, score teacher/base/student on the
+    SAME probes, run diff-in-diff. `teacher` (pinned GLM in prod) defines the retention
+    subset. Returns (ok, info) — ok=False flags a genre-overfitter (aced pre-distillable
+    stale docs, collapses on genuinely-new fresh docs)."""
+    from .corpus import split_by_commit
+    stale, fresh = split_by_commit(docs, commit_ts)
+
+    def masks(dset):
+        tp, kept = score_docs(dset, teacher, seed)          # teacher defines the subset
+        bp, _ = score_docs(kept, base, seed)                # base + student on the same docs
+        sp, _ = score_docs(kept, student, seed)
+        return {"teacher_pass": tp, "student_pass": sp, "base_pass": bp}
+
+    return diff_in_diff_gate(masks(stale), masks(fresh), threshold=threshold,
+                             min_n=min_n, seed=seed)

@@ -193,9 +193,57 @@ def test_diff_in_diff_gate():
     assert ok_strong, "uniformly-strong control wrongly flagged"
 
 
+class _SimReader:
+    """Test double that SOLVES the reading probe from the prompt (finds the number after
+    the anchor in the passage) with probability competence(doc_id), else emits a wrong
+    number. Models a memorizer (aces stale/known docs, collapses on fresh) vs an honest
+    reader (reads both). Solving-from-prompt also asserts the probe is answerable."""
+
+    def __init__(self, competence, seed=0, name="sim"):
+        self.competence, self.seed, self.name = competence, seed, name
+
+    def generate(self, prompts, max_new_tokens=64):
+        import re as _re
+        out = []
+        for p in prompts:
+            did = _re.search(r"\[doc (\S+)\]", p).group(1)
+            anchor = _re.search(r'after "([^"]*)"', p).group(1)
+            passage = p.split("Passage:\n", 1)[1].split("\n\n", 1)[0]
+            mm = _re.search(_re.escape(anchor) + r"\s+(\d{2,})", passage)
+            true = mm.group(1) if mm else "0"
+            r = random.Random(f"{self.seed}|{did}")
+            out.append(f"Answer: {true}" if r.random() < self.competence(did)
+                       else f"Answer: {int(true) + 7}")
+        return out
+
+
+def test_diff_in_diff_over_corpus():
+    """End-to-end wiring: timestamped corpus -> split at commit -> reading probes -> score
+    teacher/base/student -> gate. A memorizer (aces pre-commit stale docs it 'distilled',
+    collapses on genuinely-new fresh docs) must be flagged; an honest reader must not."""
+    from eval.corpus import split_by_commit, synth_corpus
+    from eval.overfit_gate import diff_in_diff_over_corpus
+
+    docs = synth_corpus(240, seed=5, commit_ts=100, span=30)
+    stale, fresh = split_by_commit(docs, 100)
+    assert len(stale) >= 40 and len(fresh) >= 40, (len(stale), len(fresh))
+    stale_ids = {d.id for d in stale}
+
+    teacher = _SimReader(lambda did: 0.95, name="glm")      # competent on both -> subset
+    base = _SimReader(lambda did: 0.30, name="base")
+    honest = _SimReader(lambda did: 0.78, name="honest")     # reads both equally
+    memorizer = _SimReader(lambda did: 0.95 if did in stale_ids else 0.42, name="memorizer")
+
+    ok_h, info_h = diff_in_diff_over_corpus(docs, 100, teacher, base, honest, seed=1)
+    ok_m, info_m = diff_in_diff_over_corpus(docs, 100, teacher, base, memorizer, seed=1)
+    assert ok_h, f"honest reader wrongly flagged: {info_h}"
+    assert not ok_m, f"memorizer not flagged: {info_m}"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
-             test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate]
+             test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
+             test_diff_in_diff_over_corpus]
     failed = 0
     for t in tests:
         try:
