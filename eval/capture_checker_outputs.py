@@ -61,7 +61,7 @@ def main() -> int:
             for it, o in zip(items, outs):
                 recs.append({"answer": str(it.answer)[:80], "qtype": it.meta.get("qtype", ""),
                              "passed": ax.check(it, o), "extracted": _extracted(ax, o),
-                             "raw": o[:500]})
+                             "raw": o[:2000]})
             npass = sum(x["passed"] for x in recs)
             out[mid][name] = {"n_pass": npass, "n": N, "recs": recs}
             print(f"{mid.split('/')[-1]:22} {name:14} pass {npass}/{N}", flush=True)
