@@ -91,11 +91,22 @@ class CodeExec:
 
     @staticmethod
     def _extract_code(output: str) -> str | None:
-        blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", output, re.S)
-        if blocks:
-            return blocks[-1]
-        if "def " in output:  # unfenced but plausible
-            return output[output.index("def "):]
+        """Robust code extraction. Real models emit malformed/multiple fences (```python
+        code block, a bare ``` then ```python, prose around the block); a strict fence
+        regex silently drops a CORRECT answer -> false 0 -> worst-domain soft-min inverts
+        the ranking (a capable model scored 0/22 on formatting quirks). So: match a lenient
+        fence (any info string), prefer the block that actually contains a def, and on the
+        unfenced fallback cut any trailing fence."""
+        # lenient fence: ``` + arbitrary info string (may be malformed) + newline + body
+        blocks = re.findall(r"```[^\n]*\n(.*?)```", output, re.S)
+        with_def = [b for b in blocks if "def " in b]
+        if with_def:
+            return with_def[-1]
+        nonempty = [b for b in blocks if b.strip()]
+        if nonempty:
+            return nonempty[-1]
+        if "def " in output:  # unfenced — take from def, drop any trailing fence/prose
+            return re.split(r"\n```", output[output.index("def "):])[0]
         return None
 
     def check(self, item: Item, output: str) -> bool:

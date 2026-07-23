@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 
+from eval.axes.code_exec import CodeExec
 from eval.axes.long_context import LongContext
 from eval.axis_round import AxisSpec, axis_round
 from eval.core import Item
@@ -126,8 +127,28 @@ def test_long_context_checker():
             assert not ax.check(it, f"Answer: {int(it.answer) + 7}")  # wrong number rejected
 
 
+def test_code_extractor_robust():
+    """Real models emit malformed / doubled code fences; the extractor must still recover
+    the correct code. A fence quirk once scored a correct Qwen-3B at 0/22 on the code axis,
+    and worst-domain soft-min then ranked it BELOW a 1.5B (real capability run, 2026-07-23)."""
+    ax = CodeExec()
+    items = {it.answer["fn"]: it for it in ax.generate(seed=1, n=3, difficulty=2)}
+    cases = {
+        # malformed info string: ```python code block
+        "count_divisible": (" ```python code block\ndef count_divisible(nums, k):\n"
+                            "    return sum(1 for x in nums if x % k == 0)\n```"),
+        # doubled fence: bare ``` then ```python
+        "running_max": (" ```\n```python\ndef running_max(nums):\n    out=[]; m=None\n"
+                        "    for x in nums:\n        m = x if m is None else max(m,x)\n"
+                        "        out.append(m)\n    return out\n```"),
+    }
+    for fn, out in cases.items():
+        assert ax.check(items[fn], out), fn
+
+
 def main() -> int:
-    tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker]
+    tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
+             test_code_extractor_robust]
     failed = 0
     for t in tests:
         try:
