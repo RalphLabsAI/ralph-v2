@@ -95,17 +95,26 @@ def _t_split_share(rng: random.Random, difficulty: int) -> tuple[str, Fraction]:
     return text, ans
 
 
+_FRACTION_WORD = {2: "half", 3: "third", 4: "quarter", 5: "fifth", 10: "tenth"}
+
+
 def _t_price_change(rng: random.Random, difficulty: int) -> tuple[str, Fraction]:
     who, obj = rng.choice(NAMES), rng.choice(OBJECTS)
-    unit, count = rng.randint(2, 25), rng.randint(2, 14)
+    unit = rng.randint(2, 25)
+    disc = rng.choice([2, 4, 5, 10])
+    # count is a multiple of the discount denominator so the discounted total is an EXACT
+    # integer — a decimal answer invites the model to write a fraction the numeric
+    # extractor would mis-read.
+    count = disc * rng.randint(1, 4) if difficulty >= 2 else rng.randint(2, 14)
     cost = Fraction(unit * count)
     text = (f"{obj.capitalize()} cost {unit} coins each. {who} buys {count}. "
             f"How many coins does {who} spend?")
     if difficulty >= 2:
-        disc = rng.choice([2, 4, 5, 10])
         cost = cost - cost / disc
+        # "one 2th off" was ambiguous English and depressed pass rates for the wrong reason
         text = (f"{obj.capitalize()} cost {unit} coins each. {who} buys {count} and receives "
-                f"a discount of one {disc}th off the total. How many coins does {who} spend?")
+                f"a discount of one {_FRACTION_WORD[disc]} off the total. "
+                f"How many coins does {who} spend?")
     if difficulty >= 3:
         fee = rng.randint(1, 9)
         cost += fee
@@ -113,10 +122,116 @@ def _t_price_change(rng: random.Random, difficulty: int) -> tuple[str, Fraction]
     return text, cost
 
 
+# --- harder families -------------------------------------------------------------------
+# The three grade-school templates above are compression-ROBUST: the pinned 0.5B base
+# passed 22/25 of them, which collapses the retention denominator (teacher-base) and makes
+# the axis measure almost nothing. These require genuinely composed multi-step reasoning
+# (work-rate, mixture, interest, ratio splits, back-solving) while keeping answers EXACT
+# Fractions so the checker stays deterministic.
+
+def _t_work_rate(rng: random.Random, difficulty: int) -> tuple[str, Fraction]:
+    """Combined work rates — reciprocal reasoning, not a single arithmetic chain.
+    Constructed so the combined time is an EXACT INTEGER: for 1/a + 1/b = 1/t the integer
+    solutions are a = t+x, b = t + t^2/x over divisors x of t^2. (Answers stay integral so
+    a model answering a fraction like "14/9" can't be mis-graded by the numeric extractor.)"""
+    t = rng.randint(2, 10)
+    x = rng.choice([d for d in range(1, t * t + 1) if (t * t) % d == 0])
+    a, b = t + x, t + (t * t) // x
+    who, obj = rng.choice(NAMES), rng.choice(OBJECTS)
+    other = rng.choice([x for x in NAMES if x != who])   # distinct parties
+    text = (f"{who} can sort a crate of {obj} alone in {a} hours, and {other} can sort the "
+            f"same crate alone in {b} hours. Working together at those rates, how many "
+            f"hours does it take them to sort one crate?")
+    ans = Fraction(t)
+    if difficulty >= 3:
+        crates = rng.randint(2, 6)
+        ans = Fraction(t * crates)
+        text = (f"{who} can sort a crate of {obj} alone in {a} hours, and {other} in {b} "
+                f"hours. Working together, how many hours do {crates} crates take?")
+    return text, ans
+
+
+def _t_mixture(rng: random.Random, difficulty: int) -> tuple[str, Fraction]:
+    """Weighted average — a classic trap for shallow pattern-matching (averaging the two
+    prices instead of weighting them). Prices are constructed around a chosen integer
+    average so the answer is exact: p1 = avg + q2*d, p2 = avg - q1*d."""
+    q1, q2 = rng.randint(2, 12), rng.randint(2, 12)
+    d = rng.randint(1, 3)
+    avg = rng.randint(q1 * d + 2, q1 * d + 30)
+    p1, p2 = avg + q2 * d, avg - q1 * d
+    place = rng.choice(PLACES)
+    text = (f"A trader at {place} mixes {q1} kilograms costing {p1} coins per kilogram with "
+            f"{q2} kilograms costing {p2} coins per kilogram. What is the cost per kilogram "
+            f"of the mixture?")
+    ans = Fraction(avg)
+    if difficulty >= 3:
+        ans = Fraction(avg * (q1 + q2))
+        text = text.rstrip("?").replace("What is the cost per kilogram of the mixture",
+                                        "What is the total cost of the whole mixture")
+    return text, ans
+
+
+def _t_back_solve(rng: random.Random, difficulty: int) -> tuple[str, Fraction]:
+    """Invert a described forward process — must run the steps BACKWARD."""
+    who, obj = rng.choice(NAMES), rng.choice(OBJECTS)
+    spent = rng.randint(2, 6)
+    gave = rng.randint(3, 15)
+    left = rng.randint(4, 30)
+    start = Fraction((left + gave) * spent)
+    text = (f"{who} split a pile of {obj} into {spent} equal groups and kept one group. "
+            f"{who} then gave away {gave} {obj} from that group and has {left} left. "
+            f"How many {obj} were in the original pile?")
+    if difficulty >= 3:
+        found = rng.randint(2, 12)
+        start = Fraction((left - found + gave) * spent)
+        text = (f"{who} split a pile of {obj} into {spent} equal groups and kept one group. "
+                f"{who} gave away {gave} {obj}, then found {found} more, and now has {left}. "
+                f"How many {obj} were in the original pile?")
+    return text, start
+
+
+def _t_ratio_split(rng: random.Random, difficulty: int) -> tuple[str, Fraction]:
+    """Split a total in a ratio — needs part-of-whole reasoning."""
+    r1, r2 = rng.randint(1, 7), rng.randint(1, 7)
+    per_part = rng.randint(3, 20)
+    total = (r1 + r2) * per_part
+    who, obj = rng.choice(NAMES), rng.choice(OBJECTS)
+    other = rng.choice([x for x in NAMES if x != who])   # distinct parties
+    ans = Fraction(total * r1, r1 + r2)
+    text = (f"{who} and {other} divide {total} {obj} in the ratio {r1}:{r2}. "
+            f"How many {obj} does {who} receive?")
+    if difficulty >= 3:
+        r3 = rng.randint(1, 6)
+        total = (r1 + r2 + r3) * per_part
+        ans = Fraction(total * r1, r1 + r2 + r3)
+        text = (f"{who}, {other} and a third partner divide {total} {obj} in the ratio "
+                f"{r1}:{r2}:{r3}. How many {obj} does {who} receive?")
+    return text, ans
+
+
+def _t_compound(rng: random.Random, difficulty: int) -> tuple[str, Fraction]:
+    """Repeated proportional change — compounding, not a single percentage step. The base
+    is a multiple of denom^years so the compounded value is an exact integer."""
+    denom = rng.choice([2, 4, 5, 10])
+    years = 2 if difficulty < 3 else 3
+    m = rng.randint(1, 20)
+    base = m * denom ** years
+    ans = Fraction(m * (denom + 1) ** years)
+    place = rng.choice(PLACES)
+    text = (f"A fund at {place} holds {base} coins and grows by one {_FRACTION_WORD[denom]} "
+            f"of its value each year. What is its value after {years} years?")
+    return text, ans
+
+
 TEMPLATES = {
     "rate_total": _t_rate_total,
     "split_share": _t_split_share,
     "price_change": _t_price_change,
+    "work_rate": _t_work_rate,
+    "mixture": _t_mixture,
+    "back_solve": _t_back_solve,
+    "ratio_split": _t_ratio_split,
+    "compound": _t_compound,
 }
 
 _NUM = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
