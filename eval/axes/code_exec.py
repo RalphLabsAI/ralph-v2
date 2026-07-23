@@ -26,38 +26,138 @@ from pathlib import Path
 
 from ..core import Item
 
-_SPECS = [
-    {
-        "key": "count_divisible",
-        "sig": "def count_divisible(nums: list[int], k: int) -> int",
-        "doc": "Return how many integers in `nums` are exactly divisible by `k`.",
-        "ref": "return sum(1 for x in nums if k != 0 and x % k == 0)",
-        "cases": lambda rng: [
-            ([rng.randint(-30, 30) for _ in range(rng.randint(4, 9))], rng.randint(2, 7))
-            for _ in range(4)
-        ],
-        "oracle": lambda nums, k: sum(1 for x in nums if k != 0 and x % k == 0),
-    },
-    {
-        "key": "running_max",
-        "sig": "def running_max(nums: list[int]) -> list[int]",
-        "doc": "Return the running maximum: element i is the max of nums[0..i].",
-        "ref": "out=[]\n    m=None\n    for x in nums:\n        m = x if m is None else max(m,x)\n        out.append(m)\n    return out",
-        "cases": lambda rng: [([rng.randint(-20, 20) for _ in range(rng.randint(3, 8))],) for _ in range(4)],
-        "oracle": lambda nums: [max(nums[: i + 1]) for i in range(len(nums))],
-    },
-    {
-        "key": "collapse_spaces",
-        "sig": "def collapse_spaces(s: str) -> str",
-        "doc": "Collapse every run of consecutive spaces into a single space, and strip the ends.",
-        "ref": "return ' '.join(s.split())",
-        "cases": lambda rng: [
-            ("  ".join(rng.choice(["ab", "c", "dd", "e f", "gg"]) for _ in range(rng.randint(2, 5))) + "  ",)
-            for _ in range(4)
-        ],
-        "oracle": lambda s: " ".join(s.split()),
-    },
-]
+# PARAMETERIZED FAMILIES. Three fixed specs made this axis a lookup table: a miner
+# memorizes 3 function bodies and maxes it forever, and "fresh per round" only reshuffles
+# the test inputs. Each family instead MINTS a distinct task from the round seed (different
+# predicate / accumulator / operation / parameters), so the procedure space is large enough
+# that the axis measures implementing-a-spec rather than recalling three answers.
+# Every family returns: key, sig, doc, an executable `oracle`, and a case generator.
+_INT = lambda rng, lo=-30, hi=30: rng.randint(lo, hi)
+
+
+def _f_count_pred(rng):
+    kind = rng.choice(["divisible by", "greater than", "less than"])
+    k = rng.randint(2, 9)
+    name = {"divisible by": "count_divisible", "greater than": "count_greater",
+            "less than": "count_less"}[kind]
+    oracle = {"divisible by": lambda nums, k: sum(1 for x in nums if k != 0 and x % k == 0),
+              "greater than": lambda nums, k: sum(1 for x in nums if x > k),
+              "less than": lambda nums, k: sum(1 for x in nums if x < k)}[kind]
+    return {"key": name,
+            "sig": f"def {name}(nums: list[int], k: int) -> int",
+            "doc": f"Return how many integers in `nums` are {kind} `k`.",
+            "cases": lambda r: [([_INT(r) for _ in range(r.randint(4, 9))], k) for _ in range(4)],
+            "oracle": oracle,
+            "ref": {"divisible by": "return sum(1 for x in nums if k != 0 and x % k == 0)",
+                    "greater than": "return sum(1 for x in nums if x > k)",
+                    "less than": "return sum(1 for x in nums if x < k)"}[kind]}
+
+
+def _f_running(rng):
+    kind = rng.choice(["maximum", "minimum", "sum"])
+    name = {"maximum": "running_max", "minimum": "running_min", "sum": "running_sum"}[kind]
+    oracle = {"maximum": lambda nums: [max(nums[:i + 1]) for i in range(len(nums))],
+              "minimum": lambda nums: [min(nums[:i + 1]) for i in range(len(nums))],
+              "sum": lambda nums: [sum(nums[:i + 1]) for i in range(len(nums))]}[kind]
+    return {"key": name,
+            "sig": f"def {name}(nums: list[int]) -> list[int]",
+            "doc": f"Return the running {kind}: element i is the {kind} of nums[0..i].",
+            "cases": lambda r: [([_INT(r, -20, 20) for _ in range(r.randint(3, 8))],) for _ in range(4)],
+            "oracle": oracle,
+            "ref": {"maximum": "return [max(nums[:i+1]) for i in range(len(nums))]",
+                    "minimum": "return [min(nums[:i+1]) for i in range(len(nums))]",
+                    "sum": "return [sum(nums[:i+1]) for i in range(len(nums))]"}[kind]}
+
+
+def _f_top_k(rng):
+    return {"key": "top_k",
+            "sig": "def top_k(nums: list[int], k: int) -> list[int]",
+            "doc": "Return the `k` largest integers in `nums`, sorted in DESCENDING order. "
+                   "If `k` exceeds the length, return all of them sorted descending.",
+            "cases": lambda r: [([_INT(r) for _ in range(r.randint(4, 9))], r.randint(1, 4)) for _ in range(4)],
+            "oracle": lambda nums, k: sorted(nums, reverse=True)[:k],
+            "ref": "return sorted(nums, reverse=True)[:k]"}
+
+
+def _f_dedupe(rng):
+    return {"key": "dedupe",
+            "sig": "def dedupe(items: list[int]) -> list[int]",
+            "doc": "Remove duplicates from `items`, PRESERVING first-occurrence order.",
+            "cases": lambda r: [([r.randint(0, 6) for _ in range(r.randint(5, 10))],) for _ in range(4)],
+            "oracle": lambda items: list(dict.fromkeys(items)),
+            "ref": "return list(dict.fromkeys(items))"}
+
+
+def _f_rotate(rng):
+    return {"key": "rotate_left",
+            "sig": "def rotate_left(nums: list[int], k: int) -> list[int]",
+            "doc": "Rotate `nums` LEFT by `k` positions (k may exceed the length). "
+                   "An empty list returns empty.",
+            "cases": lambda r: [([_INT(r, 0, 20) for _ in range(r.randint(3, 8))], r.randint(0, 9)) for _ in range(4)],
+            "oracle": lambda nums, k: (nums[k % len(nums):] + nums[:k % len(nums)]) if nums else [],
+            "ref": "return (nums[k % len(nums):] + nums[:k % len(nums)]) if nums else []"}
+
+
+def _f_clamp(rng):
+    return {"key": "clamp_all",
+            "sig": "def clamp_all(nums: list[int], lo: int, hi: int) -> list[int]",
+            "doc": "Clamp every value into the inclusive range [lo, hi].",
+            "cases": lambda r: [([_INT(r) for _ in range(r.randint(4, 8))], -5, 12) for _ in range(4)],
+            "oracle": lambda nums, lo, hi: [min(max(x, lo), hi) for x in nums],
+            "ref": "return [min(max(x, lo), hi) for x in nums]"}
+
+
+def _f_flatten(rng):
+    return {"key": "flatten",
+            "sig": "def flatten(rows: list[list[int]]) -> list[int]",
+            "doc": "Concatenate the sublists of `rows` into a single flat list, in order.",
+            "cases": lambda r: [([[r.randint(0, 9) for _ in range(r.randint(0, 3))]
+                                  for _ in range(r.randint(2, 4))],) for _ in range(4)],
+            "oracle": lambda rows: [x for row in rows for x in row],
+            "ref": "return [x for row in rows for x in row]"}
+
+
+def _f_char_count(rng):
+    ch = rng.choice("abcde")
+    return {"key": "char_count",
+            "sig": "def char_count(s: str, ch: str) -> int",
+            "doc": f"Return how many times the character `ch` occurs in `s` (case-sensitive).",
+            "cases": lambda r: [("".join(r.choice("abcde ") for _ in range(r.randint(6, 14))), ch)
+                                for _ in range(4)],
+            "oracle": lambda s, ch: s.count(ch),
+            "ref": "return s.count(ch)"}
+
+
+def _f_string_norm(rng):
+    kind = rng.choice(["collapse", "squeeze"])
+    if kind == "collapse":
+        return {"key": "collapse_spaces",
+                "sig": "def collapse_spaces(s: str) -> str",
+                "doc": "Collapse every run of consecutive spaces into a single space, and strip the ends.",
+                "cases": lambda r: [("  ".join(r.choice(["ab", "c", "dd", "e f", "gg"])
+                                               for _ in range(r.randint(2, 5))) + "  ",) for _ in range(4)],
+                "oracle": lambda s: " ".join(s.split()),
+                "ref": "return ' '.join(s.split())"}
+    return {"key": "reverse_words",
+            "sig": "def reverse_words(s: str) -> str",
+            "doc": "Return the words of `s` in reverse order, separated by single spaces.",
+            "cases": lambda r: [(" ".join(r.choice(["ab", "cd", "ef", "gh"])
+                                          for _ in range(r.randint(2, 5))),) for _ in range(4)],
+            "oracle": lambda s: " ".join(reversed(s.split())),
+            "ref": "return ' '.join(reversed(s.split()))"}
+
+
+def _f_sum_range(rng):
+    return {"key": "sum_between",
+            "sig": "def sum_between(nums: list[int], lo: int, hi: int) -> int",
+            "doc": "Return the sum of values in `nums` that fall in the inclusive range [lo, hi].",
+            "cases": lambda r: [([_INT(r) for _ in range(r.randint(4, 9))], -5, 15) for _ in range(4)],
+            "oracle": lambda nums, lo, hi: sum(x for x in nums if lo <= x <= hi),
+            "ref": "return sum(x for x in nums if lo <= x <= hi)"}
+
+
+_FAMILIES = [_f_count_pred, _f_running, _f_top_k, _f_dedupe, _f_rotate, _f_clamp,
+             _f_flatten, _f_char_count, _f_string_norm, _f_sum_range]
 
 
 class CodeExec:
@@ -73,7 +173,7 @@ class CodeExec:
         rng = random.Random(seed)
         items: list[Item] = []
         for i in range(n):
-            spec = _SPECS[i % len(_SPECS)]
+            spec = _FAMILIES[i % len(_FAMILIES)](rng)
             args_list = spec["cases"](rng)
             expected = [spec["oracle"](*a) for a in args_list]
             tests = [{"args": list(a), "expect": e} for a, e in zip(args_list, expected)]
@@ -84,7 +184,8 @@ class CodeExec:
             )
             items.append(Item(
                 axis=self.name, prompt=prompt,
-                answer={"fn": spec["key"], "sig": spec["sig"], "tests": tests},
+                answer={"fn": spec["key"], "sig": spec["sig"], "tests": tests,
+                        "ref": spec["ref"]},
                 meta={"template": spec["key"], "idx": i, "difficulty": difficulty, "noop": False},
             ))
         return items
@@ -140,6 +241,5 @@ class CodeExec:
 
     def reference_solution(self, item: Item) -> str:
         """The correct answer — used by simulated students to model competence."""
-        spec = next(s for s in _SPECS if s["key"] == item.answer["fn"])
-        body = spec["ref"]
-        return f"```python\n{spec['sig']}:\n    {body}\n```"
+        a = item.answer
+        return f"```python\n{a['sig']}:\n    {a['ref']}\n```"

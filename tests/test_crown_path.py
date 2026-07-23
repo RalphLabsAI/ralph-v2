@@ -133,23 +133,19 @@ def test_code_extractor_robust():
     styles scored a correct 3B at 0/22 and a 1.5B at 0/40 (real capability + capture runs,
     2026-07-23) -> worst-domain soft-min then inverted the whole ranking."""
     ax = CodeExec()
-    items = {it.answer["fn"]: it for it in ax.generate(seed=1, n=3, difficulty=2)}
-    cases = {
-        # malformed info string: ```python code block
-        "count_divisible": (" ```python code block\ndef count_divisible(nums, k):\n"
-                            "    return sum(1 for x in nums if x % k == 0)\n```"),
-        # stray leading bare ``` + prose BEFORE the real block + import before def (1.5B)
-        "running_max": (" ``` The input list is small.\n```python\nfrom typing import List\n"
-                        "def running_max(nums: List[int]) -> List[int]:\n    out=[]; m=None\n"
-                        "    for x in nums:\n        m = x if m is None else max(m,x)\n"
-                        "        out.append(m)\n    return out\n```"),
-        # import needed by the body sits ABOVE the def (must not be dropped) (1.5B)
-        "collapse_spaces": ("Here is the code:\n```python\nimport re\n"
-                            "def collapse_spaces(s: str) -> str:\n"
-                            "    return ' '.join(re.findall(r'\\S+', s))\n```"),
-    }
-    for fn, out in cases.items():
-        assert ax.check(items[fn], out), fn
+    # family-agnostic: take each task's OWN reference solution and re-wrap it in the
+    # awkward fence styles real models emit. Extraction must recover it every time.
+    for it in ax.generate(seed=1, n=6, difficulty=2):
+        ref = ax.reference_solution(it)
+        body = ref.split("```python\n", 1)[1].rsplit("\n```", 1)[0]
+        variants = {
+            "malformed info string": f" ```python code block\n{body}\n```",
+            "stray leading bare fence": f" ``` The input is small.\n```python\n{body}\n```",
+            "import above the def": f"Here is the code:\n```python\nimport re\n{body}\n```",
+            "prose after the block": f"```python\n{body}\n```\nThis implementation is O(n).",
+        }
+        for label, out in variants.items():
+            assert ax.check(it, out), f"{it.answer['fn']} / {label}"
 
 
 def test_numeric_first_marker():
