@@ -58,7 +58,7 @@ def run_env_round(
     tiers: list[Tier], tier_budgets: dict[str, TierBudget],
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     teacher_id: str = "glm", base_id: str = "base", pile_id: str = "env-pile",
-    n_points: int = 300, self_frac: float = 0.4,
+    n_points: int = 300, self_frac: float = 0.4, signer=None,
 ) -> RoundOutcome:
     out = RoundOutcome()
 
@@ -96,4 +96,6 @@ def run_env_round(
     out.record = build_round_record(round_no, commit_root, round_nonce, teacher_id,
                                     ref_id, base_id, pile_id,
                                     pt_dicts, res.scored, res.events, res.weights)
+    if signer is not None:
+        out.record.sign(signer)
     return out

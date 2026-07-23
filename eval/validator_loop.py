@@ -62,6 +62,7 @@ def run_validator_round(
     tiers: list[Tier], tier_budgets: dict[str, TierBudget],
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     pile_id: str = "pile", n_points: int = 120, self_frac: float = 0.0,
+    signer=None,
 ) -> RoundOutcome:
     out = RoundOutcome()
 
@@ -100,4 +101,6 @@ def run_validator_round(
     points = sample_points(experience, n_points, self_frac, seed=commit_seed)  # same seed => same points
     out.record = build_round_record(round_no, commit_root, round_nonce, glm.name, judge.name,
                                     base.name, pile_id, points, res.scored, res.events, res.weights)
+    if signer is not None:      # attributable, not merely self-consistent (eval/signing.py)
+        out.record.sign(signer)
     return out

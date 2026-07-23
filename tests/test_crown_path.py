@@ -297,11 +297,37 @@ def test_content_identity_and_commit_reveal():
         assert not ok and "commit mismatch" in why, why
 
 
+def test_round_record_signature():
+    """A published verdict must be ATTRIBUTABLE, not merely self-consistent: an unsigned
+    record fails verification, a signed one passes, and tampering with the crown decision
+    (or any scored field) invalidates the signature."""
+    from eval.round_record import RoundRecord, SubmissionRecord
+    from eval.signing import Ed25519Signer
+
+    def rec():
+        return RoundRecord(1, "root", "nonce", "glm", "judge", "base", "pile",
+                           [{"rollout_id": 0, "k": 1, "mode": "teacher_state"}],
+                           [SubmissionRecord("h1", "m", "t", 0.5, 0.4, [1.0, 0.0], True)],
+                           [{"tier": "t", "action": "crown", "king": "h1"}], {"m": 1.0})
+
+    r = rec()
+    assert not r.verify_signature(), "unsigned record verified"
+    r.sign(Ed25519Signer(seed=b"0" * 32))
+    assert r.verify_signature(), "signed record failed to verify"
+
+    r.events[0]["king"] = "attacker"          # tamper with the crown decision
+    assert not r.verify_signature(), "tampered record still verified"
+
+    r2 = rec().sign(Ed25519Signer(seed=b"1" * 32))
+    r2.submissions[0].retention = 0.99        # tamper with a score
+    assert not r2.verify_signature(), "tampered score still verified"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
-             test_content_identity_and_commit_reveal]
+             test_content_identity_and_commit_reveal, test_round_record_signature]
     failed = 0
     for t in tests:
         try:

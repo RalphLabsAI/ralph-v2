@@ -47,12 +47,36 @@ class RoundRecord:
     events: list             # tournament events (crown/hold/dethrone)
     weights: dict
     reproduction_tolerance: float = 0.02   # allowed |retention| drift on re-run
+    # signature over canonical() — attributes the record to a validator identity. A bare
+    # hash proves self-consistency only; anyone can mint an alternative record + hash.
+    signature: str = ""
+    signer: str = ""          # ed25519 pubkey hex, or the validator hotkey ss58
+    sig_scheme: str = ""
+
+    # excluded from the signed payload: a payload cannot contain its own signature
+    _SIG_FIELDS = ("signature", "signer", "sig_scheme")
 
     def canonical(self) -> str:
-        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        d = {k: v for k, v in asdict(self).items() if k not in self._SIG_FIELDS}
+        return json.dumps(d, sort_keys=True, separators=(",", ":"))
 
     def sha256(self) -> str:
         return hashlib.sha256(self.canonical().encode()).hexdigest()
+
+    def sign(self, signer) -> "RoundRecord":
+        """Sign the canonical payload with a Signer (eval/signing.py). Returns self."""
+        self.signature = signer.sign(self.canonical().encode())
+        self.signer = signer.public_id()
+        self.sig_scheme = getattr(signer, "scheme", "")
+        return self
+
+    def verify_signature(self) -> bool:
+        """True iff the record carries a signature valid over its canonical payload — so
+        any tampering with the points/verdicts/crown invalidates it."""
+        from .signing import verify
+        if not (self.signature and self.signer and self.sig_scheme):
+            return False
+        return verify(self.canonical().encode(), self.signature, self.signer, self.sig_scheme)
 
     def verify_reproduction(self, other: "RoundRecord") -> tuple[bool, list]:
         """Re-run auditor: same crown decisions, and per-submission retention within
