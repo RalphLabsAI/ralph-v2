@@ -15,7 +15,7 @@ This is covering-first v2 groundwork (const's gate), not the drift experiment.
 
     python -m eval.run_capability_axis 2>&1 | tee runs/cap.log
 
-Env: RALPH_TEACHER, RALPH_BASE, RALPH_STUDENTS (comma-sep), RALPH_ITEMS, RALPH_DIFF, RALPH_OUT.
+Env: RALPH_TEACHER, RALPH_BASE, RALPH_STUDENTS (comma-sep), RALPH_ITEMS, RALPH_OUT.
 """
 from __future__ import annotations
 
@@ -36,8 +36,7 @@ BASE = os.environ.get("RALPH_BASE", "Qwen/Qwen2.5-0.5B-Instruct")
 STUDENTS = os.environ.get(
     "RALPH_STUDENTS", "Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-1.5B-Instruct,Qwen/Qwen2.5-0.5B-Instruct"
 ).split(",")
-ITEMS = int(os.environ.get("RALPH_ITEMS", "48"))
-DIFF = int(os.environ.get("RALPH_DIFF", "2"))
+ITEMS = int(os.environ.get("RALPH_ITEMS", "64"))   # headroom so each axis clears MIN_AXIS_N=30
 MAXTOK = int(os.environ.get("RALPH_MAXTOK", "512"))
 BATCH = int(os.environ.get("RALPH_BATCH", "16"))
 OUT = os.environ.get("RALPH_OUT", "runs/cap")
@@ -49,14 +48,17 @@ def log(*a):
 
 def main() -> int:
     os.makedirs(OUT, exist_ok=True)
-    log(f"teacher={TEACHER} base={BASE} students={STUDENTS} items/axis={ITEMS} diff={DIFF}")
+    log(f"teacher={TEACHER} base={BASE} students={STUDENTS} items/axis={ITEMS} (per-axis difficulty calibrated)")
 
+    # per-axis difficulty CALIBRATED to GLM's frontier (the S1/capability-run lesson): each
+    # axis must sit where GLM passes >= MIN_AXIS_N (live) AND the base does NOT saturate it
+    # (else the retention denominator (teacher-base) collapses). math up (grade-school was
+    # base-solvable); long_context down into GLM's band (48-line was too hard, 19/48).
     specs = [
-        AxisSpec(MathGSM(), "math", weight=1.0, difficulty=DIFF),
-        AxisSpec(CodeExec(), "code", weight=1.0, difficulty=DIFF),
-        AxisSpec(InstructionFollowing(), "instruction", weight=1.0, difficulty=DIFF),
-        # the fragile axis the current cover lacks — GLM competence gates its liveness
-        AxisSpec(LongContext(), "long_context", weight=1.0, difficulty=DIFF),
+        AxisSpec(MathGSM(), "math", weight=1.0, difficulty=3),
+        AxisSpec(CodeExec(), "code", weight=1.0, difficulty=2),
+        AxisSpec(InstructionFollowing(), "instruction", weight=1.0, difficulty=1),
+        AxisSpec(LongContext(base_facts=12), "long_context", weight=1.0, difficulty=1),
     ]
     tiers = [Tier("open", max_params=10**12, weight=1.0)]
     tour = Tournament(tiers, margin=0.03)
@@ -77,7 +79,7 @@ def main() -> int:
 
     # report
     report = {"teacher": TEACHER, "base": BASE, "students": STUDENTS, "items": ITEMS,
-              "diff": DIFF, "n_points": res.n_points, "events": res.events,
+              "per_axis_difficulty": {sp.name: sp.difficulty for sp in specs}, "n_points": res.n_points, "events": res.events,
               "weights": res.weights, "scored": {}}
     log("=== per-student retention (worst-domain soft-min) ===")
     for mid, s in res.scored.items():
