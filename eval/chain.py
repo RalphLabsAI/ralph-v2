@@ -77,6 +77,12 @@ def run_v2_epoch(
     accepted checkpoint (SafeStudentRunner in prod; a sim factory in tests). It is NOT
     called until intake gates pass — no untrusted weights load on a rejected submission.
     """
+    if make_safe_runner is None:
+        # fail-safe default: real untrusted checkpoints load ONLY through SafeStudentRunner
+        # (safetensors-only, trust_remote_code=False). A caller must consciously inject a
+        # different factory (tests) — production never runs without the locked-down loader.
+        from .runners import SafeStudentRunner
+        make_safe_runner = lambda cd: SafeStudentRunner(cd)
     now = chain.current_block()
     lo, hi = now - commit_window, now
     commits = chain.read_commitments(lo, hi)
@@ -116,6 +122,13 @@ def run_v2_env_epoch(
     The reference is the pinned `teacher` (GLM) agent — reproduce-GLM, checked by the
     deterministic env oracle (no LLM judge)."""
     from .validator_env_loop import CommittedSubmission as EnvCommitted, run_env_round
+
+    if make_agent is None:
+        # fail-safe default: untrusted checkpoints run only as a ModelAgent wrapping the
+        # locked-down SafeStudentRunner. Tests inject their own agent factory.
+        from .runners import SafeStudentRunner
+        from .multiturn import ModelAgent
+        make_agent = lambda cd: ModelAgent(SafeStudentRunner(cd))
 
     now = chain.current_block()
     lo, hi = now - commit_window, now

@@ -50,6 +50,10 @@ class Scored:
     per_point: list[float]         # aligned to the round's fixed points (for pairing)
     gates_ok: bool
     reasons: list[str] = field(default_factory=list)
+    # per-axis paired vectors (axis_name -> agreements on that axis's points). The
+    # dethrone test uses the WORST axis, not the pooled `per_point`, so worst-domain
+    # governs dethroning as well as crown selection. Empty -> legacy pooled fallback.
+    per_axis: dict = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
@@ -88,6 +92,27 @@ def bootstrap_lcb_diff(a: list[float], b: list[float], z_reps: int = 2000,
     return means[int(alpha * z_reps)]
 
 
+def worst_axis_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000,
+                        alpha: float = 0.05, seed: int = 0) -> float:
+    """Dethrone margin = the WORST per-axis paired lower bound.
+
+    Crown SELECTION already uses worst-domain retention (soft-min); the dethrone test
+    must too, or a challenger that wins a large axis while LOSING a small one clears the
+    pooled-mean margin and dethrones a king it is worse than on its weakest domain — the
+    exact "sell one capability to buy another" worst-domain aggregation is meant to
+    forbid. We take the min over shared axes of the paired bootstrap lower bound. An exact
+    copy ties every axis (diff 0) -> min 0 -> never clears the margin, so the anti-copy
+    property is preserved. Falls back to the pooled vector only when per-axis vectors are
+    absent (legacy callers)."""
+    shared = [ax for ax in a.per_axis
+              if ax in b.per_axis and a.per_axis[ax]
+              and len(a.per_axis[ax]) == len(b.per_axis[ax])]
+    if not shared:
+        return bootstrap_lcb_diff(a.per_point, b.per_point, z_reps, alpha, seed)
+    return min(bootstrap_lcb_diff(a.per_axis[ax], b.per_axis[ax], z_reps, alpha, seed)
+               for ax in shared)
+
+
 class Tournament:
     """Holds the reigning king per tier and applies dethrone-on-margin each round."""
 
@@ -124,9 +149,10 @@ class Tournament:
                          retention=round(best.retention, 4))
             return event
 
-        # contested throne: dethrone only past the noise-floor margin, paired on the
-        # same points as the re-scored king
-        lcb = bootstrap_lcb_diff(best.per_point, king_scored.per_point, seed=seed)
+        # contested throne: dethrone only past the noise-floor margin, on the WORST axis
+        # (paired on the same points as the re-scored king). Worst-axis, not pooled mean,
+        # so a challenger strong on one axis but weak on another cannot buy the crown.
+        lcb = worst_axis_lcb_diff(best, king_scored, seed=seed)
         if lcb > self.margin and best.sub.model_id != king_scored.sub.model_id:
             self.kings[tier] = King(best.sub.miner, best.sub.model_id, best.retention, self.round)
             event.update(action="dethrone", king=best.sub.model_id, miner=best.sub.miner,

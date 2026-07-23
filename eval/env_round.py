@@ -62,7 +62,18 @@ def env_round(round_no: int, commit_seed: int, pile: list[MTRollout],
     def score_one(agent: Agent):
         ag = score_points(pile, points, agent, reference=teacher)
         axes = _axes_from_points(points, ag, base_agree)
-        return soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True), ag, axes
+        # per-axis paired vectors (one per mode) so koth dethrones on the worst axis, not
+        # the pooled mean — a fluent drifter (high teacher_state, low self_state) must not
+        # dethrone on teacher_state's share of the points alone.
+        per_axis = {mode: [ag[i] for i, p in enumerate(points) if p.mode == mode]
+                    for mode in ("teacher_state", "self_state")
+                    if any(p.mode == mode for p in points)}
+        return (soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True),
+                ag, axes, per_axis)
+
+    # when self_state is sampled (self_frac>0) BOTH modes must be live to crown, so the
+    # drift axis can't silently fall below MIN_AXIS_N and leave teacher_state-only scoring.
+    min_live = 2 if self_frac > 0 else 1
 
     def gate(sub: Submission, axes: list[AxisScore]) -> tuple[bool, list[str]]:
         reasons: list[str] = []
@@ -72,16 +83,16 @@ def env_round(round_no: int, commit_seed: int, pile: list[MTRollout],
         # from a state never reduces oracle distance) is caught by low retention, not a
         # separate output gate; a real-model ModelAgent's raw text is degeneracy-checked
         # upstream at generate time. Here the crown gates are verdict()'s.
-        reasons += verdict(axes, passk_ok=True).reasons
+        reasons += verdict(axes, passk_ok=True, min_live_axes=min_live).reasons
         return (not reasons), reasons
 
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
     for sub, agent in submissions:
-        ret, ret_lb, per_pt, axes = score_one(agent)
+        ret, ret_lb, per_pt, axes, per_ax = score_one(agent)
         ok, reasons = gate(sub, axes)
         s = Scored(sub=sub, retention=ret, retention_lb=ret_lb, per_point=per_pt,
-                   gates_ok=ok, reasons=reasons)
+                   gates_ok=ok, reasons=reasons, per_axis=per_ax)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
 
@@ -101,9 +112,10 @@ def env_round(round_no: int, commit_seed: int, pile: list[MTRollout],
             continue
         king_scored = None
         if king is not None:
-            ret, ret_lb, per_pt, _ = score_one(registry[king.model_id])
+            ret, ret_lb, per_pt, _, per_ax = score_one(registry[king.model_id])
             king_scored = Scored(sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
-                                 retention=ret, retention_lb=ret_lb, per_point=per_pt, gates_ok=True)
+                                 retention=ret, retention_lb=ret_lb, per_point=per_pt,
+                                 gates_ok=True, per_axis=per_ax)
         events.append(tournament.consider(t.name, by_tier.get(t.name, []), king_scored, seed=commit_seed))
 
     return RoundResult(round_no, len(points), scored, events, tournament.weights())

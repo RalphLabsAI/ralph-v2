@@ -96,7 +96,9 @@ def main() -> int:
     # curve that declines with depth. Report both; the crown machinery must penalise it.
     bs = report["scores"]["S_broad"]
     ssk = bs["by_k"]["self_state"]
-    curve = [ssk.get(str(k)) for k in K_BUCKETS if ssk.get(str(k)) is not None]
+    # score_exposure stores INT depth keys; a JSON round-trip would make them str — accept
+    # either so the decline check actually fires (it silently never did with str-only keys).
+    curve = [v for v in (ssk.get(k, ssk.get(str(k))) for k in K_BUCKETS) if v is not None]
     declines = len(curve) >= 2 and curve[-1] < curve[0] - 0.1
     log(f"S_broad teacher_state={bs['overall']['teacher_state']:.3f} self_state="
         f"{bs['overall']['self_state']:.3f} gap={bs['gap']:+.3f}; self_state curve "

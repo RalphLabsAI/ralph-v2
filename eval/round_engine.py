@@ -47,6 +47,7 @@ def _retention_from_points(agrees: list[float], teacher_agrees: list[float],
     test; the axes are returned so the crown gates (verdict) can run on them.
     """
     axes: list[AxisScore] = []
+    per_axis: dict[str, list[float]] = {}
     for mode in ("teacher_state", "self_state"):
         idx = [i for i, m in enumerate(modes) if m == mode]
         if not idx:
@@ -57,9 +58,12 @@ def _retention_from_points(agrees: list[float], teacher_agrees: list[float],
         s = [agrees[i] >= 0.5 for i in idx]
         b = [base_agrees[i] >= 0.5 for i in idx]
         axes.append(axis_retention(mode, 0.5, t, s, b))
+        # per-axis paired vector so koth dethrones on the worst axis, not the pooled mean.
+        per_axis[mode] = [agrees[i] for i in idx]
     if not axes:
-        return 0.0, 0.0, agrees, []
-    return soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True), agrees, axes
+        return 0.0, 0.0, agrees, {}, []
+    return (soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True),
+            agrees, per_axis, axes)
 
 
 def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
@@ -94,8 +98,8 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
         sps = score_on_points(points, refs, experience, glm, runner, judge, max_new_tokens)
         ag = [sp.agreement for sp in sps]
         outs = [sp.meta.get("out", "") for sp in sps]
-        ret, ret_lb, per_pt, axes = _retention_from_points(ag, [1.0] * len(ag), base_pts, modes)
-        return ret, ret_lb, per_pt, axes, outs
+        ret, ret_lb, per_pt, per_ax, axes = _retention_from_points(ag, [1.0] * len(ag), base_pts, modes)
+        return ret, ret_lb, per_pt, per_ax, axes, outs
 
     def gate(sub: Submission, axes: list[AxisScore], outputs: list[str]) -> tuple[bool, list[str]]:
         """All crown gates for one submission, fail-closed. Tier fit + verdict()'s
@@ -121,10 +125,10 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
     for sub, runner in submissions:
-        ret, ret_lb, per_pt, axes, outs = score_one(runner)
+        ret, ret_lb, per_pt, per_ax, axes, outs = score_one(runner)
         ok, reasons = gate(sub, axes, outs)
         s = Scored(sub=sub, retention=ret, retention_lb=ret_lb, per_point=per_pt,
-                   gates_ok=ok, reasons=reasons)
+                   gates_ok=ok, reasons=reasons, per_axis=per_ax)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
 
@@ -132,14 +136,21 @@ def run_round(round_no: int, commit_seed: int, experience: list[Rollout],
     events = []
     for t in tiers:
         king = tournament.kings.get(t.name)
+        if king is not None and registry.get(king.model_id) is None:
+            # FAIL CLOSED: the reigning king can't be re-scored (validator restart /
+            # registry eviction). Do NOT fall through to consider()'s open-throne branch,
+            # which would crown the best challenger with no margin test. Hold this round.
+            events.append({"tier": t.name, "round": round_no, "action": "hold",
+                           "king": king.model_id, "reason": "king unavailable for re-score"})
+            tournament.kings[t.name].reign += 1
+            continue
         king_scored = None
         if king is not None:
-            king_runner = registry.get(king.model_id)
-            if king_runner is not None:
-                ret, ret_lb, per_pt, _axes, _outs = score_one(king_runner)
-                king_scored = Scored(
-                    sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
-                    retention=ret, retention_lb=ret_lb, per_point=per_pt, gates_ok=True)
+            ret, ret_lb, per_pt, _per_ax, _axes, _outs = score_one(registry[king.model_id])
+            king_scored = Scored(
+                sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
+                retention=ret, retention_lb=ret_lb, per_point=per_pt, gates_ok=True,
+                per_axis=_per_ax)
         events.append(tournament.consider(t.name, by_tier.get(t.name, []), king_scored, seed=commit_seed))
 
     # 6. weights

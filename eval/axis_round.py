@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .core import ModelRunner
+from .gates import degeneracy_flags
 from .koth import Scored, Submission, Tier, Tournament
 from .round_engine import RoundResult
 from .scoring import AxisScore, axis_retention, soft_min, verdict
@@ -65,20 +66,28 @@ def mint_and_author(specs: list[AxisSpec], glm: ModelRunner, seed_fn,
 
 def _score_student(specs: list[AxisSpec], items: RoundItems, base_pass: dict,
                    runner: ModelRunner, max_new_tokens: int
-                   ) -> tuple[float, float, list[float], list[AxisScore]]:
-    """Per-axis retention (conditioned on GLM-passed items) + the paired per-point vector."""
+                   ) -> tuple[float, float, list[float], dict, list[AxisScore], list[str]]:
+    """Per-axis retention (conditioned on GLM-passed items) + per-axis paired vectors +
+    the raw outputs (for the degeneracy gate)."""
     axes: list[AxisScore] = []
     per_point: list[float] = []
+    per_axis: dict[str, list[float]] = {}
+    all_outs: list[str] = []
     spec_by_name = {s.name: s for s in specs}
     for name, its in items.by_axis.items():
         s = spec_by_name[name]
         outs = runner.generate([it.prompt for it in its], max_new_tokens)
+        all_outs += outs
         stud = [s.axis.check(it, o) for it, o in zip(its, outs)]
         tp, bp = items.teacher_pass[name], base_pass[name]
         axes.append(axis_retention(name, s.weight, tp, stud, bp))
-        # paired dethrone vector uses only the GLM-passed items (the retention subset)
-        per_point += [1.0 if stud[i] else 0.0 for i in range(len(its)) if tp[i]]
-    return soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True), per_point, axes
+        # paired dethrone vector uses only the GLM-passed items (the retention subset),
+        # kept PER-AXIS so koth dethrones on the worst axis, not the pooled mean.
+        vec = [1.0 if stud[i] else 0.0 for i in range(len(its)) if tp[i]]
+        per_axis[name] = vec
+        per_point += vec
+    return (soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True),
+            per_point, per_axis, axes, all_outs)
 
 
 def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
@@ -105,21 +114,27 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
             outs = base.generate([it.prompt for it in items.by_axis[s.name]], max_new_tokens)
             base_pass[s.name] = [s.axis.check(it, o) for it, o in zip(items.by_axis[s.name], outs)]
 
-    def gate(sub: Submission, axes: list[AxisScore]) -> tuple[bool, list[str]]:
+    def gate(sub: Submission, axes: list[AxisScore], outputs: list[str]) -> tuple[bool, list[str]]:
         reasons: list[str] = []
         if sub.params > tournament.tiers[sub.tier].max_params:
             reasons.append("over tier param budget")
-        reasons += verdict(axes, passk_ok=True).reasons
+        # looping / runaway free-text is a DoS on the 512-token axis path — disqualify.
+        deg_ok, dflags = degeneracy_flags(outputs)
+        if not deg_ok or dflags:
+            reasons.append(f"degenerate output: {', '.join(dflags)}")
+        # require EVERY declared axis to be live (min_live_axes = len(specs)) so a student
+        # cannot drop an inconvenient domain below MIN_AXIS_N and still win worst-domain.
+        reasons += verdict(axes, passk_ok=True, min_live_axes=len(specs)).reasons
         return (not reasons), reasons
 
     # 3-4. score every submission
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
     for sub, runner in submissions:
-        ret, ret_lb, per_pt, axes = _score_student(specs, items, base_pass, runner, max_new_tokens)
-        ok, reasons = gate(sub, axes)
+        ret, ret_lb, per_pt, per_ax, axes, outs = _score_student(specs, items, base_pass, runner, max_new_tokens)
+        ok, reasons = gate(sub, axes, outs)
         s = Scored(sub=sub, retention=ret, retention_lb=ret_lb, per_point=per_pt,
-                   gates_ok=ok, reasons=reasons)
+                   gates_ok=ok, reasons=reasons, per_axis=per_ax)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
 
@@ -135,9 +150,10 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
             continue
         king_scored = None
         if king is not None:
-            ret, ret_lb, per_pt, _ = _score_student(specs, items, base_pass, registry[king.model_id], max_new_tokens)
+            ret, ret_lb, per_pt, per_ax, _, _ = _score_student(specs, items, base_pass, registry[king.model_id], max_new_tokens)
             king_scored = Scored(sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
-                                 retention=ret, retention_lb=ret_lb, per_point=per_pt, gates_ok=True)
+                                 retention=ret, retention_lb=ret_lb, per_point=per_pt,
+                                 gates_ok=True, per_axis=per_ax)
         events.append(tournament.consider(t.name, by_tier.get(t.name, []), king_scored, seed=commit_seed))
 
     return RoundResult(round_no, sum(len(v) for v in items.by_axis.values()), scored, events, tournament.weights())
