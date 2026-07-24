@@ -366,12 +366,78 @@ def test_multihop_axis():
                 assert not ax.check(it, f"Answer: {it.meta['trap']}"), "shortcut trap accepted"
 
 
+def test_validator_axis_loop_end_to_end():
+    """The GLM-COVER production assembly: intake (economics + safety + tier + content hash
+    + commit-reveal) -> axis_round -> bonds -> SIGNED record -> weights. Asserts a
+    bait-and-switch submission is rejected at the door and the emitted record verifies."""
+    import tempfile
+    from pathlib import Path
+    from eval.axis_round import AxisSpec
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.signing import Ed25519Signer
+    from eval.validator_axis_loop import CommittedSubmission, run_axis_round
+
+    def make_ckpt(d, n_params):
+        """A minimal but VALID safetensors file (8-byte LE header length + JSON header +
+        data), so this flows through the real inspect_checkpoint rather than a stub."""
+        import json as _json
+        import struct
+        p = Path(d)
+        header = {"w": {"dtype": "F32", "shape": [n_params], "data_offsets": [0, 4 * n_params]}}
+        hb = _json.dumps(header).encode()
+        with open(p / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hb)))
+            f.write(hb)
+            f.write(b"\0" * (4 * n_params))
+        (p / "config.json").write_text('{"hidden_size":8,"num_hidden_layers":1}')
+        return d
+
+    with tempfile.TemporaryDirectory() as d_ok, tempfile.TemporaryDirectory() as d_bad:
+        make_ckpt(d_ok, 4)
+        make_ckpt(d_bad, 4)
+        h_ok, salt = content_hash(d_ok), "s1"
+        cv_ok = commit_value(h_ok, salt)
+        # the bad one commits to its ORIGINAL bytes, then swaps them (bait-and-switch)
+        h_bad = content_hash(d_bad)
+        cv_bad = commit_value(h_bad, salt)
+        make_ckpt(d_bad, 8)   # swap to different weights AFTER committing
+
+        specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        budgets = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
+        tour, ledger, reg = Tournament(tiers, margin=0.03), RegistrationLedger(), {}
+        glm = _Sim("glm", {"x": 1.0, "y": 1.0})
+        base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
+
+        committed = [
+            CommittedSubmission("hot_ok", "cold_ok", "t", d_ok, 1.0,
+                                make_runner=lambda: _Sim("ok", {"x": 0.9, "y": 0.9}, seed=1),
+                                revealed_hash=h_ok, salt=salt, committed_value=cv_ok),
+            CommittedSubmission("hot_bad", "cold_bad", "t", d_bad, 1.0,
+                                make_runner=lambda: _Sim("bad", {"x": 0.95, "y": 0.95}, seed=2),
+                                revealed_hash=h_bad, salt=salt, committed_value=cv_bad),
+        ]
+        signer = Ed25519Signer(seed=b"7" * 32)
+        out = run_axis_round(1, "root", "nonce", committed, specs, glm, base, tiers,
+                             budgets, tour, ledger, reg, items_per_axis=120,
+                             max_new_tokens=8, signer=signer)
+
+        assert "hot_ok" in out.accepted, out.rejected
+        assert "hot_bad" not in out.accepted, "bait-and-switch submission was accepted"
+        assert any("commit-reveal" in " ".join(r[1]) for r in out.rejected), out.rejected
+        assert out.record is not None and out.record.verify_signature(), "record unsigned/invalid"
+        assert tour.kings["t"].model_id == h_ok, "crown not keyed to the content hash"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
              test_content_identity_and_commit_reveal, test_round_record_signature,
-             test_economics_free_eval_is_per_coldkey, test_multihop_axis]
+             test_economics_free_eval_is_per_coldkey, test_multihop_axis,
+             test_validator_axis_loop_end_to_end]
     failed = 0
     for t in tests:
         try:
