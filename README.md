@@ -1,200 +1,118 @@
 # SN40 v2 — The Model Compression Subnet
 
-**One line:** miners compete to compress frontier open models — starting with GLM —
-into low-bit checkpoints that run on hardware people actually own; the best
-capability-per-bit model in each size tier wears a crown, and every crown ships as a
-downloadable open model.
+**One line:** miners compress a frontier open model — starting with **GLM** — into a small
+student that keeps the teacher's *capability*; the best student per size tier wears a crown,
+and every crown ships as a downloadable open model.
 
-**Reference point:** PrismML's Ternary Bonsai showed what one lab gets from 1.58-bit
-models (9× smaller, ~5× faster, HF-trending). v2 makes that a standing market: a
-permissionless swarm doing it to GLM, continuously, producing a *family* of runnable
-open checkpoints — with an anti-gaming design built from the public lessons of earlier
-distillation-KOTH attempts.
+**Reference point:** PrismML's Ternary Bonsai showed what one lab gets from aggressive
+compression (much smaller, faster, HF-trending). v2 makes that a standing market — a
+permissionless swarm doing it to GLM continuously — with an anti-gaming design built from
+the public lessons of earlier distillation-KOTH attempts
+([`docs/prior-art-and-lessons.md`](docs/prior-art-and-lessons.md)).
 
-## Objective
+## How it works
 
-Fix a **(teacher, permitted student-base) pair**. Miners submit **student
-checkpoints** — quantized/distilled versions of the teacher — into size/bit tiers. The
-validator scores the artifact itself on fresh, verifiable tasks. Nothing about the
-miner's private training process is trusted or inspected: download the checkpoint,
-measure what it can do, measure how small and fast it is.
+Fix a **(teacher, permitted student-base) pair** — the pair, not just the teacher, because
+*match beats strength* (OpenThoughts, [arXiv:2506.04178](https://arxiv.org/abs/2506.04178)
+Table 8: QwQ-32B is a better teacher than the stronger DeepSeek-R1). Miners submit a
+**student checkpoint** into a size tier. The validator scores the artifact itself — download
+it, measure what it can do — and never inspects or trusts the private training process.
 
-The pair is pinned, not just the teacher, because **match beats strength**: OpenThoughts
-([arXiv:2506.04178](https://arxiv.org/abs/2506.04178), Table 8) found QwQ-32B a better
-teacher than DeepSeek-R1 *in every domain* despite being the weaker model — "models with
-better performance are not necessarily better teachers." Leaving the pairing to miners
-would make our teacher choice, not miner skill, the dominant term in every score.
+Each round:
 
-**Teacher ladder** (all MIT-licensed):
+1. **Front door** — economics → safety inspect (safetensors-only, no remote code, params/
+   bits from tensor headers) → tier fit → **content-hash + commit-reveal** (you're judged on
+   the exact bytes you committed to; no bait-and-switch). No untrusted weights load until all
+   of this passes.
+2. **Score** — items are minted **fresh from the commit nonce** (they don't exist until
+   checkpoints lock, so there's nothing to memorize offline). GLM authors the reference,
+   then the student and the reigning king answer the same items.
+3. **Aggregate** — per-axis normalized retention `(student − base) / (teacher − base)` on the
+   items GLM itself passes, combined **worst-domain** (soft-min). Your weakest axis is your
+   score. Cap 1.25 (beating the teacher is the interesting case); negative retention on any
+   axis is an automatic reject.
+4. **Crown** — KOTH dethrone-on-margin, plus a signed reproducible round record.
 
-| Rung | Teacher | bf16 today | 4-bit tier | ~1.58-bit tier |
-|---|---|---|---|---|
-| 1 | GLM-4-9B (dense) | 19 GB · 24GB GPU | 4.7 GB · any laptop | **2.5 GB · a phone** |
-| 2 | GLM-4.5-Air (106B MoE, 12B active) | 212 GB · multi-GPU server | 53 GB · one H100 / Mac Studio | **26 GB · one RTX 5090** |
+## Scoring is capability, not imitation
 
-Rung 2 is the headline: a frontier-class 106B agentic model on a single consumer GPU.
+Distillation contests die when they score *imitation* (KL / distribution-match): students
+learn the teacher's **style**, win the metric, lose the capability. v2 never scores
+imitation — every axis has a **deterministic checker**, so a wrong answer fails no matter how
+GLM-like it reads:
 
-## Scoring — capability, not imitation
+| axis | checker |
+|---|---|
+| math | exact numeric answer (multi-step word problems) |
+| code | **execute hidden unit tests** |
+| instruction-following | verifiable format constraints (parsers) |
+| long-context | retrieval + aggregation over a haystack |
+| multi-hop | compose several stated facts (with a shortcut distractor) |
 
-Distillation contests die when they score *imitation* (KL / distribution-match to the
-teacher): students learn the teacher's **style** — its "let me reconsider…" filler —
-win the metric, and lose the actual capabilities. (This is not hypothetical; earlier
-distillation subnets documented it in their own public post-mortems — see
-[`docs/prior-art-and-lessons.md`](docs/prior-art-and-lessons.md).) v2 never scores
-imitation. It scores **verifiable capability retention**:
-
-```
-gate   effective-bits audit        — bits/params/dtype recomputed from the LOADED
-                                      state dict, never metadata; serialized-bytes
-                                      after canonical recompression (kills zero-pad,
-                                      sparse-stuffing, fp16-outlier "fake ternary")
-gate   safety + sanity             — safetensors only, no miner *.py (RCE ban),
-                                      anti-finetune probe (grad-explosion / absurd
-                                      norms), degeneracy probe (loop rate / length
-                                      blowup on trivial prompts)
-gate   pass@16 >= base             — mode-collapse detector; pass@1 alone cannot see it
-score  capability on FRESH tasks   — normalized retention, per compute (see below)
-bonus  measured decode tok/s       — on pinned hardware, plausibility-ceilinged
-```
-
-**No KL in the reward. Any KL you like in your trainer.** Scoring never uses
-distribution-match, logit-matching or an LLM judge — but nothing stops a miner training
-with reverse-KL on-policy distillation, and they should: Qwen3
-([arXiv:2505.09388](https://arxiv.org/abs/2505.09388), Table 21) beat RL on *every*
-metric at 1,800 GPU-hours versus 17,920. Banning imitation as a **method** would outlaw
-the state of the art; we only refuse to **pay** for it.
-
-**pass@16 is a gate, not a weighted term.** A student can lift pass@1 while pass@k stays
-flat or drops — capability sharpening that reads as progress
-([arXiv:2505.14216](https://arxiv.org/abs/2505.14216): "RLVR enhances overall accuracy
-(pass@1) but often fails to improve capability (pass@k)"). Fail the gate, no crown,
-regardless of score.
-
-**The score is downstream capability on freshly-minted, machine-checkable tasks** —
-math with checkable answers, code scored by execution, templated reasoning
-(GSM-Symbolic style, with NoOp distractors), tool-call/format tasks with programmatic
-checkers. Style cannot pass a unit test.
-
-Per axis, retention is **normalized against the pinned pair** —
-`(student − base) / (teacher − base)` — so an axis where the base already scores well
-can't be farmed for headroom it never had. Axes aggregate by **worst-domain soft-min**:
-sacrificing any one capability to buy another tanks the score. The per-axis cap is
-**1.25, not 1.0** — a hard 1.0 makes the crown undecidable the moment two miners reach
-teacher parity, and beating the teacher is the interesting case, not an error. Negative
-retention on any axis is an automatic reject.
-
-**Capability per compute — the denominator is part of the score.** Efficiency is the
-differentiator, so it has to be measured, and measured whole. Teacher *generation*
-compute is the same order as student *training* compute — OpenThinker3-7B took ~22,000
-H100-hours generating traces against ~25,000 A100-hours training the student — so a
-metric that meters only the training step measures under half the real cost and is
-trivially gamed by pushing effort offline into teacher sampling. The budget counts
-`teacher generation + student training + teacher scoring + rollout` FLOPs in normalized
-H100-hours, **per registration, including runs the miner discarded**. Undeclared compute
-is fraud, not an error: it forfeits the bond.
-
-**Fresh by construction (commit-then-generate).** The eval items for a round are
-generated *after* the round's checkpoint hashes are committed — from seeded procedural
-generators and post-cutoff documents. There is no static answer key to memorize and
-nothing to harvest; the secret set never exists on a miner-reachable box and is deleted
-after the round. A paraphrase-invariant slice and a stale-vs-fresh diff-in-diff (our
-GPT-2-control method, which caught a real memorization king on sn40) flag any model
-whose gains are benchmark-recovery rather than genuine compression.
+Two of these — long-context and multi-hop — are what compression breaks *first*, so the
+worst-domain crown is set by what a compressed model **loses**, not what it keeps. **No KL in
+the reward; any KL you like in your trainer** — banning imitation as a *method* would outlaw
+the state of the art (on-policy distillation), we only refuse to *pay* for style.
 
 ## Anti-gaming — economics, not detection
 
-The last team proved you **cannot detect** copying on a shared public base — every
-fingerprint detector either failed on legit fine-tunes or got weaponized. v2 makes
-copying and gaming *unprofitable* instead:
+The last team proved you **cannot detect** copying on a shared base. v2 makes gaming
+*unprofitable* instead — all of the following are built and tested:
 
-- **Tiered multi-slot king-of-the-hill.** One crown per size/bit tier (e.g. sub-1B /
-  sub-3B / sub-7B, or 1.58 / 2 / 4-bit). Within a tier the ranking is a **total
-  order** (capability retention above the effective-bits gate) — no undefined
-  "Pareto partial order" stalls. Across tiers you get a downloadable *family*.
-- **A copy earns nothing.** Dethroning requires being *strictly better* — higher
-  retention at equal-or-smaller budget, past a margin **well above the noise floor**
-  (bootstrap-LCB, paired against the incumbent on the same fresh items). A copy of the
-  king ties; a tie pays zero; micro-shaving is below the margin. No detector to evade.
-- **Margin over a naive-quant control.** Emission share ∝ (retention − round-to-nearest
-  baseline at that budget). Shipping the obvious quantization, or a copy of it, has
-  ~zero expected value; every emitted TAO is attached to demonstrated algorithmic delta.
-- **First-committer-owns-hash + delayed reveal.** Sealed commit-then-reveal (Ralph's
-  X25519 bundle encryption); the winning artifact publishes only after a delay window,
-  so the live king isn't copyable mid-round; the earliest on-chain commit of a given
-  content hash wins, which DQs the *later* committer only (no griefing).
-- **Anti-grind economics** (the only defenses that held for the last team):
-  one-eval-per-registration, a per-coldkey round cap, and a bond/fee for extra
-  submissions *refunded when the submission improves the miner's own best* — spam and
-  best-of-N crown-farming become strictly unprofitable; honest iteration stays cheap.
-- **Never-shrink ratchet + headroom pay.** The retention floor only rises; payout
-  scales with distance above it, so a saturated tier self-retires (emission migrates to
-  unsaturated tiers) instead of Goodharting on noise.
+- **A copy earns nothing.** The king is re-scored on the same fresh items every round; an
+  exact copy ties (zero margin, paired bootstrap-LCB on the **worst axis**) and cannot
+  dethrone. Dethroning needs a *strict* worst-axis improvement past the noise floor.
+- **Genre-overfit gate (stale-vs-fresh diff-in-diff).** Distilling GLM only over the
+  announced distribution doesn't win: a student whose edge over base **collapses on
+  genuinely-new same-genre documents** is demoted regardless of its axis scores. Freshness
+  alone doesn't stop distribution-overfit; this does.
+- **Content-addressed identity + commit-reveal.** You're bound to the exact bytes you
+  committed (weights *and* config/tokenizer) — no post-commit swap.
+- **Anti-grind economics.** One free eval per **coldkey**, a per-coldkey round cap, and a
+  bond for extra submissions refunded only when you improve your own best — spam and
+  best-of-N crown-farming are unprofitable; honest iteration stays cheap.
+- **Signed round records.** Every verdict is signed by the validator and independently
+  re-runnable from the recorded seeds.
 
-## Where confidential compute fits (and where it doesn't)
+## The honest claim
 
-We asked the hard question directly and researched it: **CC-attested proof bundles do
-NOT solve the gaming problem.** They prove *computational integrity* — that the
-official eval ran on real hardware over a sealed set — but an attested run of a
-gameable objective just faithfully certifies a gamed model. And miner-run CC is a trap:
-the miner owns the box, so "sealed from the miner" is outside the hardware vendor's
-threat model (enclave memory is extractable by the box owner), and miner-run eval would
-delete the one-eval-per-registration defense.
+The crown certifies **verifiable capability retention of GLM** across a broad, freshly-minted
+distribution. It does *not* certify "is specifically a compressed GLM" — no behavioral eval
+can prove lineage (a different, equally-capable model passes the same checkers). We claim
+exactly what the eval proves.
 
-So the core eval is **validator-side** — which is cheap *because the students are
-small* (that is exactly what structurally fixes the eval-economics death that bankrupted
-the last attempt). CC has one honest, optional role: **phase-2 throughput
-attestation** — proving "this student really runs this fast on genuine hardware," a
-non-forgeable version of the tok/s bonus, which reuses Ralph's existing TDX+H100-CC
-stack. Nice-to-have, not the security foundation.
+## Roadmap (not yet built)
 
-## Deliverables & narrative
+The current subnet crowns capability retention per size tier. These are designed but not
+implemented, and the code does not claim them:
 
-- Every crowned king ships as an **open runnable checkpoint** (safetensors + GGUF) on
-  HF, Apache-2.0/MIT — a *family* across tiers, not one model.
-- Public leaderboard: capability-per-bit frontier, live at ralphlabs.ai, every verdict
-  independently re-runnable on one modest GPU (signed audit trail).
-- Standing demo: **"run the king"** — this week's best compressed GLM, on your laptop.
-- Recurring headline, on tap with every crown: *"Bittensor's swarm just put a
-  frontier-class model on your laptop / phone."*
+- **Bit-tier structure + capability-per-compute** — 1.58/2/4-bit tiers, effective-bits audit
+  by recompression, and a compute denominator (teacher generation + training + scoring FLOPs,
+  reconciled) in the ranking. Today: size tiers, compute declared-not-ranked.
+- **pass@k gate** — a mode-collapse detector (pass@1 can't see it); needs a determinism
+  redesign (seeded sampling) before it's turned on. Currently a no-op.
+- **Throughput attestation** — a non-forgeable "runs this fast on real hardware" bonus
+  (reusing Ralph's TDX+H100-CC stack).
+- **Live fresh-corpus feed** — the genre-overfit gate is validated on a static timestamped
+  dataset; production draws the fresh half from a live post-commit feed.
+- **Delivery** — GGUF / "run the king on your phone", GLM-4.5-Air as a second rung,
+  first-committer-wins + delayed reveal, never-shrink ratchet.
+- **Chain integration** — the round is wired to a `ChainIO` boundary and tested against a
+  fake chain; the live-validator wiring + testnet shakedown is the remaining engineering.
+
+## Run it
+
+```bash
+python -m tests.test_crown_path        # 17/17, CPU, no deps
+python -m eval.run_capability_axis     # real GLM + student ladder: per-axis retention, crown
+python -m eval.shadow_axis_epoch       # the full operator epoch end to end (fake chain)
+```
+
+Miners: see [`miner/QUICKSTART.md`](miner/QUICKSTART.md).
 
 ## Positioning vs the family
 
-SN3 trains full-precision models on a frozen arch (compression out of scope by design).
-SN97 fine-tunes a fixed 35B, quantization banned. SN120 runs RL environments on
-full-size students. **Nobody owns the efficiency axis.** v2 is the missing quadrant —
-and it fuses three things no other subnet can assemble: a fresh commit-then-generate
-*verifiable* eval, reward-indifference-to-copies (economic, not detection), and a
-tiered family of downloadable artifacts.
-
-## Honest open problems — to prove before locking
-
-The design is not claimed solved. Three problems are genuinely open and will be
-prototyped and measured on the live subnet in a low-stakes shadow mode *before* any
-public capability claim:
-
-1. **Covering-set breadth / capability laundering.** A miner could distill from a
-   smuggled frontier-model corpus and win narrow math/code without truly compressing
-   GLM. Only eval *breadth* plus teacher-relative retention defeats it. The honest
-   promise is **"verifiable retention of checkable capability,"** not "broad
-   capability" — the state of the art forces this tradeoff, and we will not overclaim.
-2. **Dethrone margin vs noise.** The strict-improvement margin must sit well above
-   measurement noise, or micro-shaving flips crowns. Calibrate empirically.
-3. **Eval-cost scaling.** As the covering set widens, run a tiered cheapest-first
-   funnel (bits audit → safety/degeneracy → small slice → full suite only for
-   survivors); GLM must stay validator-hostable — never a cloud-API dependency in the
-   scoring path.
-4. **Compute accounting is self-declared at the edges.** The budget is enforceable
-   where it can be reconciled — declared generation tokens against the published
-   throughput envelope, and re-derivation of a sampled slice against the pinned
-   teacher. Beyond that it rests on the bond, not on detection. Closed-teacher use is
-   deterred by cost-of-proof, not caught by a classifier: stylistic and
-   response-similarity signals are all defeated by paraphrasing traces through the
-   pinned open teacher, and we would rather say so than imply a detector we don't have.
-
-## Migration & timeline
-
-sn40's validator, KOTH statistics, held-out rotation, fraud gates, bundle encryption,
-dashboard, and signed publishing pipeline all carry over — this is a re-aim of a
-running system, not a rebuild. Rung 1 (GLM-4-9B, one bit tier) ships to the live subnet
-in shadow mode first — scoring runs and the frontier is published, but the open problems
-above are measured and settled before crowns carry full emission weight.
+SN3 trains full-precision models on a frozen arch (compression out of scope). SN97 fine-tunes
+a fixed model, quantization banned. SN120 runs RL environments on full-size students. **Nobody
+owns the efficiency axis** — v2 is the missing quadrant: a fresh, commit-then-generate
+*verifiable* eval; reward-indifference-to-copies (economic, not detection); and a tiered
+family of downloadable open checkpoints.
