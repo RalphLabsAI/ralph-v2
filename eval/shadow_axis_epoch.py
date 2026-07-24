@@ -79,9 +79,13 @@ class FakeChain:
 
 
 def _tier_specs():
+    # code axis grades untrusted student output by executing it -> hard sandbox REQUIRED in
+    # production (fail closed if bwrap is absent). Set RALPH_CODE_SANDBOX=auto only on a
+    # trusted dev box without bubblewrap.
+    code_sandbox = os.environ.get("RALPH_CODE_SANDBOX", "require")
     specs = [
         AxisSpec(MathGSM(), "math", 1.0, difficulty=3),
-        AxisSpec(CodeExec(), "code", 1.0, difficulty=2, items=160),
+        AxisSpec(CodeExec(sandbox=code_sandbox), "code", 1.0, difficulty=2, items=160),
         AxisSpec(InstructionFollowing(), "instruction", 1.0, difficulty=1),
         AxisSpec(LongContext(base_facts=12), "long_context", 1.0, difficulty=1),
         AxisSpec(MultiHop(), "multihop", 1.0, difficulty=1),

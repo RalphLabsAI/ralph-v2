@@ -55,6 +55,20 @@ def _extract_int(output: str) -> str | None:
     return nums[-1].replace(",", "") if nums else None
 
 
+_UNIT = re.compile(r"Unit-[A-Z]\d{2}")
+
+
+def _extract_unit(output: str) -> str | None:
+    """First unit id AFTER the answer marker (mirrors _extract_int): naming several ids or
+    echoing the context — which always contains the answer id — cannot shotgun a pass."""
+    if not output:
+        return None
+    tail = re.split(r"(?i)(?:final answer|answer)\s*[:=]", output)
+    seg = tail[1] if len(tail) > 1 else output
+    m = _UNIT.search(seg)
+    return m.group(0) if m else None
+
+
 class LongContext:
     name = "long_context"
     weight = 1.0
@@ -76,6 +90,14 @@ class LongContext:
                     ents.append(e)
             attr, unit = rng.choice(_ATTRS)
             vals = {e: rng.randint(10, 999) for e in ents}
+            # resolve a UNIQUE maximum BEFORE rendering the haystack, so the argmax answer is
+            # always recoverable from the printed facts. (Previously the tie-break bumped a
+            # value inside _query AFTER this text was built, so on a max-tie the answer
+            # disagreed with the context and penalized a model that read it correctly.)
+            mx = max(vals.values())
+            top = [e for e, v in vals.items() if v == mx]
+            if len(top) > 1:
+                vals[top[0]] = mx + rng.randint(1, 50)
             facts = [f"The {attr} of {e} is {vals[e]} {unit}." for e in ents]
             fillers = [rng.choice(_FILLERS) for _ in range(max(0, n_lines - len(ents)))]
             lines = facts + fillers
@@ -101,11 +123,8 @@ class LongContext:
             cnt = sum(1 for v in vals.values() if v > thr)
             return (f"How many units have a {attr} greater than {thr} {unit}?", cnt, True)
         if qtype == "argmax":
-            # guarantee a unique max so the identity answer is well-defined
-            mx = max(vals.values())
-            top = [e for e, v in vals.items() if v == mx]
-            if len(top) > 1:
-                vals[top[0]] = mx + rng.randint(1, 50)
+            # the max is already unique (resolved before the haystack was rendered), so the
+            # answer is well-defined and printed in the context.
             best = max(vals, key=lambda e: vals[e])
             return f"Which unit has the greatest {attr}?", best, False
         # sum
@@ -115,5 +134,8 @@ class LongContext:
         if item.meta.get("numeric", True):
             got = _extract_int(output)
             return got is not None and got == str(item.answer)
-        # identifier: the exact Unit id must appear in the response
-        return re.search(rf"\b{re.escape(str(item.answer))}\b", output or "") is not None
+        # identifier: take the FIRST unit id AFTER the answer marker and require an exact
+        # match. A substring-anywhere match let a model shotgun several ids (or echo the
+        # context, which always names the answer) and pass without doing the retrieval.
+        got = _extract_unit(output)
+        return got is not None and got == str(item.answer)

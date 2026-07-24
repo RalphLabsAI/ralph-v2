@@ -1,0 +1,10 @@
+# Crown-path test suite (python -m tests.test_crown_path) — the only hard dependency:
+pynacl                 # ed25519 signing of round records (eval/signing.py)
+
+# Real model runs (eval.run_capability_axis / eval.shadow_axis_epoch, GPU) additionally need:
+#   torch
+#   transformers
+#   safetensors
+#   huggingface_hub
+#   datasets            # only for the live genre-overfit corpus (eval/corpus_hf.py)
+# and, for the code-axis grader sandbox in production, the system package `bubblewrap` (bwrap).

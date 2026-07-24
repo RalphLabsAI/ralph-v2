@@ -40,7 +40,7 @@ class RegistrationLedger:
     # state
     hotkey_submissions: dict = field(default_factory=dict)      # hotkey -> count this epoch
     coldkey_submissions: dict = field(default_factory=dict)     # coldkey -> count this epoch
-    best_score: dict = field(default_factory=dict)             # hotkey -> best retention so far
+    best_score: dict = field(default_factory=dict)             # COLDKEY -> best retention so far
     bonds_held: dict = field(default_factory=dict)             # hotkey -> bond posted, pending refund
 
     def can_submit(self, hotkey: str, coldkey: str, bond_posted: float = 0.0) -> SubmitDecision:
@@ -66,14 +66,21 @@ class RegistrationLedger:
         if bond_posted > 0:
             self.bonds_held[hotkey] = self.bonds_held.get(hotkey, 0.0) + bond_posted
 
-    def settle(self, hotkey: str, new_score: float) -> float:
+    def settle(self, hotkey: str, coldkey: str, new_score: float) -> float:
         """Called after scoring. Refund the held bond iff the submission improved the
-        miner's own best; otherwise the bond is forfeit (taxes noise, not work).
-        Returns the refunded amount."""
-        prev = self.best_score.get(hotkey, float("-inf"))
+        operator's own best; otherwise the bond is forfeit (taxes noise, not work).
+        Returns the refunded amount.
+
+        "Own best" is keyed by COLDKEY, not hotkey: the cap and bond escalate per coldkey
+        (that is the operator identity), so the improvement bar must too. Keying it by hotkey
+        let a multi-hotkey operator rotate hotkeys under one coldkey — each fresh hotkey has
+        best_score=-inf, so every bonded resubmission trivially "improved" and was always
+        refunded, making the anti-best-of-N tax optional. The held bond is still popped by the
+        posting hotkey (that is who put it up)."""
+        prev = self.best_score.get(coldkey, float("-inf"))
         improved = new_score > prev + 1e-9
         if improved:
-            self.best_score[hotkey] = new_score
+            self.best_score[coldkey] = new_score
         held = self.bonds_held.pop(hotkey, 0.0)
         return held if improved else 0.0   # forfeit if not improved
 

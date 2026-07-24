@@ -9,22 +9,23 @@ Tasks are generated from parameterized specs (same principle as the math axis:
 the procedure is fixed, the surface is fresh), and each carries hidden tests the
 model never sees.
 
-SANDBOXING: this module runs candidate code in a subprocess with a wall-clock
-timeout, which is sufficient for OUR OWN generated reference solutions and the
-simulated students. Grading real miner-submitted model output must additionally run
-with no network, a read-only filesystem, and resource caps — see the RCE lesson in
-docs/prior-art-and-lessons.md. Do not point this at untrusted output as-is.
+SANDBOXING: candidate code is student-emitted and hostile by construction (a payload in
+the ```python block that passes the asserts AND exfiltrates the validator wallet), so the
+subprocess runs through eval.sandbox.run_script — bubblewrap (no network, read-only FS,
+$HOME/tmp masked) plus rlimits. In production the code axis is constructed with
+sandbox="require" (fail closed if no hard sandbox backend is present); "auto" degrades to
+rlimit-only with a loud warning for local dev on trusted models. See the RCE lesson in
+docs/prior-art-and-lessons.md.
 """
 from __future__ import annotations
 
 import random
 import re
-import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
 from ..core import Item
+from ..sandbox import run_script
 
 # PARAMETERIZED FAMILIES. Three fixed specs made this axis a lookup table: a miner
 # memorizes 3 function bodies and maxes it forever, and "fresh per round" only reshuffles
@@ -177,8 +178,12 @@ class CodeExec:
     name = "code"
     weight = 0.25
 
-    def __init__(self, timeout_s: float = 5.0):
+    def __init__(self, timeout_s: float = 5.0, sandbox: str = "auto"):
+        # sandbox: "require" (production, fail-closed if no bwrap), "auto" (bwrap if present
+        # else rlimit-only + warning), "off" (rlimit-only). Untrusted student output must be
+        # graded with "require"; the production spec assemblies set it via RALPH_CODE_SANDBOX.
         self.timeout_s = timeout_s
+        self.sandbox = sandbox
 
     def generate(self, seed: int, n: int, difficulty: int = 1) -> list[Item]:
         rng = random.Random(seed)
@@ -250,12 +255,10 @@ class CodeExec:
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "cand.py"
             p.write_text(script)
-            try:
-                r = subprocess.run([sys.executable, str(p)], capture_output=True,
-                                   text=True, timeout=self.timeout_s, cwd=td)
-            except subprocess.TimeoutExpired:
+            executed, cp = run_script(str(p), td, timeout=self.timeout_s, mode=self.sandbox)
+            if not executed or cp is None:   # refused (no sandbox in 'require' mode) or timed out
                 return False
-            return r.returncode == 0 and "__OK__" in r.stdout
+            return cp.returncode == 0 and "__OK__" in cp.stdout
 
     def reference_solution(self, item: Item) -> str:
         """The correct answer — used by simulated students to model competence."""

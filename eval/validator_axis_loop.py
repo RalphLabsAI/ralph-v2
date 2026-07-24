@@ -79,7 +79,8 @@ def run_axis_round(
         # model_id = CONTENT HASH: binds the scored artifact to the committed one and makes
         # koth's copy-guard content-based rather than hotkey-based.
         sub = Submission(miner=c.hotkey, tier=c.tier, model_id=d.content_hash,
-                         params=d.inspection.params, compute_h100h=c.declared_compute_h100h)
+                         params=d.inspection.params, compute_h100h=c.declared_compute_h100h,
+                         coldkey=c.coldkey)
         subs.append((sub, c.make_runner()))
         out.accepted.append(c.hotkey)
 
@@ -93,7 +94,7 @@ def run_axis_round(
 
     # 3. settle refundable anti-grind bonds (refunded iff the miner improved its own best)
     for mid, s in res.scored.items():
-        refund = ledger.settle(s.sub.miner, s.retention)
+        refund = ledger.settle(s.sub.miner, s.sub.coldkey, s.retention)
         if refund:
             out.refunds[s.sub.miner] = refund
 

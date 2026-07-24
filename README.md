@@ -102,7 +102,8 @@ implemented, and the code does not claim them:
 ## Run it
 
 ```bash
-python -m tests.test_crown_path        # 17/17, CPU, no deps
+pip install -r requirements.txt        # one dep for the tests: pynacl
+python -m tests.test_crown_path        # 19/19, CPU
 python -m eval.run_capability_axis     # real GLM + student ladder: per-axis retention, crown
 python -m eval.shadow_axis_epoch       # the full operator epoch end to end (fake chain)
 ```

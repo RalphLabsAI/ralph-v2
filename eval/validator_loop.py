@@ -93,7 +93,7 @@ def run_validator_round(
 
     # 4. settle bonds — refund on self-improvement, forfeit otherwise
     for mid, s in res.scored.items():
-        refund = ledger.settle(s.sub.miner, s.retention)
+        refund = ledger.settle(s.sub.miner, s.sub.coldkey, s.retention)
         if refund:
             out.refunds[s.sub.miner] = refund
 

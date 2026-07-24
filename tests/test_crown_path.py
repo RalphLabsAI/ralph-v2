@@ -585,6 +585,83 @@ def test_miner_submission_roundtrip():
         assert not ok2 and "bait-and-switch" in why, why
 
 
+def test_code_exec_sandbox_blocks_payload():
+    """C1 regression: the code grader must not let student-emitted code touch the host. A
+    payload that writes a canary OUTSIDE the work dir executes under sandbox='off' (proving
+    the payload is real and the pre-fix path was exploitable), but is stopped under
+    sandbox='require' — either fail-closed when no hard sandbox backend is present, or blocked
+    by the read-only sandbox FS when bwrap is."""
+    import tempfile
+    from pathlib import Path
+    from eval.axes.code_exec import CodeExec
+
+    ax = CodeExec()
+    item = ax.generate(seed=1, n=1, difficulty=1)[0]     # a real code item + its hidden tests
+    with tempfile.TemporaryDirectory() as d:
+        canary = Path(d) / "pwned"
+        # student output: the CORRECT reference solution + a module-level exfil side effect
+        payload = (f"```python\n{item.answer['sig']}:\n    {item.answer['ref']}\n"
+                   f"import pathlib; pathlib.Path({str(canary)!r}).write_text('x')\n```")
+
+        # raw execution (the pre-fix behavior) runs the payload -> the item passes AND the
+        # canary lands on the host: proves the payload is genuinely dangerous.
+        assert CodeExec(sandbox="off").check(item, payload)
+        assert canary.exists(), "payload did not execute under sandbox=off (test is vacuous)"
+        canary.unlink()
+
+        # the fix: require a hard sandbox -> the write never reaches the host, either way.
+        CodeExec(sandbox="require").check(item, payload)
+        assert not canary.exists(), "sandbox='require' let student code write to the host"
+
+
+def test_bond_refund_keyed_by_coldkey():
+    """E7 regression: the resubmission bond must be forfeit for a non-improving best-of-N
+    attempt even when the operator rotates HOTKEYS under one coldkey — otherwise a fresh
+    hotkey resets best_score to -inf and its bond is always refunded, making the anti-grind
+    tax optional."""
+    from eval.economics import RegistrationLedger
+    led = RegistrationLedger(per_coldkey_round_cap=3, base_bond=1.0)
+
+    # operator's first (free) submission under coldkey C sets a high personal best
+    led.record("hotA", "C")
+    led.settle("hotA", "C", 0.80)
+
+    # a SECOND submission under a DIFFERENT hotkey, same coldkey, that is WORSE -> bond forfeit
+    d = led.can_submit("hotB", "C", bond_posted=1.0)
+    assert d.ok
+    led.record("hotB", "C", bond_posted=1.0)
+    assert led.settle("hotB", "C", 0.50) == 0.0, "worse best-of-N refunded via hotkey rotation"
+
+    # a genuine improvement under yet another hotkey IS refunded (honest iteration untaxed)
+    d2 = led.can_submit("hotD", "C", bond_posted=2.0)
+    assert d2.ok
+    led.record("hotD", "C", bond_posted=2.0)
+    assert led.settle("hotD", "C", 0.90) == 2.0, "honest improvement not refunded"
+
+
+def test_long_context_argmax_and_id():
+    """H5 regression: the argmax answer must be the unique maximum actually PRINTED in the
+    haystack (no post-render tie mutation), and the identifier check must take the FIRST unit
+    id after the answer marker (exact match) so a shotgun/echo cannot pass."""
+    import re as _re
+    from eval.axes.long_context import LongContext
+    ax = LongContext(base_facts=12)
+    for seed in range(40):
+        for it in ax.generate(seed, 4, 1):
+            if it.meta["qtype"] != "argmax":
+                continue
+            body = it.prompt.split("\n\nQuestion")[0]
+            vals = {m[0]: int(m[1]) for m in _re.findall(r"of (Unit-[A-Z]\d\d) is (\d+)", body)}
+            mx = max(vals.values())
+            assert list(vals.values()).count(mx) == 1, "printed max is not unique"
+            assert vals[it.answer] == mx, "argmax answer is not the printed maximum"
+            assert ax.check(it, f"Answer: {it.answer}"), "correct answer rejected"
+            # shotgun every id after the marker: passes ONLY if the answer happens to be first
+            first = next(iter(vals))
+            shotgun = "Answer: " + " ".join(vals)
+            assert ax.check(it, shotgun) == (first == it.answer), "shotgun bypassed the id check"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -593,7 +670,8 @@ def main() -> int:
              test_economics_free_eval_is_per_coldkey, test_multihop_axis,
              test_validator_axis_loop_end_to_end, test_axis_chain_epoch_end_to_end,
              test_corpus_hf_pure_logic, test_overfit_check_wired_into_crown,
-             test_miner_submission_roundtrip]
+             test_miner_submission_roundtrip, test_code_exec_sandbox_blocks_payload,
+             test_bond_refund_keyed_by_coldkey, test_long_context_argmax_and_id]
     failed = 0
     for t in tests:
         try:
@@ -602,6 +680,11 @@ def main() -> int:
         except AssertionError as e:
             failed += 1
             print(f"  FAIL  {t.__name__}: {e}")
+        except Exception as e:
+            # a missing dep (e.g. pynacl) or unexpected error must not abort the whole run —
+            # report it and keep going so one gap doesn't hide the rest of the suite.
+            failed += 1
+            print(f"  ERROR {t.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 

@@ -32,6 +32,7 @@ class Submission:
     model_id: str            # content hash of the checkpoint
     params: int
     compute_h100h: float     # declared, normalized; reconciled elsewhere
+    coldkey: str = ""        # operator identity — the unit anti-grind economics key on
 
 
 # minimum aggregate lower-bound retention to be crownable AT ALL (open or contested).

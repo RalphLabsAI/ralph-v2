@@ -81,7 +81,7 @@ def run_env_round(
     out.weights = res.weights
 
     for mid, s in res.scored.items():
-        refund = ledger.settle(s.sub.miner, s.retention)
+        refund = ledger.settle(s.sub.miner, s.sub.coldkey, s.retention)
         if refund:
             out.refunds[s.sub.miner] = refund
 
