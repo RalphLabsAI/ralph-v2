@@ -42,6 +42,11 @@ class AxisSpec:
     name: str
     weight: float = 1.0
     difficulty: int = 1
+    # Optional per-axis item count. Liveness needs >= MIN_AXIS_N teacher-passed ITEMS, not a
+    # minimum pass RATE — so an axis the teacher only clears at (say) 31% just needs more
+    # items sampled, rather than being made easier. Keeping a hard axis and sampling more
+    # preserves its discriminating power; dumbing it down would not.
+    items: int | None = None
 
 
 @dataclass
@@ -57,7 +62,7 @@ def mint_and_author(specs: list[AxisSpec], glm: ModelRunner, seed_fn,
     answering them. `seed_fn(axis_name) -> int` binds each axis to the commit nonce."""
     by_axis, teacher_pass = {}, {}
     for s in specs:
-        items = s.axis.generate(seed_fn(s.name), items_per_axis, s.difficulty)
+        items = s.axis.generate(seed_fn(s.name), s.items or items_per_axis, s.difficulty)
         outs = glm.generate([it.prompt for it in items], max_new_tokens)
         by_axis[s.name] = items
         teacher_pass[s.name] = [s.axis.check(it, o) for it, o in zip(items, outs)]

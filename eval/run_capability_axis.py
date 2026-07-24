@@ -57,7 +57,9 @@ def main() -> int:
     # base-solvable); long_context down into GLM's band (48-line was too hard, 19/48).
     specs = [
         AxisSpec(MathGSM(), "math", weight=1.0, difficulty=3),
-        AxisSpec(CodeExec(), "code", weight=1.0, difficulty=2),
+        # hard pool kept (broader cover); teacher clears it at ~31%, so sample MORE items
+        # rather than dumbing it down: 0.31*160 ~ 50 teacher-passed >> MIN_AXIS_N=30.
+        AxisSpec(CodeExec(), "code", weight=1.0, difficulty=2, items=160),
         AxisSpec(InstructionFollowing(), "instruction", weight=1.0, difficulty=1),
         AxisSpec(LongContext(base_facts=12), "long_context", weight=1.0, difficulty=1),
         # second fragile axis: COMPOSITION (each hop compounds), distinct from retrieval

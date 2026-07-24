@@ -62,8 +62,12 @@ class MultiHop:
             # so pattern-matching the question's outer relation onto e0 gives a wrong answer.
             trap = pool[0]
             facts.append(f"The {rels[-1]} of {chain[0]} is {trap}.")
-            # plain distractors over unrelated entities, reusing the same relations
-            for j in range(1, min(len(pool) - 1, 2 * hops)):
+            # plain distractors over unrelated entities, reusing the same relations.
+            # Density scales with difficulty: measured at 2 hops with 2*hops distractors the
+            # pinned teacher only reached ~53% (borderline for MIN_AXIS_N liveness), and an
+            # axis the TEACHER cannot clear measures nothing.
+            n_distract = hops if difficulty <= 1 else 2 * hops
+            for j in range(1, min(len(pool) - 1, n_distract)):
                 facts.append(f"The {rng.choice(rels)} of {pool[j]} is {pool[j + 1]}.")
             rng.shuffle(facts)
 
