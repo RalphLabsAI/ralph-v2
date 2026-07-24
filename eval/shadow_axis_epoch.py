@@ -110,11 +110,25 @@ def main() -> int:
     budgets = {"open": TierBudget(name="open", max_params=10 ** 12, max_effective_bits=32.0)}
     chain = FakeChain(commits)
 
+    # optional: enable the LIVE genre-overfit crown precondition on a real corpus
+    # (RALPH_OVERFIT_CORPUS=cc_news). Off by default because it scores every student on the
+    # corpus too — a real per-round cost the operator opts into.
+    overfit_check = None
+    src = os.environ.get("RALPH_OVERFIT_CORPUS")
+    if src:
+        from .corpus_hf import load_hf_timestamped, median_commit_ts
+        from .overfit_gate import make_overfit_check
+        docs = load_hf_timestamped(src, n=int(os.environ.get("RALPH_CORPUS_N", "300")))
+        cut = median_commit_ts(docs)
+        overfit_check = make_overfit_check(docs, cut, glm, base, min_n=20)
+        print(f"overfit gate LIVE on {len(docs)} {src} docs (cut={cut})")
+
     result = run_v2_axis_epoch(
         chain, 1, _tier_specs(), glm, base, tiers, budgets,
         Tournament(tiers, margin=0.03), RegistrationLedger(), {},
         make_safe_runner=lambda cd: SafeStudentRunner(cd, name=runners[cd].split("/")[-1]),
-        items_per_axis=ITEMS, signer=Ed25519Signer(seed=b"shadow-operator-key-000000000000"[:32]),
+        items_per_axis=ITEMS, overfit_check=overfit_check,
+        signer=Ed25519Signer(seed=b"shadow-operator-key-000000000000"[:32]),
     )
 
     print("\n===== SHADOW AXIS EPOCH =====")

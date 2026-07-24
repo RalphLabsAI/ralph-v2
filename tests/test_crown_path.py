@@ -500,6 +500,54 @@ def test_corpus_hf_pure_logic():
     assert len(stale) > 0 and len(fresh) > 0 and len(stale) + len(fresh) == 11
 
 
+def test_overfit_check_wired_into_crown():
+    """make_overfit_check -> axis_round precondition: a genre-overfitter with STRONG axis
+    capability is demoted from the crown because its edge collapses on fresh corpus docs,
+    while an honest reader of equal axis strength crowns. Proves the gate works IN the
+    crown path, not just standalone."""
+    from eval.corpus import synth_corpus, split_by_commit
+    from eval.overfit_gate import make_overfit_check
+
+    docs = synth_corpus(240, seed=5, commit_ts=100, span=30)
+    stale, _ = split_by_commit(docs, 100)
+    stale_ids = {d.id for d in stale}
+    glm_reader = _SimReader(lambda d: 0.95, name="glm")
+    base_reader = _SimReader(lambda d: 0.30, name="base")
+
+    # the axis models: both strong on the axes; the corpus readers differ (honest vs memorizer)
+    class Dual:
+        """One object that answers axis probes at `axis_prob` and corpus probes via `reader`."""
+        def __init__(self, name, axis_prob, reader):
+            self.name, self.axis_prob, self._r = name, axis_prob, reader
+
+        def generate(self, prompts, max_new_tokens=512):
+            if prompts and "[doc " in prompts[0]:            # corpus reading probe
+                return self._r.generate(prompts, max_new_tokens)
+            out = []                                          # axis probe (_FakeAxis style)
+            for p in prompts:
+                r = random.Random(f"{self.name}|{p}")
+                out.append("GOOD" if r.random() < self.axis_prob else "no")
+            return out
+
+    honest = Dual("honest", 0.9, _SimReader(lambda d: 0.78))
+    memo = Dual("memo", 0.9, _SimReader(lambda d: 0.95 if d in stale_ids else 0.42))
+
+    specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
+    tiers = [Tier("t", 10 ** 12, 1.0)]
+    tour, reg = Tournament(tiers, margin=0.03), {}
+    glm = _Sim("glm", {"x": 1.0, "y": 1.0})
+    base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
+    oc = make_overfit_check(docs, 100, glm_reader, base_reader, seed=1)
+
+    res = axis_round(1, 1, specs, glm, base, tiers, tour,
+                     [(Submission("m_h", "t", "honest", 1, 1.0), honest),
+                      (Submission("m_m", "t", "memo", 1, 1.0), memo)],
+                     registry=reg, items_per_axis=120, max_new_tokens=8, overfit_check=oc)
+    assert not res.scored["memo"].gates_ok, "genre-overfitter crowned via the axes"
+    assert res.scored["honest"].gates_ok
+    assert tour.kings["t"].model_id == "honest"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -507,7 +555,7 @@ def main() -> int:
              test_content_identity_and_commit_reveal, test_round_record_signature,
              test_economics_free_eval_is_per_coldkey, test_multihop_axis,
              test_validator_axis_loop_end_to_end, test_axis_chain_epoch_end_to_end,
-             test_corpus_hf_pure_logic]
+             test_corpus_hf_pure_logic, test_overfit_check_wired_into_crown]
     failed = 0
     for t in tests:
         try:

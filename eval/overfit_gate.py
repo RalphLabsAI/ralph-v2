@@ -118,3 +118,15 @@ def diff_in_diff_over_corpus(docs: list, commit_ts: int, teacher, base, student,
 
     return diff_in_diff_gate(masks(stale), masks(fresh), threshold=threshold,
                              min_n=min_n, seed=seed)
+
+
+def make_overfit_check(docs: list, commit_ts: int, teacher, base, seed: int = 0,
+                       threshold: float = 0.15, min_n: int = 30):
+    """Build the `overfit_check(submission, runner)` crown precondition for axis_round /
+    run_axis_round from a timestamped corpus + the pinned teacher/base. Each candidate
+    student is scored on the same stale/fresh reading probes and gated on the diff-in-diff.
+    teacher/base are ModelRunners (`.generate`), the same objects the axis round uses."""
+    def check(sub, runner):
+        return diff_in_diff_over_corpus(docs, commit_ts, teacher, base, runner,
+                                        seed=seed, threshold=threshold, min_n=min_n)
+    return check
