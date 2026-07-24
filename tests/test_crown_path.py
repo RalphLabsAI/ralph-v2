@@ -662,6 +662,97 @@ def test_long_context_argmax_and_id():
             assert ax.check(it, shotgun) == (first == it.answer), "shotgun bypassed the id check"
 
 
+def test_extractive_axis():
+    """The real-text extractive-QA axis (the crown-bearing measure): the gold is a verbatim
+    span present in the passage, a correct answer passes, a wrong/absent one fails."""
+    from eval.axes.extractive import ExtractiveQA
+    from eval.corpus import synth_corpus
+    docs = synth_corpus(80, seed=3, commit_ts=100, span=50)
+    ax = ExtractiveQA(docs, kinds=("number",))
+    items = ax.generate(seed=11, n=50, difficulty=1)
+    assert len(items) >= 25, f"too few probes minted: {len(items)}"
+    for it in items:
+        passage = it.prompt.split("Passage:\n", 1)[1].split("\n\n", 1)[0]
+        assert str(it.answer) in passage, "gold span not present in the passage"
+        assert ax.check(it, f"Answer: {it.answer}"), "correct answer rejected"
+        assert not ax.check(it, "Answer: 987654321"), "wrong number accepted"
+        assert not ax.check(it, "I don't know"), "no-answer accepted"
+
+
+def _extractive_gold(prompt):
+    """Recover the gold span from an extractive prompt the way a perfect reader would (the
+    answer is literally in the passage) — lets a mock model 'read' at a chosen competence."""
+    import re as _re
+    passage = prompt.split("Passage:\n", 1)[1].split("\n\n", 1)[0]
+    m = _re.search(r'appears immediately after "([^"]+)"', prompt)
+    if not m:
+        return None
+    idx = passage.find(m.group(1))
+    if idx < 0:
+        return None
+    after = passage[idx + len(m.group(1)):]
+    mm = _re.search(r"\d{2,}" if "what number" in prompt else r"[A-Z][a-z]{2,}", after)
+    return mm.group() if mm else None
+
+
+class _RoutingSim:
+    """Solves synthetic _FakeAxis prompts (emits GOOD w.p. axis_prob) and READS extractive
+    prompts (recovers the verbatim span w.p. read_prob). Builds a generator-SPECIALIST (aces
+    synthetic, reads real text at base) vs an honest broad reader."""
+    def __init__(self, name, axis_prob, read_prob, seed=0):
+        self.name, self.axis_prob, self.read_prob, self.seed = name, axis_prob, read_prob, seed
+
+    def generate(self, prompts, max_new_tokens=512):
+        out = []
+        for p in prompts:
+            r = random.Random(f"{self.seed}|{self.name}|{p}")
+            if p.startswith("[doc "):
+                gold = _extractive_gold(p)
+                out.append(f"Answer: {gold}" if (gold and r.random() < self.read_prob) else "Answer: 1")
+            else:
+                out.append("GOOD" if r.random() < self.axis_prob else "no")
+        return out
+
+
+def test_generator_specialist_denied_crown():
+    """THE necessity test — const's SN97 fix. A generator-SPECIALIST that aces every synthetic
+    FLOOR axis (as it could offline, the generators being public) but reads fresh real docs
+    only at base level does NOT win the crown, because the crown is set by the real∩verifiable
+    extractive axis, not the synthetic floor. An honest broad reader takes it. Under the OLD
+    design (all axes crown) the specialist would have out-scored and dethroned the honest king;
+    the role split is what denies it."""
+    from eval.axes.extractive import ExtractiveQA
+    from eval.corpus import split_by_commit, synth_corpus
+    docs = synth_corpus(400, seed=7, commit_ts=100, span=60)
+    _, fresh = split_by_commit(docs, 100)
+
+    specs = [
+        AxisSpec(ExtractiveQA(fresh, kinds=("number",)), "extractive", 1.0, role="crown"),
+        AxisSpec(_FakeAxis("math"), "math", 1.0, role="floor"),
+        AxisSpec(_FakeAxis("code"), "code", 1.0, role="floor"),
+        AxisSpec(_FakeAxis("instruction"), "instruction", 1.0, role="floor"),
+    ]
+    tiers = [Tier("t", 10 ** 12, 1.0)]
+    tour, reg = Tournament(tiers, margin=0.03), {}
+    glm = _RoutingSim("glm", axis_prob=1.0, read_prob=0.95)
+    base = _RoutingSim("base", axis_prob=0.30, read_prob=0.30, seed=9)
+    specialist = (Submission("m_spec", "t", "spec", 1, 1.0),
+                  _RoutingSim("spec", axis_prob=1.0, read_prob=0.30, seed=2))   # aces synthetic, reads at base
+    honest = (Submission("m_hon", "t", "honest", 1, 1.0),
+              _RoutingSim("honest", axis_prob=0.60, read_prob=0.85, seed=1))    # reads real text
+
+    res = axis_round(1, 100, specs, glm, base, tiers, tour, [specialist, honest],
+                     registry=reg, items_per_axis=150, max_new_tokens=8)
+    sp, ho = res.scored["spec"], res.scored["honest"]
+
+    floor = {a.axis: a.retention for a in sp.axes if a.axis != "extractive"}
+    assert all(v > 0.9 for v in floor.values()), f"specialist should ace floor axes: {floor}"
+    assert sp.retention < 0.25, f"specialist crown retention too high: {sp.retention}"
+    assert not sp.valid, "generator-specialist was crownable"          # necessity holds
+    assert ho.retention > 0.5, f"honest reader retention too low: {ho.retention}"
+    assert tour.kings["t"].model_id == "honest", f"crown went to {tour.kings['t'].model_id}"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -671,7 +762,8 @@ def main() -> int:
              test_validator_axis_loop_end_to_end, test_axis_chain_epoch_end_to_end,
              test_corpus_hf_pure_logic, test_overfit_check_wired_into_crown,
              test_miner_submission_roundtrip, test_code_exec_sandbox_blocks_payload,
-             test_bond_refund_keyed_by_coldkey, test_long_context_argmax_and_id]
+             test_bond_refund_keyed_by_coldkey, test_long_context_argmax_and_id,
+             test_extractive_axis, test_generator_specialist_denied_crown]
     failed = 0
     for t in tests:
         try:

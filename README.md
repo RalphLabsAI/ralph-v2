@@ -24,34 +24,36 @@ Each round:
    bits from tensor headers) → tier fit → **content-hash + commit-reveal** (you're judged on
    the exact bytes you committed to; no bait-and-switch). No untrusted weights load until all
    of this passes.
-2. **Score** — items are minted **fresh from the commit nonce** (they don't exist until
-   checkpoints lock, so there's nothing to memorize offline). GLM authors the reference,
-   then the student and the reigning king answer the same items.
+2. **Score** — the crown is decided on **real, post-commit content** (see below). GLM authors
+   the reference on the same items, then the student and the reigning king answer them.
 3. **Aggregate** — per-axis normalized retention `(student − base) / (teacher − base)` on the
    items GLM itself passes, combined **worst-domain** (soft-min). Your weakest axis is your
    score. Cap 1.25 (beating the teacher is the interesting case); negative retention on any
    axis is an automatic reject.
 4. **Crown** — KOTH dethrone-on-margin, plus a signed reproducible round record.
 
-## Scoring is capability, not imitation
+## The crown is real∩verifiable, not synthetic generators
 
-Distillation contests die when they score *imitation* (KL / distribution-match): students
-learn the teacher's **style**, win the metric, lose the capability. v2 never scores
-imitation — every axis has a **deterministic checker**, so a wrong answer fails no matter how
-GLM-like it reads:
+Every distillation-KOTH before this (SN97/Distil's own post-mortem is explicit about it) got
+gamed the same way: score on a **synthetic/procedural generator**, and a miner learns the
+*generator* — a cheap specialist that aces every "fresh" instance without retaining the
+teacher's capability. Freshness of *instances* doesn't help: the generator is public, so
+there is no held-out information. The score climbs while real capability stays flat (Goodhart;
+GSM-Symbolic / GSM1k / RULER all show the same decoupling).
 
-| axis | checker |
-|---|---|
-| math | exact numeric answer (multi-step word problems) |
-| code | **execute hidden unit tests** |
-| instruction-following | verifiable format constraints (parsers) |
-| long-context | retrieval + aggregation over a haystack |
-| multi-hop | compose several stated facts (with a shortcut distractor) |
+So the crown is set by a **deterministic checker over REAL text that is fresh after the
+commit**, the one place where CPU-auditable *and* un-pre-distillable both hold:
 
-Two of these — long-context and multi-hop — are what compression breaks *first*, so the
-worst-domain crown is set by what a compressed model **loses**, not what it keeps. **No KL in
-the reward; any KL you like in your trainer** — banning imitation as a *method* would outlaw
-the state of the art (on-policy distillation), we only refuse to *pay* for style.
+| role | axis | checker |
+|---|---|---|
+| **crown** | **extractive QA over fresh real docs** | the answer is a **verbatim span in the document** — exact-match, no judge, no KL. A doc published *after* the seal carries information the miner could not have distilled. |
+| floor | math / code / instruction / long-context / multi-hop | the synthetic generators — deterministic, but the distribution is closed. **Demoted to a liveness/calibration floor:** they gate (a broken or degenerate student is disqualified) but **cannot set the crown.** |
+
+A wrong answer fails the checker no matter how GLM-like it reads, so **style earns nothing**
+(no KL in the reward — bring any KL you like to your *trainer*). And because the crown rides
+on the fresh-real axis, a generator-specialist that aces every synthetic floor axis but reads
+fresh documents only at base level is **not crownable** — necessity, not just sufficiency, is
+tested (`tests/test_crown_path.py::test_generator_specialist_denied_crown`).
 
 ## Anti-gaming — economics, not detection
 
@@ -61,10 +63,11 @@ The last team proved you **cannot detect** copying on a shared base. v2 makes ga
 - **A copy earns nothing.** The king is re-scored on the same fresh items every round; an
   exact copy ties (zero margin, paired bootstrap-LCB on the **worst axis**) and cannot
   dethrone. Dethroning needs a *strict* worst-axis improvement past the noise floor.
-- **Genre-overfit gate (stale-vs-fresh diff-in-diff).** Distilling GLM only over the
-  announced distribution doesn't win: a student whose edge over base **collapses on
-  genuinely-new same-genre documents** is demoted regardless of its axis scores. Freshness
-  alone doesn't stop distribution-overfit; this does.
+- **Genre-overfit gate (stale-vs-fresh diff-in-diff), armed by default.** A student whose
+  edge over base **collapses on genuinely-new same-genre documents** is demoted. This gate is
+  only *sighted* when the fresh half is real text (on a synthetic generator, stale and fresh
+  are the same closed distribution, so a specialist shows no gap) — which is exactly why the
+  crown axis is real-corpus. Freshness alone doesn't stop distribution-overfit; this does.
 - **Content-addressed identity + commit-reveal.** You're bound to the exact bytes you
   committed (weights *and* config/tokenizer) — no post-commit swap.
 - **Anti-grind economics.** One free eval per **coldkey**, a per-coldkey round cap, and a
@@ -92,8 +95,13 @@ implemented, and the code does not claim them:
   redesign (seeded sampling) before it's turned on. Currently a no-op.
 - **Throughput attestation** — a non-forgeable "runs this fast on real hardware" bonus
   (reusing Ralph's TDX+H100-CC stack).
-- **Live fresh-corpus feed** — the genre-overfit gate is validated on a static timestamped
-  dataset; production draws the fresh half from a live post-commit feed.
+- **Live post-commit corpus feed + provenance** — the extractive crown axis and the
+  genre-overfit gate are built and run on a timestamped dataset (CC-News); the un-pre-
+  distillability guarantee needs the fresh half to come from a *live* post-commit feed with
+  source-provenance attestation and a grind-resistant randomness beacon for the round nonce.
+  This is the load-bearing remaining infra.
+- **Real-repo code axis** — a second crown axis: fresh commits + their real test suites (run
+  the tests = deterministic, un-pre-distillable), pinned dependency snapshot, sandboxed.
 - **Delivery** — GGUF / "run the king on your phone", GLM-4.5-Air as a second rung,
   first-committer-wins + delayed reveal, never-shrink ratchet.
 - **Chain integration** — the round is wired to a `ChainIO` boundary and tested against a
@@ -103,7 +111,7 @@ implemented, and the code does not claim them:
 
 ```bash
 pip install -r requirements.txt        # one dep for the tests: pynacl
-python -m tests.test_crown_path        # 19/19, CPU
+python -m tests.test_crown_path        # 22/22, CPU (incl. the generator-specialist denial)
 python -m eval.run_capability_axis     # real GLM + student ladder: per-axis retention, crown
 python -m eval.shadow_axis_epoch       # the full operator epoch end to end (fake chain)
 ```

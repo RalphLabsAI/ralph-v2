@@ -30,7 +30,7 @@ from .core import ModelRunner
 from .gates import degeneracy_flags
 from .koth import Scored, Submission, Tier, Tournament
 from .round_engine import RoundResult
-from .scoring import AxisScore, axis_retention, soft_min, verdict
+from .scoring import AxisScore, axis_retention, soft_min
 
 
 @dataclass
@@ -47,6 +47,14 @@ class AxisSpec:
     # items sampled, rather than being made easier. Keeping a hard axis and sampling more
     # preserves its discriminating power; dumbing it down would not.
     items: int | None = None
+    # role: "crown" axes SET the crown score + the dethrone margin; "floor" axes only gate
+    # (liveness / degeneracy / no-negative) but do NOT set the score. This is const's SN97
+    # fix: the crown is decided by real∩verifiable axes (extractive QA over fresh real docs,
+    # real-repo tests) that carry information a miner can't pre-distill, while the SYNTHETIC
+    # generators — which a specialist can ace offline without retaining GLM — are demoted to
+    # a liveness/calibration floor and can no longer buy the crown. Default "crown" keeps the
+    # legacy all-axes-count behavior for callers that don't split roles.
+    role: str = "crown"
 
 
 @dataclass
@@ -70,10 +78,12 @@ def mint_and_author(specs: list[AxisSpec], glm: ModelRunner, seed_fn,
 
 
 def _score_student(specs: list[AxisSpec], items: RoundItems, base_pass: dict,
-                   runner: ModelRunner, max_new_tokens: int
+                   runner: ModelRunner, max_new_tokens: int, crown_names: set[str]
                    ) -> tuple[float, float, list[float], dict, list[AxisScore], list[str]]:
     """Per-axis retention (conditioned on GLM-passed items) + per-axis paired vectors +
-    the raw outputs (for the degeneracy gate)."""
+    the raw outputs (for the degeneracy gate). The crown score and the dethrone vectors are
+    built from CROWN axes only; floor axes are still scored (returned in `axes` for the
+    gate/record) but do not set the score."""
     axes: list[AxisScore] = []
     per_point: list[float] = []
     per_axis: dict[str, list[float]] = {}
@@ -86,12 +96,15 @@ def _score_student(specs: list[AxisSpec], items: RoundItems, base_pass: dict,
         stud = [s.axis.check(it, o) for it, o in zip(its, outs)]
         tp, bp = items.teacher_pass[name], base_pass[name]
         axes.append(axis_retention(name, s.weight, tp, stud, bp))
-        # paired dethrone vector uses only the GLM-passed items (the retention subset),
-        # kept PER-AXIS so koth dethrones on the worst axis, not the pooled mean.
-        vec = [1.0 if stud[i] else 0.0 for i in range(len(its)) if tp[i]]
-        per_axis[name] = vec
-        per_point += vec
-    return (soft_min(axes, use_lower_bound=False), soft_min(axes, use_lower_bound=True),
+        # paired dethrone vector uses only the GLM-passed items (the retention subset), kept
+        # PER-AXIS so koth dethrones on the worst axis. CROWN axes only, so a copy of the
+        # king on the real axes ties even if it drifts on a floor axis.
+        if name in crown_names:
+            vec = [1.0 if stud[i] else 0.0 for i in range(len(its)) if tp[i]]
+            per_axis[name] = vec
+            per_point += vec
+    crown_axes = [a for a in axes if a.axis in crown_names]
+    return (soft_min(crown_axes, use_lower_bound=False), soft_min(crown_axes, use_lower_bound=True),
             per_point, per_axis, axes, all_outs)
 
 
@@ -126,6 +139,8 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
             outs = base.generate([it.prompt for it in items.by_axis[s.name]], max_new_tokens)
             base_pass[s.name] = [s.axis.check(it, o) for it, o in zip(items.by_axis[s.name], outs)]
 
+    crown_names = {s.name for s in specs if s.role == "crown"}
+
     def gate(sub: Submission, axes: list[AxisScore], outputs: list[str]) -> tuple[bool, list[str]]:
         reasons: list[str] = []
         if sub.params > tournament.tiers[sub.tier].max_params:
@@ -134,16 +149,27 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
         deg_ok, dflags = degeneracy_flags(outputs)
         if not deg_ok or dflags:
             reasons.append(f"degenerate output: {', '.join(dflags)}")
-        # require EVERY declared axis to be live (min_live_axes = len(specs)) so a student
-        # cannot drop an inconvenient domain below MIN_AXIS_N and still win worst-domain.
-        reasons += verdict(axes, passk_ok=True, min_live_axes=len(specs)).reasons
+        # negative retention on ANY axis (crown OR floor) is a genuine capability sacrifice
+        # vs the base — disqualify. A floor axis is still a real capability, so acing the
+        # real axes while regressing below base on a floor axis is not crownable.
+        neg = [a.axis for a in axes if a.negative]
+        if neg:
+            reasons.append(f"negative retention on: {', '.join(neg)}")
+        # every CROWN (real∩verifiable) axis must be LIVE — a student whose real-capability
+        # retention couldn't be measured this round (thin fresh corpus) is not crownable.
+        # Floor (synthetic) axes are always-available calibration; they don't gate liveness,
+        # so acing them cannot substitute for real signal.
+        live_crown = sum(1 for a in axes if a.axis in crown_names and a.live)
+        if live_crown < len(crown_names):
+            reasons.append(f"only {live_crown}/{len(crown_names)} crown axes live — "
+                           "cannot measure real-capability retention this round")
         return (not reasons), reasons
 
     # 3-4. score every submission
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
     for sub, runner in submissions:
-        ret, ret_lb, per_pt, per_ax, axes, outs = _score_student(specs, items, base_pass, runner, max_new_tokens)
+        ret, ret_lb, per_pt, per_ax, axes, outs = _score_student(specs, items, base_pass, runner, max_new_tokens, crown_names)
         ok, reasons = gate(sub, axes, outs)
         if overfit_check is not None and ok:   # only run the corpus gate on a crownable student
             of_ok, of_info = overfit_check(sub, runner)
@@ -167,7 +193,7 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
             continue
         king_scored = None
         if king is not None:
-            ret, ret_lb, per_pt, per_ax, _, _ = _score_student(specs, items, base_pass, registry[king.model_id], max_new_tokens)
+            ret, ret_lb, per_pt, per_ax, _, _ = _score_student(specs, items, base_pass, registry[king.model_id], max_new_tokens, crown_names)
             king_scored = Scored(sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
                                  retention=ret, retention_lb=ret_lb, per_point=per_pt,
                                  gates_ok=True, per_axis=per_ax)

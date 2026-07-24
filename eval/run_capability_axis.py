@@ -24,6 +24,7 @@ import os
 import time
 
 from eval.axes.code_exec import CodeExec
+from eval.axes.extractive import ExtractiveQA
 from eval.axes.instruction import InstructionFollowing
 from eval.axes.long_context import LongContext
 from eval.axes.math_gsm import MathGSM
@@ -58,15 +59,29 @@ def main() -> int:
     # code axis executes student-emitted code -> require a hard sandbox by default (fail
     # closed without bwrap). RALPH_CODE_SANDBOX=auto only on a trusted dev box.
     code_sandbox = os.environ.get("RALPH_CODE_SANDBOX", "require")
+    # CROWN = real∩verifiable extractive QA over fresh real docs (the pivot); the synthetic
+    # generators are demoted to a FLOOR (liveness/calibration/fragile-capability probes) and
+    # no longer set the crown. Corpus: CC-News if available, synthetic stand-in offline.
+    try:
+        from eval.corpus_hf import load_hf_timestamped, median_commit_ts
+        _docs = load_hf_timestamped(os.environ.get("RALPH_CORPUS", "cc_news"), n=400)
+        _cut = median_commit_ts(_docs)
+    except Exception as e:
+        from eval.corpus import synth_corpus
+        _docs, _cut = synth_corpus(400, seed=20260724, commit_ts=1000, span=200), 1000
+        log(f"real corpus unavailable ({e}); using synthetic stand-in")
+    from eval.corpus import split_by_commit
+    _, _fresh = split_by_commit(_docs, _cut)
     specs = [
-        AxisSpec(MathGSM(), "math", weight=1.0, difficulty=3),
+        AxisSpec(ExtractiveQA(_fresh), "extractive", weight=1.0, difficulty=1, role="crown"),
+        AxisSpec(MathGSM(), "math", weight=1.0, difficulty=3, role="floor"),
         # hard pool kept (broader cover); teacher clears it at ~31%, so sample MORE items
         # rather than dumbing it down: 0.31*160 ~ 50 teacher-passed >> MIN_AXIS_N=30.
-        AxisSpec(CodeExec(sandbox=code_sandbox), "code", weight=1.0, difficulty=2, items=160),
-        AxisSpec(InstructionFollowing(), "instruction", weight=1.0, difficulty=1),
-        AxisSpec(LongContext(base_facts=12), "long_context", weight=1.0, difficulty=1),
+        AxisSpec(CodeExec(sandbox=code_sandbox), "code", weight=1.0, difficulty=2, items=160, role="floor"),
+        AxisSpec(InstructionFollowing(), "instruction", weight=1.0, difficulty=1, role="floor"),
+        AxisSpec(LongContext(base_facts=12), "long_context", weight=1.0, difficulty=1, role="floor"),
         # second fragile axis: COMPOSITION (each hop compounds), distinct from retrieval
-        AxisSpec(MultiHop(), "multihop", weight=1.0, difficulty=1),
+        AxisSpec(MultiHop(), "multihop", weight=1.0, difficulty=1, role="floor"),
     ]
     tiers = [Tier("open", max_params=10**12, weight=1.0)]
     tour = Tournament(tiers, margin=0.03)

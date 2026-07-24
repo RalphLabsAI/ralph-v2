@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 
 from .axes.code_exec import CodeExec
+from .axes.extractive import ExtractiveQA
 from .axes.instruction import InstructionFollowing
 from .axes.long_context import LongContext
 from .axes.math_gsm import MathGSM
@@ -78,19 +79,38 @@ class FakeChain:
         pass
 
 
-def _tier_specs():
-    # code axis grades untrusted student output by executing it -> hard sandbox REQUIRED in
-    # production (fail closed if bwrap is absent). Set RALPH_CODE_SANDBOX=auto only on a
-    # trusted dev box without bubblewrap.
-    code_sandbox = os.environ.get("RALPH_CODE_SANDBOX", "require")
-    specs = [
-        AxisSpec(MathGSM(), "math", 1.0, difficulty=3),
-        AxisSpec(CodeExec(sandbox=code_sandbox), "code", 1.0, difficulty=2, items=160),
-        AxisSpec(InstructionFollowing(), "instruction", 1.0, difficulty=1),
-        AxisSpec(LongContext(base_facts=12), "long_context", 1.0, difficulty=1),
-        AxisSpec(MultiHop(), "multihop", 1.0, difficulty=1),
+def _tier_specs(fresh_docs, code_sandbox):
+    # THE PIVOT (const's SN97 fix). CROWN = real∩verifiable capability retention on fresh,
+    # post-commit real documents (extractive QA, answer is a verbatim span, exact-match, no
+    # judge) — carries information a miner cannot pre-distill. FLOOR = the synthetic
+    # generators, demoted to liveness/calibration/fragile-capability probes: they gate
+    # (degeneracy + no-negative) but do NOT set the crown, because a specialist can ace a
+    # public generator offline without retaining GLM. code axis executes untrusted output ->
+    # sandbox REQUIRED (RALPH_CODE_SANDBOX=auto only on a trusted dev box without bwrap).
+    return [
+        AxisSpec(ExtractiveQA(fresh_docs), "extractive", 1.0, difficulty=1, role="crown"),
+        AxisSpec(MathGSM(), "math", 1.0, difficulty=3, role="floor"),
+        AxisSpec(CodeExec(sandbox=code_sandbox), "code", 1.0, difficulty=2, items=160, role="floor"),
+        AxisSpec(InstructionFollowing(), "instruction", 1.0, difficulty=1, role="floor"),
+        AxisSpec(LongContext(base_facts=12), "long_context", 1.0, difficulty=1, role="floor"),
+        AxisSpec(MultiHop(), "multihop", 1.0, difficulty=1, role="floor"),
     ]
-    return specs
+
+
+def _load_corpus():
+    """Timestamped real docs (CC-News) split stale/fresh. In production the FRESH half is a
+    live post-commit feed with provenance attestation (Roadmap); here a timestamped dataset
+    stands in, with a synthetic fallback so the shadow runs offline."""
+    n = int(os.environ.get("RALPH_CORPUS_N", "400"))
+    src = os.environ.get("RALPH_CORPUS", "cc_news")
+    try:
+        from .corpus_hf import load_hf_timestamped, median_commit_ts
+        docs = load_hf_timestamped(src, n=n)
+        return docs, median_commit_ts(docs), f"{len(docs)} {src} docs"
+    except Exception as e:  # offline / datasets missing -> synthetic stand-in
+        from .corpus import synth_corpus
+        docs = synth_corpus(n, seed=20260724, commit_ts=1000, span=200)
+        return docs, 1000, f"{len(docs)} SYNTHETIC docs (real corpus unavailable: {e})"
 
 
 def main() -> int:
@@ -114,21 +134,22 @@ def main() -> int:
     budgets = {"open": TierBudget(name="open", max_params=10 ** 12, max_effective_bits=32.0)}
     chain = FakeChain(commits)
 
-    # optional: enable the LIVE genre-overfit crown precondition on a real corpus
-    # (RALPH_OVERFIT_CORPUS=cc_news). Off by default because it scores every student on the
-    # corpus too — a real per-round cost the operator opts into.
+    # real corpus: FRESH (post-commit) docs bear the crown axis; the genre-overfit gate runs
+    # stale-vs-fresh over the whole set. Both are ON by default now that they are the load-
+    # bearing anti-overfit defense (RALPH_OVERFIT_OFF=1 disables the gate only).
+    from .corpus import split_by_commit
+    docs, cut, desc = _load_corpus()
+    stale, fresh = split_by_commit(docs, cut)
+    print(f"corpus: {desc}; {len(stale)} stale / {len(fresh)} fresh (cut={cut})")
+    code_sandbox = os.environ.get("RALPH_CODE_SANDBOX", "require")
+
     overfit_check = None
-    src = os.environ.get("RALPH_OVERFIT_CORPUS")
-    if src:
-        from .corpus_hf import load_hf_timestamped, median_commit_ts
+    if not os.environ.get("RALPH_OVERFIT_OFF"):
         from .overfit_gate import make_overfit_check
-        docs = load_hf_timestamped(src, n=int(os.environ.get("RALPH_CORPUS_N", "300")))
-        cut = median_commit_ts(docs)
         overfit_check = make_overfit_check(docs, cut, glm, base, min_n=20)
-        print(f"overfit gate LIVE on {len(docs)} {src} docs (cut={cut})")
 
     result = run_v2_axis_epoch(
-        chain, 1, _tier_specs(), glm, base, tiers, budgets,
+        chain, 1, _tier_specs(fresh, code_sandbox), glm, base, tiers, budgets,
         Tournament(tiers, margin=0.03), RegistrationLedger(), {},
         make_safe_runner=lambda cd: SafeStudentRunner(cd, name=runners[cd].split("/")[-1]),
         items_per_axis=ITEMS, overfit_check=overfit_check,
