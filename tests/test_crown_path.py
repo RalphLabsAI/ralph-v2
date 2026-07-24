@@ -486,13 +486,28 @@ def test_axis_chain_epoch_end_to_end():
         assert chain.record is not None and chain.record.verify_signature()  # signed record
 
 
+def test_corpus_hf_pure_logic():
+    """Network-free coverage of the real-corpus loader's parsing/splitting (the HF fetch
+    itself is validated live, not in the offline suite): date parsing and a median cutoff
+    that splits into non-empty stale/fresh halves."""
+    from eval.corpus import Doc, split_by_commit
+    from eval.corpus_hf import _parse_ts, median_commit_ts
+    assert _parse_ts("2018-07-04T00:00:00") == _parse_ts("2018-07-04")
+    assert _parse_ts("garbage") is None and _parse_ts(1530662400) == 1530662400
+    docs = [Doc(f"d{i}", "x", 100 + i) for i in range(11)]
+    cut = median_commit_ts(docs)
+    stale, fresh = split_by_commit(docs, cut)
+    assert len(stale) > 0 and len(fresh) > 0 and len(stale) + len(fresh) == 11
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
              test_content_identity_and_commit_reveal, test_round_record_signature,
              test_economics_free_eval_is_per_coldkey, test_multihop_axis,
-             test_validator_axis_loop_end_to_end, test_axis_chain_epoch_end_to_end]
+             test_validator_axis_loop_end_to_end, test_axis_chain_epoch_end_to_end,
+             test_corpus_hf_pure_logic]
     failed = 0
     for t in tests:
         try:
