@@ -156,8 +156,19 @@ def _f_sum_range(rng):
             "ref": "return sum(x for x in nums if lo <= x <= hi)"}
 
 
-_FAMILIES = [_f_count_pred, _f_running, _f_top_k, _f_dedupe, _f_rotate, _f_clamp,
-             _f_flatten, _f_char_count, _f_string_norm, _f_sum_range]
+# Difficulty selects the FAMILY POOL, not just the inputs. Measured on the pinned teacher:
+# GLM-4-9B is a weak coder on the harder families — it emits genuine syntax errors (a stray
+# trailing paren) and wrong logic (running_max appending result[-1] on an empty list), which
+# dragged the axis to ~28-50% and BELOW MIN_AXIS_N, so the axis went non-live and the
+# all-axes-live gate blocked every crown. An axis only measures compression if the TEACHER
+# clears it; keep d1 inside the teacher's competence band and escalate for stronger pairs.
+_EASY = [_f_count_pred, _f_char_count, _f_string_norm, _f_sum_range, _f_running]
+_HARD = [_f_top_k, _f_dedupe, _f_rotate, _f_clamp, _f_flatten]
+_FAMILIES = _EASY + _HARD
+
+
+def _family_pool(difficulty: int) -> list:
+    return _EASY if difficulty <= 1 else _FAMILIES
 
 
 class CodeExec:
@@ -173,22 +184,21 @@ class CodeExec:
         rng = random.Random(seed)
         items: list[Item] = []
         for i in range(n):
-            spec = _FAMILIES[i % len(_FAMILIES)](rng)
+            pool = _family_pool(difficulty)
+            spec = pool[i % len(pool)](rng)
             args_list = spec["cases"](rng)
             expected = [spec["oracle"](*a) for a in args_list]
             tests = [{"args": list(a), "expect": e} for a, e in zip(args_list, expected)]
-            # NOTE: the instruction must NOT contain a literal ```python fence. It used to,
-            # and an unclosed fence in the PROMPT pushed the teacher into echoing that
-            # pattern: it emitted ```python + code, then opened ANOTHER ```python instead
-            # of closing, looping until the token cap. That produced systematic false
-            # failures and made the axis look far harder than it is (GLM measured ~42%
-            # while writing correct logic). Describe the format instead of showing it.
+            # MEASURED, not assumed: showing the literal ```python fence here is the better
+            # prompt. Replacing it with a described format + "close the fence, do not
+            # repeat" was tried and HURT — same tasks/seed, GLM 16/32 -> 9/32. The teacher
+            # repeats the block either way (its own generation degeneracy, not the fence),
+            # and extraction handles that fine by taking the first block; the negative
+            # constraints just degraded its code. Do not "fix" this prompt without an A/B.
             prompt = (
                 f"Implement this function in Python.\n\n"
                 f"{spec['sig']}:\n    \"\"\"{spec['doc']}\"\"\"\n\n"
-                "Reply with only the complete function definition, inside a single fenced "
-                "Python code block. Close the fence. Do not repeat the block and do not "
-                "add explanation."
+                "Return ONLY the complete function definition in a ```python code block."
             )
             items.append(Item(
                 axis=self.name, prompt=prompt,
