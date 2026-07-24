@@ -162,6 +162,50 @@ def run_v2_env_epoch(
     return _write_back(chain, tiers, tournament, outcome, round_no)
 
 
+def run_v2_axis_epoch(
+    chain: ChainIO, round_no: int,
+    specs, glm, base,
+    tiers: list[Tier], tier_budgets: dict[str, TierBudget],
+    tournament: Tournament, ledger: RegistrationLedger, registry: dict,
+    commit_window: int = 100, make_safe_runner=None,
+    teacher_id: str = "glm", base_id: str = "base",
+    items_per_axis: int = 64, max_new_tokens: int = 512,
+    overfit_check=None, signer=None,
+) -> EpochResult:
+    """One v2 epoch on the AXIS substrate — the GLM-COVER production path (verifiable-outcome
+    retention across deterministic-checker axes). Same chain I/O as run_v2_epoch; scores via
+    run_axis_round, which carries the full front door (intake + commit-reveal), the
+    genre-overfit crown precondition, and a signed record. `make_safe_runner(ckpt_dir)`
+    builds the locked-down loader, invoked only after intake gates pass."""
+    from .validator_axis_loop import CommittedSubmission as AxisCommitted, run_axis_round
+
+    if make_safe_runner is None:
+        from .runners import SafeStudentRunner
+        make_safe_runner = lambda cd: SafeStudentRunner(cd)
+
+    now = chain.current_block()
+    lo, hi = now - commit_window, now
+    commits = chain.read_commitments(lo, hi)
+    commit_root = chain.commit_root(lo, hi)
+    round_nonce = chain.block_hash(now)   # drawn AFTER the window closed -> unpredictable
+
+    committed = [
+        AxisCommitted(hotkey=c.hotkey, coldkey=c.coldkey, tier=c.tier, ckpt_dir=c.ckpt_dir,
+                      declared_compute_h100h=c.declared_compute_h100h, bond_posted=c.bond_posted,
+                      make_runner=(lambda cd=c.ckpt_dir: make_safe_runner(cd)),
+                      revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value)
+        for c in commits
+    ]
+    outcome = run_axis_round(
+        round_no, commit_root, round_nonce, committed, specs, glm, base,
+        tiers, tier_budgets, tournament, ledger, registry,
+        teacher_id=teacher_id, base_id=base_id,
+        items_per_axis=items_per_axis, max_new_tokens=max_new_tokens,
+        overfit_check=overfit_check, signer=signer,
+    )
+    return _write_back(chain, tiers, tournament, outcome, round_no)
+
+
 def _write_back(chain: ChainIO, tiers, tournament, outcome, round_no) -> EpochResult:
     """Crown per tier, set weights, publish the auditable record."""
     for tier in tiers:

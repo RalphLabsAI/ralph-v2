@@ -431,13 +431,68 @@ def test_validator_axis_loop_end_to_end():
         assert tour.kings["t"].model_id == h_ok, "crown not keyed to the content hash"
 
 
+def test_axis_chain_epoch_end_to_end():
+    """The full v2 AXIS epoch through the chain boundary against a FakeChain: read commits ->
+    draw nonce -> intake (with commit-reveal) -> axis_round -> signed record -> write back
+    weights + crown. Proves the operator-runnable path (shadow_axis_epoch) is wired, no GPU."""
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.axis_round import AxisSpec
+    from eval.chain import Commitment, run_v2_axis_epoch
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.koth import Tier, Tournament
+    from eval.shadow_axis_epoch import FakeChain
+    from eval.signing import Ed25519Signer
+
+    def make_ckpt(d, n):
+        p = Path(d)
+        header = {"w": {"dtype": "F32", "shape": [n], "data_offsets": [0, 4 * n]}}
+        hb = _json.dumps(header).encode()
+        with open(p / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hb)) + hb + b"\0" * (4 * n))
+        (p / "config.json").write_text('{"hidden_size":8}')
+        return d
+
+    with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
+        make_ckpt(da, 4)
+        make_ckpt(db, 8)
+        commits, runners = [], {}
+        for i, (d, probs) in enumerate([(da, {"x": 0.9, "y": 0.9}), (db, {"x": 0.6, "y": 0.6})]):
+            h, salt = content_hash(d), f"s{i}"
+            commits.append(Commitment(f"hot{i}", f"cold{i}", "t", d, 1.0,
+                                      revealed_hash=h, salt=salt, committed_value=commit_value(h, salt)))
+            runners[d] = _Sim(f"m{i}", probs, seed=i + 1)
+
+        specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        budgets = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
+        glm = _Sim("glm", {"x": 1.0, "y": 1.0})
+        base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
+        chain = FakeChain(commits)
+
+        result = run_v2_axis_epoch(
+            chain, 1, specs, glm, base, tiers, budgets,
+            Tournament(tiers, margin=0.03), RegistrationLedger(), {},
+            make_safe_runner=lambda cd: runners[cd], items_per_axis=120, max_new_tokens=8,
+            signer=Ed25519Signer(seed=b"k" * 32))
+
+        assert set(result.outcome.accepted) == {"hot0", "hot1"}, result.outcome.rejected
+        assert chain.weights and sum(chain.weights.values()) > 0        # weights written
+        assert "t" in chain.kings                                       # crown written
+        assert chain.record is not None and chain.record.verify_signature()  # signed record
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
              test_content_identity_and_commit_reveal, test_round_record_signature,
              test_economics_free_eval_is_per_coldkey, test_multihop_axis,
-             test_validator_axis_loop_end_to_end]
+             test_validator_axis_loop_end_to_end, test_axis_chain_epoch_end_to_end]
     failed = 0
     for t in tests:
         try:
