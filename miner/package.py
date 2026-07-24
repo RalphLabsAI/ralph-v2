@@ -54,8 +54,13 @@ def build_submission(ckpt_dir: str | Path, tier: str, teacher_pair: str,
         tier=tier, teacher_pair=teacher_pair, params=insp.params,
         effective_bits=insp.effective_bits_per_param,
         declared_compute_h100h=declared_compute_h100h, student_base=student_base)
-    chash = content_hash(ckpt_dir)
+    # Write the manifest BEFORE hashing: the content hash covers .json files, so it must be
+    # computed over the exact directory the validator will fetch (which includes the
+    # manifest). Hashing first would commit a hash that never matches at reveal -> every
+    # honest submission rejected as bait-and-switch. Writing it under the hash also binds
+    # the manifest, so a miner cannot swap the declared tier/compute after committing.
     (Path(ckpt_dir) / "manifest.json").write_text(json.dumps(asdict(manifest), indent=2))
+    chash = content_hash(ckpt_dir)
     return {
         "manifest": asdict(manifest),
         "content_hash": chash,

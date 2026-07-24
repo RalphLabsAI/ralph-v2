@@ -548,6 +548,43 @@ def test_overfit_check_wired_into_crown():
     assert tour.kings["t"].model_id == "honest"
 
 
+def test_miner_submission_roundtrip():
+    """The miner packages with build_submission; the validator's verify_reveal must accept
+    it (the committed hash covers the manifest the miner writes), and a swap after commit
+    must be rejected."""
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.identity import verify_reveal
+    from miner.package import build_submission
+
+    def make_ckpt(d, n):
+        p = Path(d)
+        header = {"w": {"dtype": "F32", "shape": [n], "data_offsets": [0, 4 * n]}}
+        hb = _json.dumps(header).encode()
+        with open(p / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hb)) + hb + b"\0" * (4 * n))
+        (p / "config.json").write_text('{"hidden_size":8}')
+
+    with tempfile.TemporaryDirectory() as d:
+        make_ckpt(d, 4)
+        sub = build_submission(d, tier="open", teacher_pair="glm-4-9b/qwen-0.5b",
+                               student_base="Qwen/Qwen2.5-0.5B", declared_compute_h100h=12.0,
+                               salt="miner-salt")
+        # validator side: fetch the dir (now includes manifest.json) and verify
+        ok, res = verify_reveal(d, sub["reveal"]["content_hash"], sub["reveal"]["salt"],
+                                sub["commit_value"])
+        assert ok, f"honest submission rejected: {res}"
+        assert (Path(d) / "manifest.json").exists()
+
+        # swap the weights after committing -> reveal must fail
+        make_ckpt(d, 8)
+        ok2, why = verify_reveal(d, sub["reveal"]["content_hash"], sub["reveal"]["salt"],
+                                 sub["commit_value"])
+        assert not ok2 and "bait-and-switch" in why, why
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -555,7 +592,8 @@ def main() -> int:
              test_content_identity_and_commit_reveal, test_round_record_signature,
              test_economics_free_eval_is_per_coldkey, test_multihop_axis,
              test_validator_axis_loop_end_to_end, test_axis_chain_epoch_end_to_end,
-             test_corpus_hf_pure_logic, test_overfit_check_wired_into_crown]
+             test_corpus_hf_pure_logic, test_overfit_check_wired_into_crown,
+             test_miner_submission_roundtrip]
     failed = 0
     for t in tests:
         try:
