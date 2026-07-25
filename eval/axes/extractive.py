@@ -87,13 +87,25 @@ class ExtractiveQA:
                     break
         return items
 
+    # An unmarked reply longer than this many WORDS is not an answer, it is a dump. Measured
+    # on real fineweb/bbc text: without this, echoing the passage back passes ~5% of items for
+    # free (the gold is sometimes simply the first number/word in the doc) — comprehension-free
+    # points. A genuine bare answer ("Therefore", "1998") is 1-3 words; any passage echo is
+    # dozens, so a WORD cap holds for short and long documents alike (a char cap does not).
+    MAX_UNMARKED_WORDS = 6
+
     def check(self, item: Item, output: str) -> bool:
         """Exact-span match against the gold the document itself pins down. First token after
         the answer marker (mirrors the other axes) so trailing chatter can't shift it."""
         if not output:
             return False
         tail = re.split(r"(?i)(?:final answer|answer)\s*[:=]", output)
-        seg = tail[1] if len(tail) > 1 else output
+        if len(tail) > 1:
+            seg = tail[1]
+        elif len(output.split()) > self.MAX_UNMARKED_WORDS:
+            return False        # unmarked dump / passage echo — not an answer
+        else:
+            seg = output
         gold = str(item.answer)
         if item.meta.get("kind") == "number":
             m = re.search(r"-?\d[\d,]*", seg)

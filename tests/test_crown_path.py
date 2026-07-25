@@ -675,8 +675,14 @@ def test_extractive_axis():
         passage = it.prompt.split("Passage:\n", 1)[1].split("\n\n", 1)[0]
         assert str(it.answer) in passage, "gold span not present in the passage"
         assert ax.check(it, f"Answer: {it.answer}"), "correct answer rejected"
+        assert ax.check(it, str(it.answer)), "bare correct answer rejected"
+        # a model that reasons at length then answers must still pass
+        assert ax.check(it, "thinking " * 80 + f"\nAnswer: {it.answer}"), "verbose+marked rejected"
         assert not ax.check(it, "Answer: 987654321"), "wrong number accepted"
         assert not ax.check(it, "I don't know"), "no-answer accepted"
+        # ECHO ATTACK (measured on real fineweb/bbc text: this passed ~5% of items before the
+        # unmarked-length cap): dumping the passage back must never score.
+        assert not ax.check(it, passage), "passage echo accepted"
 
 
 def _extractive_gold(prompt):
@@ -753,6 +759,66 @@ def test_generator_specialist_denied_crown():
     assert tour.kings["t"].model_id == "honest", f"crown went to {tour.kings['t'].model_id}"
 
 
+def test_corpus_stream_selection():
+    """Scale is the anti-overfit defense, so the SELECTION logic must be (a) deterministic —
+    an auditor re-derives the identical slice from the seed — and (b) seed-dispersed — a
+    different round lands on a different snapshot/shard, so the slice is unknowable before the
+    post-commit seed exists. Network-free: the HF stream is stubbed, the logic under test is
+    ours. (The live pull is validated separately against real HF.)"""
+    import sys
+    import types
+    from eval import corpus_stream as cs
+
+    seen_configs = []
+
+    class _FakeIterable:
+        def __init__(self, name, cfg):
+            self.name, self.cfg, self._seed = name, cfg, 0
+
+        def shuffle(self, seed=0, buffer_size=0):
+            self._seed = seed
+            return self
+
+        def __iter__(self):
+            # deterministic pseudo-rows whose content depends on config + shuffle seed,
+            # standing in for "which shard/offset the stream lands on"
+            r = random.Random(f"{self.name}|{self.cfg}|{self._seed}")
+            for _ in range(200):
+                yield {"text": f"doc {r.random()} " + "filler words here. " * 30,
+                       "content": f"doc {r.random()} " + "filler words here. " * 30,
+                       "date": "2024-05-14T00:00:00Z", "published_date": "2024-05-14"}
+
+    def _fake_load_dataset(dataset, name=None, split=None, streaming=False):
+        seen_configs.append(name)
+        return _FakeIterable(dataset, name)
+
+    fake = types.ModuleType("datasets")
+    fake.load_dataset = _fake_load_dataset
+    real = sys.modules.get("datasets")
+    sys.modules["datasets"] = fake
+    try:
+        a = cs.load_stream_slice("nonce-A", n=20)
+        a2 = cs.load_stream_slice("nonce-A", n=20)
+        b = cs.load_stream_slice("nonce-B", n=20)
+    finally:
+        if real is not None:
+            sys.modules["datasets"] = real
+        else:
+            del sys.modules["datasets"]
+
+    assert len(a) == 20, f"short slice: {len(a)}"
+    # (a) determinism -> the auditor can reproduce the round
+    assert cs.corpus_fingerprint(a) == cs.corpus_fingerprint(a2), "same seed gave a different slice"
+    # (b) dispersion -> a new round draws different content
+    assert cs.corpus_fingerprint(a) != cs.corpus_fingerprint(b), "different seeds gave the same slice"
+    # the seed must also move WHICH shard/snapshot is read, not just the order
+    assert len(set(seen_configs)) > 1, f"seed never changed the config: {set(seen_configs)}"
+    # the mix must actually be multi-source (dilutes any single planted document)
+    assert len({d.id.split(":")[0] for d in a}) > 1, "slice came from a single source"
+    # the pool we claim must be genuinely large — this number IS the defense
+    assert cs.pool_size() > 10 ** 9, f"pool too small to deter enumeration: {cs.pool_size()}"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -763,7 +829,8 @@ def main() -> int:
              test_corpus_hf_pure_logic, test_overfit_check_wired_into_crown,
              test_miner_submission_roundtrip, test_code_exec_sandbox_blocks_payload,
              test_bond_refund_keyed_by_coldkey, test_long_context_argmax_and_id,
-             test_extractive_axis, test_generator_specialist_denied_crown]
+             test_extractive_axis, test_generator_specialist_denied_crown,
+             test_corpus_stream_selection]
     failed = 0
     for t in tests:
         try:

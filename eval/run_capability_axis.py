@@ -63,9 +63,13 @@ def main() -> int:
     # generators are demoted to a FLOOR (liveness/calibration/fragile-capability probes) and
     # no longer set the crown. Corpus: CC-News if available, synthetic stand-in offline.
     try:
-        from eval.corpus_hf import load_hf_timestamped, median_commit_ts
-        _docs = load_hf_timestamped(os.environ.get("RALPH_CORPUS", "cc_news"), n=400)
+        from eval.corpus_hf import median_commit_ts
+        from eval.corpus_stream import corpus_fingerprint, load_stream_slice, pool_size
+        _docs = load_stream_slice(os.environ.get("RALPH_CORPUS_SEED", "cap-run"), n=400,
+                                  strict=True)
         _cut = median_commit_ts(_docs)
+        log(f"corpus: {len(_docs)} real docs from a {pool_size():,}-row pool "
+            f"(fingerprint {corpus_fingerprint(_docs)[:12]})")
     except Exception as e:
         from eval.corpus import synth_corpus
         _docs, _cut = synth_corpus(400, seed=20260724, commit_ts=1000, span=200), 1000

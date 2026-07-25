@@ -97,16 +97,24 @@ def _tier_specs(fresh_docs, code_sandbox):
     ]
 
 
-def _load_corpus():
-    """Timestamped real docs (CC-News) split stale/fresh. In production the FRESH half is a
-    live post-commit feed with provenance attestation (Roadmap); here a timestamped dataset
-    stands in, with a synthetic fallback so the shadow runs offline."""
+def _load_corpus(seed):
+    """Real docs drawn from the LARGE multi-source pool, seeded by the round nonce.
+
+    Scale is the anti-overfit defense: 400 docs out of ~2.8e9 reachable rows is a ~1e-7
+    sampling rate, and the seed picks the crawl snapshot + shard order, so the slice is
+    unknowable before the (post-commit) seed exists. Same seed -> same docs, so an auditor
+    re-derives it; corpus_fingerprint goes in the round record to prove which slice ran.
+    Falls back to synthetic ONLY so the shadow runs offline — never in production."""
     n = int(os.environ.get("RALPH_CORPUS_N", "400"))
-    src = os.environ.get("RALPH_CORPUS", "cc_news")
     try:
-        from .corpus_hf import load_hf_timestamped, median_commit_ts
-        docs = load_hf_timestamped(src, n=n)
-        return docs, median_commit_ts(docs), f"{len(docs)} {src} docs"
+        from .corpus_stream import corpus_fingerprint, load_stream_slice, pool_size
+        docs = load_stream_slice(seed, n=n, strict=True)
+        if not docs:
+            raise RuntimeError("empty corpus slice")
+        from .corpus_hf import median_commit_ts
+        return (docs, median_commit_ts(docs),
+                f"{len(docs)} real docs from a {pool_size():,}-row pool "
+                f"(fingerprint {corpus_fingerprint(docs)[:12]})")
     except Exception as e:  # offline / datasets missing -> synthetic stand-in
         from .corpus import synth_corpus
         docs = synth_corpus(n, seed=20260724, commit_ts=1000, span=200)
@@ -138,7 +146,9 @@ def main() -> int:
     # stale-vs-fresh over the whole set. Both are ON by default now that they are the load-
     # bearing anti-overfit defense (RALPH_OVERFIT_OFF=1 disables the gate only).
     from .corpus import split_by_commit
-    docs, cut, desc = _load_corpus()
+    # the corpus slice is seeded by the round nonce: in production this is post-commit chain
+    # entropy, so which documents get scored cannot be known when the miner seals its weights.
+    docs, cut, desc = _load_corpus(f"{chain.commit_root(0, 0)}|{chain.block_hash(chain.current_block())}")
     stale, fresh = split_by_commit(docs, cut)
     print(f"corpus: {desc}; {len(stale)} stale / {len(fresh)} fresh (cut={cut})")
     code_sandbox = os.environ.get("RALPH_CODE_SANDBOX", "require")
