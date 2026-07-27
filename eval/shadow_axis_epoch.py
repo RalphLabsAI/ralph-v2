@@ -123,6 +123,37 @@ def _tier_specs(fresh_docs, code_sandbox, ml_docs=()):
     ]
 
 
+def _tier_ladder():
+    """Size/bit rungs the crown is contested on, and the emission split across them.
+
+    Two axes of pressure, deliberately: PARAMS (how big a model) and BITS (how tightly stored).
+    Bonsai's own product line is exactly two operating points on the bit axis — 1.125 for phone
+    footprint, 1.71 for laptop quality — which exists because a single scalar cannot express the
+    tradeoff. `bit_tier` is what makes intake measure the tensor DATA rather than dtype headers,
+    so a 1.125-bit model in a BF16 container is credited for its compression and still rejected
+    as unshippable.
+
+    RALPH_TIER selects a single rung for a cheap shadow run."""
+    from .bitrate import BitTier
+    rungs = [
+        # name        params      weight  code bpw   container cap
+        ("ternary-4b", 4_500_000_000, 0.40, 1.75, 2.6),
+        ("binary-4b", 4_500_000_000, 0.35, 1.15, 2.0),
+        ("sub4-4b", 4_500_000_000, 0.25, 4.25, 5.0),
+    ]
+    only = os.environ.get("RALPH_TIER")
+    if only:
+        rungs = [r for r in rungs if r[0] == only] or rungs[:1]
+    total = sum(r[2] for r in rungs)
+    tiers = [Tier(n, p, w / total) for n, p, w, _, _ in rungs]
+    budgets = {
+        n: TierBudget(name=n, max_params=p, max_effective_bits=16.0,
+                      bit_tier=BitTier(n, max_code_bits=cb, max_container_bits=cc))
+        for n, p, _, cb, cc in rungs
+    }
+    return tiers, budgets
+
+
 def _load_corpus(seed):
     """Real docs drawn from the LARGE multi-source pool, seeded by the round nonce.
 
@@ -160,6 +191,10 @@ def _load_corpus(seed):
 def main() -> int:
     from .runners import HFRunner, SafeStudentRunner
 
+    tiers, budgets = _tier_ladder()
+    TIER_NAME = tiers[0].name        # shadow submits into the first rung
+
+
     # miners commit real checkpoints; here they are off-the-shelf HF ids resolved to a local
     # dir with a proper commit-reveal so the epoch's fetch-verify runs for real.
     from huggingface_hub import snapshot_download
@@ -167,15 +202,19 @@ def main() -> int:
     for i, mid in enumerate(STUDENTS):
         d = snapshot_download(mid, allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model"])
         h, salt = content_hash(d), f"salt{i}"
-        commits.append(Commitment(hotkey=f"hot{i}", coldkey=f"cold{i}", tier="open",
+        commits.append(Commitment(hotkey=f"hot{i}", coldkey=f"cold{i}", tier=TIER_NAME,
                                    ckpt_dir=d, declared_compute_h100h=1.0,
                                    revealed_hash=h, salt=salt, committed_value=commit_value(h, salt)))
         runners[d] = mid
 
     glm = HFRunner(TEACHER, name="glm", trust_remote_code=True, batch_size=16)
     base = HFRunner(BASE, name="base", batch_size=16)
-    tiers = [Tier("open", 10 ** 12, 1.0)]
-    budgets = {"open": TierBudget(name="open", max_params=10 ** 12, max_effective_bits=32.0)}
+    # (ladder built above)
+    # A REAL LADDER. The placeholder was Tier("open", 10**12) + max_effective_bits=32.0 — a cap
+    # ABOVE fp16, i.e. no budget at all, which pointed the incentive away from the product: an
+    # uncompressed model beat a 1.125-bit one on every axis and paid nothing for its size.
+    # Emission is split across rungs so there is somewhere to win by compressing harder rather
+    # than only by being bigger. Bit budgets are the two operating points PrismML ship.
     chain = FakeChain(commits)
 
     # real corpus: FRESH (post-commit) docs bear the crown axis; the genre-overfit gate runs

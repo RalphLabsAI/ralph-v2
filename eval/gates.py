@@ -143,6 +143,9 @@ class TierBudget:
     name: str
     max_params: int
     max_effective_bits: float = 16.0   # e.g. 4.5 for a 4-bit tier, 2.0 for a 2-bit tier
+    # Optional bitrate.BitTier. When set, intake ALSO measures true bits/weight from the tensor
+    # data, because header dtypes cannot see a 1.125-bit model inside a BF16 container.
+    bit_tier: object = None
 
 
 def tier_gate(insp: Inspection, tier: TierBudget) -> tuple[bool, list[str]]:

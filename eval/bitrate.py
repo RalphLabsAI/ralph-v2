@@ -62,30 +62,43 @@ class BitReport:
 
 def tensor_code_bits(values, group_size: int = 128, scale_bits: int = 16,
                      tol: float = CODE_TOL, max_codebook: int = 4096) -> tuple[float, int]:
-    """(bits_per_weight, codebook_size) for one flat weight tensor.
+    """(bits_per_weight, mean_levels_per_group) for one flat weight tensor.
 
-    Per group, normalize by max-abs to recover the code, then count DISTINCT codes globally.
-    Returns bits = log2(k) + scale_bits/group_size, where k is the codebook size. Bails out to
-    (inf, max_codebook) once the codebook is clearly dense — that tensor is not quantized and
-    the caller falls back to the container width."""
+    Counts DISTINCT LEVELS WITHIN EACH GROUP, not a global codebook. That distinction is
+    load-bearing: a global codebook normalized by group max-abs only works for SYMMETRIC
+    quantization (one scale per group). Every mainstream 4-bit scheme — GPTQ, AWQ, NF4,
+    bitsandbytes — is AFFINE, carrying a per-group zero-point as well, so the normalized codes
+    differ from group to group and the global set explodes. Measured: affine int4 read 9.06 bpw
+    with a codebook of 490 instead of ~4.25, i.e. an honest 4-bit artifact would have been
+    rejected from the 4-bit tier. Per-group counting is invariant to ANY per-group affine
+    transform, so symmetric and affine schemes both measure correctly.
+
+    Scale overhead is inferred per group: a level set spanning zero symmetrically implies one
+    scale; an asymmetric one implies scale + zero-point (two). Dense tensors saturate at
+    group_size levels and the caller falls back to the container width."""
     n = len(values)
     if n == 0:
         return 0.0, 0
-    codes: set[int] = set()
     inv_tol = 1.0 / tol
+    tot_bits, tot_w, tot_levels, n_groups = 0.0, 0, 0, 0
     for start in range(0, n, group_size):
         g = values[start:start + group_size]
+        w = len(g)
         s = max((abs(v) for v in g), default=0.0)
         if s <= 0.0:
-            codes.add(0)                       # an all-zero group carries one code
-            continue
-        inv_s = 1.0 / s
-        for v in g:
-            codes.add(int(round(v * inv_s * inv_tol)))
-            if len(codes) > max_codebook:
-                return float("inf"), max_codebook
-    k = max(1, len(codes))
-    return math.log2(k) + scale_bits / group_size, k
+            levels, sym = {0}, True             # an all-zero group carries one level
+        else:
+            inv_s = 1.0 / s
+            levels = {int(round(v * inv_s * inv_tol)) for v in g}
+            lo, hi = min(levels), max(levels)
+            sym = abs(lo + hi) <= max(1, int(0.05 * inv_tol))   # spans zero symmetrically
+        k = max(1, len(levels))
+        n_scales = 1 if sym else 2              # symmetric: scale. affine: scale + zero-point.
+        tot_bits += (math.log2(k) + n_scales * scale_bits / group_size) * w
+        tot_w += w
+        tot_levels += k
+        n_groups += 1
+    return tot_bits / tot_w, (tot_levels // max(1, n_groups))
 
 
 def measure_state_dict(tensors: dict, group_size: int = 128, scale_bits: int = 16,
@@ -117,6 +130,109 @@ def measure_state_dict(tensors: dict, group_size: int = 128, scale_bits: int = 1
         rep.code_bits = round(total_code / total_n, 4)
         rep.container_bits = round(total_container / total_n, 4)
         rep.codebook = all_codes
+    return rep
+
+
+# ---- the producer: read real checkpoint bytes -------------------------------------------
+# Without this, everything above is library code with no input. Pure struct/mmap, no torch and
+# no safetensors dependency, mirroring gates._read_safetensors_header — the validator must be
+# able to measure an artifact on a CPU box with nothing installed.
+
+_FLOAT_DTYPES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2}
+# name fragments for tensors that are NOT weights: the "negligible tail" every scheme keeps in
+# higher precision. Counted in the container total, never allowed to define the code width.
+_NON_WEIGHT = ("norm", "bias", "scale", "zero_point", "zeros", "g_idx", "embed_positions")
+
+
+def _decode(buf: bytes, dt: str) -> list[float]:
+    import struct
+    if dt == "F32":
+        return list(struct.unpack(f"<{len(buf)//4}f", buf[:len(buf)//4*4]))
+    if dt == "F64":
+        return list(struct.unpack(f"<{len(buf)//8}d", buf[:len(buf)//8*8]))
+    if dt == "F16":
+        return list(struct.unpack(f"<{len(buf)//2}e", buf[:len(buf)//2*2]))
+    if dt == "BF16":
+        n = len(buf) // 2
+        hi = struct.unpack(f"<{n}H", buf[:n * 2])
+        # bf16 is the top 16 bits of an f32
+        return list(struct.unpack(f"<{n}f", struct.pack(f"<{n}I", *(h << 16 for h in hi))))
+    return []
+
+
+def measure_checkpoint(ckpt_dir, group_size: int = 128, max_groups_per_tensor: int = 64,
+                       max_tensors: int = 256) -> BitReport:
+    """Measure a real checkpoint directory. Deterministic and bounded.
+
+    Sampling is by whole GROUPS at evenly spaced offsets — never random elements, because level
+    counting needs intact groups, and never the whole file, because a 27B artifact is 54 GB.
+    Even spacing keeps it reproducible: an auditor measuring the same bytes gets the same
+    number, which is the property that lets a bit budget be part of a published verdict.
+
+    Integer dtypes are ALREADY-PACKED codes whose meaning depends on a quantization scheme we
+    would have to trust the miner's config to interpret. For those the shipped container IS the
+    achievement, so they contribute their container width and are not level-counted."""
+    import json
+    import struct
+    from pathlib import Path
+
+    rep = BitReport(group_size=group_size)
+    files = sorted(Path(ckpt_dir).glob("*.safetensors"))
+    tot_code, tot_container, tot_n, max_levels = 0.0, 0.0, 0, 0
+    seen = 0
+    for f in files:
+        with open(f, "rb") as fh:
+            (hlen,) = struct.unpack("<Q", fh.read(8))
+            hdr = json.loads(fh.read(hlen))
+            base = 8 + hlen
+            for name, meta in sorted(hdr.items()):
+                if name == "__metadata__" or not isinstance(meta, dict) or seen >= max_tensors:
+                    continue
+                dt, shape = meta.get("dtype", "?"), meta.get("shape", [])
+                if len(shape) < 2:
+                    continue                              # 1-D: norms/biases, not weights
+                if any(t in name.lower() for t in _NON_WEIGHT):
+                    continue
+                n = 1
+                for s in shape:
+                    n *= s
+                if n < group_size:
+                    continue
+                off = meta.get("data_offsets", [0, 0])
+                cbits = (off[1] - off[0]) * 8.0 / n if n else 0.0
+                if dt in _FLOAT_DTYPES:
+                    w = _FLOAT_DTYPES[dt]
+                    n_groups = min(max_groups_per_tensor, n // group_size)
+                    stride = max(1, (n // group_size) // max(1, n_groups))
+                    vals: list[float] = []
+                    for gi in range(n_groups):
+                        start = base + off[0] + gi * stride * group_size * w
+                        fh.seek(start)
+                        vals += _decode(fh.read(group_size * w), dt)
+                    bits, levels = tensor_code_bits(vals, group_size) if vals else (cbits, 0)
+                    # SATURATED = not quantized. Level counting can only observe group_size
+                    # distinct values, so a dense fp16 tensor bottoms out at log2(128)=7 and
+                    # would otherwise claim to be a 7-bit achievement. If the groups are
+                    # essentially all-distinct, the container IS the truth.
+                    if levels >= 0.9 * group_size:
+                        bits = cbits
+                    bits = min(bits, cbits)               # never claim less than you ship
+                    max_levels = max(max_levels, levels)
+                else:
+                    bits = cbits                          # packed codes: container is the truth
+                rep.per_tensor[name] = {"n": n, "dtype": dt, "code_bits": round(bits, 4),
+                                        "container_bits": round(cbits, 4)}
+                tot_code += bits * n
+                tot_container += cbits * n
+                tot_n += n
+                seen += 1
+    if tot_n:
+        rep.params = tot_n
+        rep.code_bits = round(tot_code / tot_n, 4)
+        rep.container_bits = round(tot_container / tot_n, 4)
+        rep.codebook = max_levels
+    else:
+        rep.notes.append("no weight tensors measured")
     return rep
 
 

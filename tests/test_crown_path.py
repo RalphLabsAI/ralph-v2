@@ -846,9 +846,25 @@ def test_bitrate_matches_published_formats():
     assert abs(t - 1.70996) < 1e-4, f"ternary bpw {t} != 1.70996 (PrismML Q2_0)"
     assert (kb, kt) == (2, 3), f"codebook sizes wrong: {kb}, {kt}"
 
-    # dense weights must NOT read as cheap — they fall back to the container width
-    dense, _ = tensor_code_bits([r.gauss(0, 0.02) for _ in range(N)])
-    assert dense > 8.0 or math.isinf(dense), f"fp16-ish weights read as {dense} bpw"
+    # AFFINE int4 (GPTQ / AWQ / NF4 / bitsandbytes — every mainstream 4-bit scheme carries a
+    # per-group zero-point). A global codebook normalized by group max-abs EXPLODES here: it
+    # measured 9.06 bpw with a codebook of 490, so an honest 4-bit artifact was rejected from
+    # the 4-bit tier. Per-group level counting is invariant to any per-group affine transform.
+    aff = []
+    for _ in range(N // 128):
+        s, z = r.uniform(0.01, 0.3), r.uniform(-0.5, 0.5)
+        aff += [s * (r.randint(0, 15) / 15) - z for _ in range(128)]
+    ab, ak = tensor_code_bits(aff)
+    assert 4.0 <= ab <= 4.6, f"affine int4 reads {ab} bpw — honest 4-bit would be rejected"
+    assert ak == 16, f"affine int4 levels {ak} != 16"
+    sym_b, _ = tensor_code_bits(grouped([-8, -4, -1, 0, 1, 4, 7]))
+    assert sym_b < 4.0, sym_b
+
+    # dense weights SATURATE: level counting can only observe group_size distinct values, so a
+    # dense tensor bottoms out near log2(128)=7. That is the signal the caller uses to fall back
+    # to the container width — it must never be mistaken for a real 7-bit achievement.
+    dense, dk = tensor_code_bits([r.gauss(0, 0.02) for _ in range(N)])
+    assert dk >= 0.9 * 128, f"dense tensor did not saturate: {dk} levels"
 
     # the `-unpacked` trap: 1-bit information, 16-bit container
     rep = measure_state_dict({"lm_head.w": (grouped([-1, 1]), 16),
@@ -864,6 +880,48 @@ def test_bitrate_matches_published_formats():
     ok2, why2 = bit_tier_gate(rep2, TIERS[0])
     assert ok2, f"honest binary artifact rejected: {why2}"
     assert rep2.compression_x > 14.0, rep2.compression_x
+
+    # THE PRODUCER, on real bytes. Until this existed the whole module was library code with no
+    # input: nothing in the repo read safetensors tensor DATA, so no bit budget could bind.
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.bitrate import measure_checkpoint
+
+    def write_st(d, name_to_vals, dtype="BF16"):
+        hdr, blobs, off = {}, [], 0
+        for nm, vals in name_to_vals.items():
+            b = b"".join(struct.pack("<H", struct.unpack("<I", struct.pack("<f", v))[0] >> 16)
+                         for v in vals)
+            hdr[nm] = {"dtype": dtype, "shape": [len(vals) // 128, 128],
+                       "data_offsets": [off, off + len(b)]}
+            blobs.append(b)
+            off += len(b)
+        hb = _json.dumps(hdr).encode()
+        with open(Path(d) / "model.safetensors", "wb") as fh:
+            fh.write(struct.pack("<Q", len(hb)))
+            fh.write(hb)
+            for b in blobs:
+                fh.write(b)
+
+    tern = grouped([-1, 0, 1])
+    with tempfile.TemporaryDirectory() as d:
+        # the `-unpacked` shape, read from actual file bytes rather than a python list
+        write_st(d, {"model.layers.0.mlp.weight": tern, "lm_head.weight": tern,
+                     "model.norm.weight": [r.gauss(0, .02) for _ in range(128)]})
+        rp = measure_checkpoint(d)
+        assert abs(rp.code_bits - 1.71) < 0.01, f"ternary file read as {rp.code_bits}"
+        assert rp.container_bits == 16.0, rp.container_bits
+        assert "model.norm.weight" not in rp.per_tensor, "norm counted as a weight tensor"
+        ok3, why3 = bit_tier_gate(rp, TIERS[1])
+        assert not ok3 and any("container" in w for w in why3), why3
+
+    with tempfile.TemporaryDirectory() as d:
+        write_st(d, {"model.layers.0.mlp.weight": [r.gauss(0, .02) for _ in range(N)]})
+        rp2 = measure_checkpoint(d)
+        # saturation must resolve to the CONTAINER, not to a fake ~7-bit achievement
+        assert rp2.code_bits == 16.0, f"dense checkpoint claimed {rp2.code_bits} bpw"
 
 
 def test_multi_constraint_compounds():

@@ -27,6 +27,8 @@ class IntakeDecision:
     # scored artifact to the committed one (bait-and-switch) and makes koth's copy-guard
     # content-based rather than hotkey-based.
     content_hash: str = ""
+    # measured bit budget (bitrate.BitReport) when the tier declares one. None = not measured.
+    bits: object = None
 
 
 def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | None = None,
@@ -55,6 +57,25 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
     if not ok:
         return IntakeDecision(False, insp, reasons=tier_reasons)
 
+    # 3b. BIT BUDGET, measured from the actual tensor data. `tier_gate` above works off dtype
+    #     HEADERS, which is the right check for "is a bigger model being smuggled in" and the
+    #     wrong one for "how compressed is this": a genuinely 1.125-bit model stored in a BF16
+    #     container (PrismML ship exactly that as `-unpacked`) reads as 16.0 from headers. For a
+    #     subnet whose product is "a runnable checkpoint at a stated bit budget", the budget has
+    #     to bind on the bytes, so this is where it binds.
+    if getattr(tier, "bit_tier", None) is not None:
+        from .bitrate import bit_tier_gate, measure_checkpoint
+        try:
+            rep = measure_checkpoint(ckpt_dir)
+        except Exception as e:
+            return IntakeDecision(False, insp, reasons=[f"bit measurement failed: {e}"])
+        bok, breasons = bit_tier_gate(rep, tier.bit_tier)
+        if not bok:
+            return IntakeDecision(False, insp, reasons=breasons, bits=rep)
+        bits_report = rep
+    else:
+        bits_report = None
+
     # 4. identity: content-hash the artifact, and fetch-verify it against the commitment
     #    when one was supplied. Done before any runner is built (no untrusted load yet).
     from .identity import content_hash, verify_reveal
@@ -72,4 +93,4 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
     # accepted — record the submission (degeneracy + pass@k gates run later, on outputs)
     if ledger is not None:
         ledger.record(hotkey, coldkey, bond_posted)
-    return IntakeDecision(True, insp, reasons=[], content_hash=chash)
+    return IntakeDecision(True, insp, reasons=[], content_hash=chash, bits=bits_report)
