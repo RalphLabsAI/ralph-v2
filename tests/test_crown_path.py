@@ -992,6 +992,64 @@ def test_saturation_guard_retires_flat_axes():
     assert disc.retention > 0.5, disc.retention
 
 
+def test_corpus_swap_invariance():
+    """Calibration-overfit detection: a miner picks its own recovery corpus, and the literature
+    says that is where the cheating lives (QDrop: the variant with the LOWEST calibration score
+    had the HIGHEST test score; Williams & Aletras: same setup, different 128-sequence draw ->
+    BoolQ 57.0% -> 71.6%). We test the behavioral analog — score on probe sets from DIFFERENT
+    sources and look at the shape.
+
+    Three cases, and the third is the one that makes it sound rather than merely sensitive:
+      overfitter    strong on its own genre, weak elsewhere      -> FLAGGED
+      honest        flat and strong                              -> passes
+      uniformly weak  flat and LOW                               -> must NOT be flagged
+    """
+    from eval.corpus import synth_corpus
+    from eval.invariance import corpus_swap_invariance, invariance_over_sources
+
+    # two genuinely different sources
+    src_a = synth_corpus(90, seed=11, commit_ts=100, span=5)
+    src_b = synth_corpus(90, seed=77, commit_ts=100, span=5)
+    a_ids = {d.id for d in src_a}
+    sources = {"alpha": src_a, "beta": src_b}
+
+    teacher = _SimReader(lambda d: 0.95, name="teacher")
+    base = _SimReader(lambda d: 0.30, name="base")
+
+    overfit = _SimReader(lambda d: 0.93 if d in a_ids else 0.34, name="overfit")
+    honest = _SimReader(lambda d: 0.80, name="honest")
+    weak = _SimReader(lambda d: 0.33, name="weak")
+
+    ro = invariance_over_sources(sources, teacher, base, overfit, seed=3)
+    rh = invariance_over_sources(sources, teacher, base, honest, seed=3)
+    rw = invariance_over_sources(sources, teacher, base, weak, seed=3)
+
+    assert ro.n_live == 2 and rh.n_live == 2, (ro.as_dict(), rh.as_dict())
+    assert ro.verdict == "calibration-overfit", f"overfitter not caught: {ro.as_dict()}"
+    assert rh.verdict == "ok", f"honest model flagged: {rh.as_dict()}"
+    assert rw.verdict == "ok", f"uniformly-weak model flagged as cheating: {rw.as_dict()}"
+
+    # the SCORE is the worst source, so overfitting one genre cannot buy a high score
+    assert ro.worst_retention < 0.3, ro.as_dict()
+    assert rh.worst_retention > 0.5, rh.as_dict()
+    # ...and the weak model scores low on the level while passing the gate — the two jobs are
+    # genuinely separate (spread gates, level scores)
+    assert rw.worst_retention < 0.2, rw.as_dict()
+
+    # a real spread must survive its own noise floor: identical masks -> zero dispersion
+    flat = {"a": {"teacher_pass": [True] * 60, "student_pass": [i % 2 == 0 for i in range(60)],
+                  "base_pass": [i % 5 == 0 for i in range(60)]}}
+    flat["b"] = dict(flat["a"])
+    rep = corpus_swap_invariance(flat, seed=1)
+    assert rep.dispersion == 0.0 and rep.verdict == "ok", rep.as_dict()
+
+    # fewer than two live sources -> inconclusive, and the crown check fails CLOSED
+    from eval.invariance import make_invariance_check
+    chk = make_invariance_check({"only": src_a}, teacher, base, seed=3)
+    ok, info = chk(None, honest)
+    assert not ok and "failclosed" in info["verdict"], info
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1005,6 +1063,7 @@ def main() -> int:
              test_extractive_axis, test_generator_specialist_denied_crown,
              test_corpus_stream_selection, test_bitrate_matches_published_formats,
              test_multi_constraint_compounds, test_score_at_budget_and_convergence_gate,
+             test_corpus_swap_invariance,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

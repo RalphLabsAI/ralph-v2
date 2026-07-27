@@ -57,6 +57,28 @@ class AxisSpec:
     role: str = "crown"
 
 
+def compose_preconditions(*checks):
+    """Chain `(sub, runner) -> (ok, info)` crown preconditions. ALL must pass; the first
+    failure short-circuits (each check costs real GPU time) and its info is returned tagged
+    with which gate fired, so a demotion is always attributable to a named defense."""
+    live = [c for c in checks if c is not None]
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0]
+
+    def check(sub, runner):
+        merged = {}
+        for i, c in enumerate(live):
+            ok, info = c(sub, runner)
+            name = getattr(c, "gate_name", f"gate{i}")
+            merged[name] = info
+            if not ok:
+                return False, {"failed": name, **merged}
+        return True, merged
+    return check
+
+
 @dataclass
 class RoundItems:
     """Items minted for one round + GLM's pass mask per axis (authored once, amortized)."""

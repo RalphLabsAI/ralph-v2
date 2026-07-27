@@ -161,8 +161,29 @@ def main() -> int:
 
     overfit_check = None
     if not os.environ.get("RALPH_OVERFIT_OFF"):
+        from .axis_round import compose_preconditions
+        from .invariance import make_invariance_check
         from .overfit_gate import make_overfit_check
-        overfit_check = make_overfit_check(docs, cut, glm, base, min_n=20)
+
+        dind = make_overfit_check(docs, cut, glm, base, min_n=20)
+        dind.gate_name = "genre_overfit"
+        # CORPUS-SWAP INVARIANCE: the miner picks its own recovery corpus, so score the student
+        # on probe sets from genuinely DIFFERENT origins and flag source-dependent retention.
+        # Sources must be different origins, not two slices of one distribution — swapping
+        # within a distribution tests nothing.
+        by_source: dict = {}
+        for d in fresh:
+            by_source.setdefault(d.id.split(":")[0], []).append(d)
+        inv = None
+        if len(by_source) >= 2:
+            inv = make_invariance_check(by_source, glm, base)
+            inv.gate_name = "corpus_swap"
+            print(f"corpus-swap invariance armed over {len(by_source)} sources: "
+                  f"{ {k: len(v) for k, v in by_source.items()} }")
+        else:
+            print(f"corpus-swap invariance NOT armed — only {len(by_source)} source(s) in the "
+                  f"fresh slice; it needs >= 2 distinct origins")
+        overfit_check = compose_preconditions(dind, inv)
 
     result = run_v2_axis_epoch(
         chain, 1, _tier_specs(fresh, code_sandbox), glm, base, tiers, budgets,
