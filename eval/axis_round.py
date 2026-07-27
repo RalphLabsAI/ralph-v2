@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 from .core import ModelRunner
 from .gates import degeneracy_flags
-from .koth import Scored, Submission, Tier, Tournament
+from .koth import MIN_CROWN_LB, Scored, Submission, Tier, Tournament
 from .round_engine import RoundResult
 from .scoring import AxisScore, axis_retention, soft_min
 
@@ -134,7 +134,7 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
                glm: ModelRunner, base: ModelRunner, tiers: list[Tier], tournament: Tournament,
                submissions: list[tuple[Submission, ModelRunner]],
                registry: dict[str, ModelRunner] | None = None,
-               items_per_axis: int = 64, max_new_tokens: int = 512,
+               items_per_axis: int = 150, max_new_tokens: int = 512,
                items: RoundItems | None = None, base_pass: dict | None = None,
                overfit_check=None, surprise_k: int | None = None,
                commit_root: str = "", round_nonce: str = "") -> RoundResult:
@@ -229,10 +229,24 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
             continue
         king_scored = None
         if king is not None:
-            ret, ret_lb, per_pt, per_ax, _, _ = _score_student(specs, items, base_pass, registry[king.model_id], max_new_tokens, crown_names)
-            king_scored = Scored(sub=Submission(king.miner, t.name, king.model_id, 0, 0.0),
-                                 retention=ret, retention_lb=ret_lb, per_point=per_pt,
-                                 gates_ok=True, per_axis=per_ax)
+            ret, ret_lb, per_pt, per_ax, k_axes, k_outs = _score_student(
+                specs, items, base_pass, registry[king.model_id], max_new_tokens, crown_names)
+            k_sub = Submission(king.miner, t.name, king.model_id, 0, 0.0)
+            # RE-GATE THE INCUMBENT on the same gates every challenger faces. Previously this
+            # hardcoded gates_ok=True, so the king was never re-validated: a model that had
+            # rotted below base, gone degenerate, or lost an axis kept the throne and 100% of
+            # the tier's emission forever, while a challenger with the same scores would have
+            # been rejected outright. A crown certificate has to keep being true.
+            k_ok, k_reasons = gate(k_sub, k_axes, k_outs)
+            if not k_ok or ret_lb <= MIN_CROWN_LB:
+                events.append({"tier": t.name, "round": round_no, "action": "vacate",
+                               "king": king.model_id, "retention_lb": round(ret_lb, 4),
+                               "reasons": k_reasons or [f"retention_lb <= {MIN_CROWN_LB}"]})
+                del tournament.kings[t.name]      # open throne: best valid challenger may take it
+            else:
+                king_scored = Scored(sub=k_sub, retention=ret, retention_lb=ret_lb,
+                                     per_point=per_pt, gates_ok=True, per_axis=per_ax,
+                                     axes=k_axes)
         events.append(tournament.consider(t.name, by_tier.get(t.name, []), king_scored, seed=commit_seed))
 
     if surprise_pick:

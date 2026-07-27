@@ -169,7 +169,7 @@ def run_v2_axis_epoch(
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     commit_window: int = 100, make_safe_runner=None,
     teacher_id: str = "glm", base_id: str = "base",
-    items_per_axis: int = 64, max_new_tokens: int = 512,
+    items_per_axis: int = 150, max_new_tokens: int = 512,
     overfit_check=None, signer=None, surprise_k: int | None = None,
 ) -> EpochResult:
     """One v2 epoch on the AXIS substrate — the GLM-COVER production path (verifiable-outcome

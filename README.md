@@ -111,7 +111,7 @@ implemented, and the code does not claim them:
 
 ```bash
 pip install -r requirements.txt        # one dep for the tests: pynacl
-python -m tests.test_crown_path        # 22/22, CPU (incl. the generator-specialist denial)
+python -m tests.test_crown_path        # 33/33, CPU (incl. the generator-specialist denial)
 python -m eval.run_capability_axis     # real GLM + student ladder: per-axis retention, crown
 python -m eval.shadow_axis_epoch       # the full operator epoch end to end (fake chain)
 ```

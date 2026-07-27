@@ -36,7 +36,7 @@ BASE = os.environ.get("RALPH_BASE", "Qwen/Qwen2.5-0.5B-Instruct")
 STUDENTS = os.environ.get(
     "RALPH_STUDENTS", "Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-1.5B-Instruct"
 ).split(",")
-ITEMS = int(os.environ.get("RALPH_ITEMS", "64"))
+ITEMS = int(os.environ.get("RALPH_ITEMS", "150"))  # dethrone power is PER AXIS; 64 needs ~+0.25 to dethrone
 
 
 class FakeChain:
@@ -181,15 +181,26 @@ def main() -> int:
     code_sandbox = os.environ.get("RALPH_CODE_SANDBOX", "require")
 
     # non-Latin slice for the multilingual crown axis (optional: skipped cleanly if offline)
+    # NB: import the callables HERE. They were previously only imported inside _load_corpus,
+    # so this block raised NameError on every run — swallowed by a broad `except Exception` and
+    # printed as "corpus unavailable", silently disabling the one axis a cloned artifact loses
+    # on. A bare except around a whole block turns a coding bug into a plausible-looking
+    # operational message; keep the try around the FETCH only.
+    from .corpus_stream import MULTILINGUAL_MIX, load_stream_slice as _load_slice, pool_size
     ml_docs = []
     try:
-        from .corpus_stream import MULTILINGUAL_MIX
-        ml_docs = load_stream_slice(f"{seed_str}|ml", n=int(os.environ.get("RALPH_ML_N", "150")),
-                                    mix=MULTILINGUAL_MIX, strict=True)
+        ml_docs = _load_slice(f"{seed_str}|ml", n=int(os.environ.get("RALPH_ML_N", "150")),
+                              mix=MULTILINGUAL_MIX, strict=True)
+    except Exception as e:
+        if not os.environ.get("RALPH_ML_OFF"):
+            raise RuntimeError(
+                f"multilingual corpus unavailable ({e}). This is the anti-clone axis; running "
+                f"without it crowns on axes a cloned model wins. Set RALPH_ML_OFF=1 to override."
+            ) from e
+        print(f"multilingual axis DISABLED by RALPH_ML_OFF ({e})")
+    if ml_docs:
         print(f"multilingual: {len(ml_docs)} non-Latin docs "
               f"({pool_size(MULTILINGUAL_MIX):,}-row pool)")
-    except Exception as e:
-        print(f"multilingual axis SKIPPED (corpus unavailable: {e})")
 
     overfit_check = None
     if not os.environ.get("RALPH_OVERFIT_OFF"):

@@ -1176,6 +1176,85 @@ def test_doc_task_axes():
             "wrong content accepted"
 
 
+def test_dethrone_rewards_the_anti_clone_strategy():
+    """THE MECHANISM MUST PAY FOR ITS OWN STRATEGY. The product thesis is 'beat a cloned
+    artifact on the axes a clone loses' (multilingual, agentic). The OLD rule — min over
+    per-axis paired LCBs — could not reward that: measured at production n, a challenger tied
+    on English and +0.55 better on multilingual scored -0.109 and HELD, because each per-axis
+    LCB is the 5th percentile of a noisy difference and the min selects the unluckiest tied
+    axis (two models of IDENTICAL skill measured -0.156).
+
+    The new rule bootstraps the LCB on the soft-min AGGREGATE difference. This test pins all
+    four properties that must hold simultaneously — losing any one re-breaks the mechanism."""
+    from eval.koth import axis_regression, softmin_lcb_diff
+
+    AX = ["extractive", "numeric_composition", "multilingual"]
+
+    def mk(mid, rates, n=150, seed=0):
+        r = random.Random(seed)
+        pa = {ax: [1.0 if r.random() < p else 0.0 for _ in range(n)] for ax, p in rates.items()}
+        return Scored(sub=Submission(mid, "t", mid, 1, 0.0), retention=min(rates.values()),
+                      retention_lb=min(rates.values()),
+                      per_point=[v for a in pa.values() for v in a], gates_ok=True, per_axis=pa)
+
+    def dethrones(c, k):
+        lcb = softmin_lcb_diff(c, k, seed=7)
+        return lcb > MARGIN and axis_regression(c, k, seed=7) is None
+
+    # 1. the anti-clone improvement MUST be rewarded
+    clone = mk("clone", {"extractive": .85, "numeric_composition": .85, "multilingual": .20}, seed=3)
+    chal = mk("chal", {"extractive": .85, "numeric_composition": .85, "multilingual": .75}, seed=4)
+    assert dethrones(chal, clone), "the product's core strategy still cannot dethrone"
+
+    # 2. an exact copy must STILL tie — zero variance in every replicate
+    king = mk("king", {a: .60 for a in AX}, seed=11)
+    assert softmin_lcb_diff(mk("copy", {a: .60 for a in AX}, seed=11), king, seed=7) == 0.0
+    assert not dethrones(mk("copy", {a: .60 for a in AX}, seed=11), king)
+
+    # 3. equal skill with independent errors must not dethrone, and must not be wildly biased
+    ind = softmin_lcb_diff(mk("ind", {a: .60 for a in AX}, seed=99), king, seed=7)
+    assert not dethrones(mk("ind", {a: .60 for a in AX}, seed=99), king)
+    assert ind > -0.08, f"estimator still badly biased on tied axes: {ind}"
+
+    # 4. the drifter guarantee survives: big gains cannot buy a real regression
+    drift = mk("drift", {"extractive": .95, "numeric_composition": .95, "multilingual": .35}, seed=5)
+    assert not dethrones(drift, king), "drifter bought the crown"
+
+    # 5. an honest across-the-board improvement is actually payable at production n
+    wins = sum(dethrones(mk("c", {a: .75 for a in AX}, seed=500 + t),
+                         mk("k", {a: .60 for a in AX}, seed=100 + t)) for t in range(20))
+    assert wins >= 14, f"uniform +0.15 dethroned only {wins}/20 — crown effectively unremovable"
+
+
+def test_king_is_revalidated_and_vacated():
+    """The incumbent must face the SAME gates as challengers. Previously axis_round hardcoded
+    gates_ok=True for the king, so a model that had rotted below base kept the throne and 100%
+    of the tier's emission forever — while an identical challenger would have been rejected.
+    A crown certificate has to keep being true."""
+    specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
+    tiers = [Tier("t", 10 ** 12, 1.0)]
+    tour, reg = Tournament(tiers, margin=0.03), {}
+    glm = _Sim("glm", {"x": 1.0, "y": 1.0})
+    base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
+
+    good = (Submission("m_good", "t", "good", 1, 1.0), _Sim("good", {"x": .85, "y": .85}, seed=1))
+    _run(1, specs, tiers, tour, reg, [good], glm, base)
+    assert tour.kings["t"].model_id == "good", "setup: good should crown the open throne"
+
+    # the king now degenerates (loops). Re-scored, it must FAIL the degeneracy gate and be
+    # vacated — not silently retained.
+    reg["good"] = _Sim("rotted", {}, loop=True)
+    res = _run(2, specs, tiers, tour, reg, [], glm, base)
+    vac = [e for e in res.events if e.get("action") == "vacate"]
+    assert vac, f"rotted king was not vacated: {res.events}"
+    assert "t" not in tour.kings, "throne still occupied by a failing king"
+
+    # and with the throne open, a valid challenger takes it the same round it is offered
+    fresh = (Submission("m_new", "t", "new", 1, 1.0), _Sim("new", {"x": .80, "y": .80}, seed=6))
+    _run(3, specs, tiers, tour, reg, [fresh], glm, base)
+    assert tour.kings["t"].model_id == "new", f"throne not re-crowned: {tour.kings.get('t')}"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1191,6 +1270,7 @@ def main() -> int:
              test_multi_constraint_compounds, test_score_at_budget_and_convergence_gate,
              test_corpus_swap_invariance, test_surprise_axis_selection,
              test_surprise_selection_in_crown_round, test_doc_task_axes,
+             test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

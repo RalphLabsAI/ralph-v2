@@ -95,6 +95,89 @@ def bootstrap_lcb_diff(a: list[float], b: list[float], z_reps: int = 2000,
     return means[int(alpha * z_reps)]
 
 
+SOFTMIN_P = -3.0        # matches scoring.SOFTMIN_P; worst-domain pressure without annihilation
+
+
+def _soft_min(rates: list[float], p: float = SOFTMIN_P) -> float:
+    """Power-mean over per-axis rates — the same worst-domain aggregate the crown score uses,
+    on plain rates so the bootstrap can recompute it per replicate."""
+    if not rates:
+        return 0.0
+    eps = 1e-3
+    acc = sum(max(r, eps) ** p for r in rates) / len(rates)
+    return acc ** (1.0 / p)
+
+
+def _shared_axes(a: "Scored", b: "Scored") -> list[str]:
+    return [ax for ax in sorted(a.per_axis)
+            if ax in b.per_axis and a.per_axis[ax]
+            and len(a.per_axis[ax]) == len(b.per_axis[ax])]
+
+
+def softmin_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000, alpha: float = 0.05,
+                     seed: int = 0, p: float = SOFTMIN_P) -> float:
+    """Dethrone statistic: bootstrap lower bound on the difference of WORST-DOMAIN AGGREGATES.
+
+    Replaces the old min-over-per-axis-LCBs, which was negatively biased to the point of being
+    unusable. Measured on the production item count (n=64/axis, 3 axes): two models of IDENTICAL
+    skill with independent error patterns scored -0.156, because each per-axis paired LCB is the
+    5th percentile of a noisy difference and taking the MIN over axes selects the unluckiest one.
+    A challenger therefore had to beat the king by ~+0.25 on EVERY axis to dethrone, and the case
+    this subnet exists to reward — tied on English, far better on the axis a cloned model loses
+    (multilingual) — scored -0.109 and HELD the throne. The mechanism could not pay for its own
+    strategy.
+
+    Here each replicate resamples the items ONCE per axis (paired: both models are scored on the
+    same items), recomputes each model's soft-min aggregate on that resample, and differences
+    them. The 5th percentile of that distribution is the bound.
+
+    The anti-copy guarantee is preserved exactly and for the same reason as before: an exact copy
+    produces identical per-item results, so in EVERY replicate both aggregates coincide, the
+    difference is exactly 0 with zero variance, and the bound is 0 — never clearing the margin.
+    Improving your WORST axis moves the soft-min, which is precisely the improvement we want to
+    buy; improving an already-strong axis moves it barely at all.
+    """
+    shared = _shared_axes(a, b)
+    if not shared:
+        return bootstrap_lcb_diff(a.per_point, b.per_point, z_reps, alpha, seed)
+    rng = random.Random(seed)
+    vecs = [(a.per_axis[ax], b.per_axis[ax]) for ax in shared]
+    diffs = []
+    for _ in range(z_reps):
+        ar, br = [], []
+        for av, bv in vecs:
+            n = len(av)
+            idx = [rng.randrange(n) for _ in range(n)]
+            ar.append(sum(av[i] for i in idx) / n)
+            br.append(sum(bv[i] for i in idx) / n)
+        diffs.append(_soft_min(ar, p) - _soft_min(br, p))
+    diffs.sort()
+    return diffs[int(alpha * z_reps)]
+
+
+def axis_regression(a: "Scored", b: "Scored", z_reps: int = 1000, alpha: float = 0.05,
+                    seed: int = 0) -> str | None:
+    """Name of an axis where `a` is CONFIDENTLY worse than `b`, else None.
+
+    The soft-min difference already punishes selling one capability to buy another (the
+    aggregate is dominated by the weakest axis), but this keeps the old worst-axis guarantee
+    explicit and cheap: a challenger that genuinely regresses on any shared axis cannot take the
+    crown no matter how much it gained elsewhere. Confidence-based, so sampling noise on a tied
+    axis does not block an honest challenger."""
+    for ax in _shared_axes(a, b):
+        av, bv = a.per_axis[ax], b.per_axis[ax]
+        n = len(av)
+        rng = random.Random(f"{seed}|{ax}")
+        ds = []
+        for _ in range(z_reps):
+            idx = [rng.randrange(n) for _ in range(n)]
+            ds.append(sum(av[i] - bv[i] for i in idx) / n)
+        ds.sort()
+        if ds[int((1 - alpha) * len(ds))] < 0.0:      # upper bound still below zero
+            return ax
+    return None
+
+
 def worst_axis_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000,
                         alpha: float = 0.05, seed: int = 0) -> float:
     """Dethrone margin = the WORST per-axis paired lower bound.
@@ -152,10 +235,18 @@ class Tournament:
                          retention=round(best.retention, 4))
             return event
 
-        # contested throne: dethrone only past the noise-floor margin, on the WORST axis
-        # (paired on the same points as the re-scored king). Worst-axis, not pooled mean,
-        # so a challenger strong on one axis but weak on another cannot buy the crown.
-        lcb = worst_axis_lcb_diff(best, king_scored, seed=seed)
+        # contested throne: dethrone only past the noise-floor margin, on the WORST-DOMAIN
+        # AGGREGATE (paired on the same points as the re-scored king), plus an explicit
+        # no-regression rule. The aggregate difference is what makes "improve your weakest
+        # axis" the paying strategy; the regression check keeps the old guarantee that you
+        # cannot sell one capability to buy another.
+        lcb = softmin_lcb_diff(best, king_scored, seed=seed)
+        regressed = axis_regression(best, king_scored, seed=seed) if lcb > self.margin else None
+        if regressed:
+            self.kings[tier].reign += 1
+            event.update(action="hold", margin_lcb=round(lcb, 4),
+                         best_challenger=best.sub.model_id, regressed_axis=regressed)
+            return event
         if lcb > self.margin and best.sub.model_id != king_scored.sub.model_id:
             self.kings[tier] = King(best.sub.miner, best.sub.model_id, best.retention, self.round)
             event.update(action="dethrone", king=best.sub.model_id, miner=best.sub.miner,

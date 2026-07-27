@@ -61,7 +61,7 @@ def run_axis_round(
     tiers: list[Tier], tier_budgets: dict[str, TierBudget],
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     teacher_id: str = "glm", base_id: str = "base",
-    items_per_axis: int = 64, max_new_tokens: int = 512,
+    items_per_axis: int = 150, max_new_tokens: int = 512,
     overfit_check=None, signer=None, surprise_k: int | None = None,
 ) -> RoundOutcome:
     out = RoundOutcome()
