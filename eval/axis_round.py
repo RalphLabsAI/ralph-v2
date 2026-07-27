@@ -136,18 +136,32 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
                registry: dict[str, ModelRunner] | None = None,
                items_per_axis: int = 64, max_new_tokens: int = 512,
                items: RoundItems | None = None, base_pass: dict | None = None,
-               overfit_check=None) -> RoundResult:
+               overfit_check=None, surprise_k: int | None = None,
+               commit_root: str = "", round_nonce: str = "") -> RoundResult:
     """`overfit_check(submission, runner) -> (ok, info)`: optional crown PRECONDITION — the
     stale-vs-fresh diff-in-diff genre-overfit gate (overfit_gate.diff_in_diff_over_corpus,
     closed over the round's timestamped corpus + pinned teacher/base). A flagged student is
     NOT crownable regardless of its capability retention, so acing the (pre-distillable)
     covered distribution can't buy the crown if the edge collapses on genuinely-fresh
     same-genre documents. Skipped when None."""
-    from .seeds import derive_seed
+    from .seeds import derive_seed, derive_surprise_axes
     tournament.round = round_no
     registry = registry if registry is not None else {}
     for sub, runner in submissions:
         registry[sub.model_id] = runner
+
+    # SURPRISE SELECTION: which crown axes actually score is drawn from post-commit entropy, so
+    # a miner cannot pre-fit the task FORMAT (the hole that corpus scale and item-freshness do
+    # not touch — the formats are in the source everyone reads). Floor axes always run: they are
+    # the cheap liveness/degeneracy check and are not worth hiding.
+    surprise_pick: list[str] = []
+    if surprise_k:
+        crown_pool = [s.name for s in specs if s.role == "crown"]
+        if surprise_k < len(crown_pool):
+            surprise_pick = derive_surprise_axes(
+                commit_root or str(commit_seed), round_nonce or str(commit_seed),
+                crown_pool, surprise_k)
+            specs = [s for s in specs if s.role != "crown" or s.name in surprise_pick]
 
     # 1-2. fresh items + GLM reference (once per round, amortized across all miners + king).
     # Each axis seeded independently off the round seed so `derive_surprise_axes` can later
@@ -220,5 +234,11 @@ def axis_round(round_no: int, commit_seed: int, specs: list[AxisSpec],
                                  retention=ret, retention_lb=ret_lb, per_point=per_pt,
                                  gates_ok=True, per_axis=per_ax)
         events.append(tournament.consider(t.name, by_tier.get(t.name, []), king_scored, seed=commit_seed))
+
+    if surprise_pick:
+        # a gate nobody can verify is not a gate: publish which axes were drawn so an auditor
+        # re-derives the same selection from the nonce and re-checks every verdict.
+        events.append({"round": round_no, "action": "surprise_axes", "axes": surprise_pick,
+                       "scored": [s.name for s in specs]})
 
     return RoundResult(round_no, sum(len(v) for v in items.by_axis.values()), scored, events, tournament.weights())

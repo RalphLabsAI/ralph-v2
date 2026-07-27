@@ -27,18 +27,34 @@ def derive_seed(commit_root: str, round_nonce: str, axis_name: str) -> int:
 
 
 def derive_surprise_axes(commit_root: str, round_nonce: str, pool: list[str], k: int = 2) -> list[str]:
-    """Pick which un-announced axes are live this round.
+    """Pick which axes actually SCORE this round, from post-commit entropy.
 
-    Miners cannot know which surprise axes count until after they have committed,
-    so pre-fitting to the announced axes does not protect them.
+    THE GAP THIS CLOSES. Corpus scale and item-freshness stop a miner memorizing items; they do
+    NOTHING against a miner who pre-fits the TASK FORMAT, because the formats are in the
+    validator source everyone reads. Fine-tuning the narrow skill "find the word after an anchor
+    phrase" is cheap and buys the crown without retaining much of anything.
+
+    So the format a miner must satisfy is not knowable at seal time: publish the whole pool, but
+    draw which k count from the round nonce AFTER checkpoints lock. Combined with worst-axis
+    aggregation the two compose multiplicatively — you must cover every format in the pool
+    (you cannot know which are drawn) AND you are scored on your weakest drawn one, so buying a
+    cheap corner of the space is worthless.
+
+    The honest bar is economic, not absolute: a miner who covers the WHOLE pool is back to
+    parity — which is the point, because the pool is diverse real-text task formats, and
+    covering all of them is general capability rather than a trick. Cost scales with |pool|/k;
+    the payoff is capped by the worst drawn axis.
+
+    Selection is a pure function of published inputs, so an auditor re-derives it exactly; it is
+    also recorded in the round record, because a gate nobody can verify is not a gate.
     """
     if k >= len(pool):
         return sorted(pool)
-    seed = derive_seed(commit_root, round_nonce, "__surprise__")
+    # INDEPENDENT seed per draw. The old `seed >> (i*13)` exhausted a 64-bit word: for i>=5 the
+    # shift is >= 65, the value is 0, and every later draw collapses to index 0 deterministically.
     picked: list[str] = []
     remaining = sorted(pool)
     for i in range(k):
-        # rejection-free index draw from the shrinking pool
-        idx = (seed >> (i * 13)) % len(remaining)
-        picked.append(remaining.pop(idx))
+        s = derive_seed(commit_root, round_nonce, f"__surprise__{i}")
+        picked.append(remaining.pop(s % len(remaining)))
     return sorted(picked)

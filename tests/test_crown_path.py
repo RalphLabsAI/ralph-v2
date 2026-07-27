@@ -1050,6 +1050,66 @@ def test_corpus_swap_invariance():
     assert not ok and "failclosed" in info["verdict"], info
 
 
+def test_surprise_axis_selection():
+    """THE FORMAT GAP. Corpus scale and item-freshness stop item memorization; they do nothing
+    against a miner who pre-fits the TASK FORMAT, because every format is in the validator
+    source. Fix: publish the pool, draw which k score from POST-COMMIT entropy.
+
+    Required properties: unpredictable before the nonce, reproducible after it (auditable),
+    uniform over the pool (no dead formats a miner can safely ignore), and — the security
+    review's H4 — no bit-exhaustion collapse at larger k."""
+    from collections import Counter
+    from eval.seeds import derive_surprise_axes
+
+    pool = [f"ax{i}" for i in range(10)]
+
+    # reproducible: same (commit_root, nonce) -> same draw, so an auditor re-derives it
+    a = derive_surprise_axes("root1", "nonce1", pool, k=3)
+    assert a == derive_surprise_axes("root1", "nonce1", pool, k=3), "selection not reproducible"
+    # unpredictable: a different nonce moves it
+    assert a != derive_surprise_axes("root1", "nonce2", pool, k=3), "nonce did not change the draw"
+    assert len(a) == len(set(a)) == 3, a
+
+    # H4 regression: the old `seed >> (i*13)` hit 0 for i>=5 and every later draw collapsed to
+    # index 0. Large k must still return k DISTINCT axes.
+    big = derive_surprise_axes("root", "nonce", pool, k=8)
+    assert len(big) == len(set(big)) == 8, f"bit-exhaustion collapse at k=8: {big}"
+
+    # uniform-ish: no axis is effectively never drawn (a dead format is one a miner ignores)
+    counts = Counter()
+    for i in range(600):
+        counts.update(derive_surprise_axes("root", f"n{i}", pool, k=2))
+    assert len(counts) == len(pool), f"some axes never drawn: {set(pool) - set(counts)}"
+    assert min(counts.values()) > 40, f"badly skewed draw: {counts}"
+
+
+def test_surprise_selection_in_crown_round():
+    """Wired end-to-end: only the DRAWN crown axes score, floor axes always run, and the
+    selection is published in the round record so the verdict is auditable."""
+    specs = [AxisSpec(_FakeAxis(n), n, 1.0, role="crown") for n in ("cA", "cB", "cC")] + \
+            [AxisSpec(_FakeAxis("fl"), "fl", 1.0, role="floor")]
+    tiers = [Tier("t", 10 ** 12, 1.0)]
+    tour, reg = Tournament(tiers, margin=0.03), {}
+    probs = {n: 1.0 for n in ("cA", "cB", "cC", "fl")}
+    glm = _Sim("glm", probs)
+    base = _Sim("base", {n: 0.30 for n in probs}, seed=9)
+    stud = (Submission("m", "t", "s", 1, 1.0), _Sim("s", {n: 0.85 for n in probs}, seed=1))
+
+    res = axis_round(1, 4242, specs, glm, base, tiers, tour, [stud], registry=reg,
+                     items_per_axis=120, max_new_tokens=8, surprise_k=2,
+                     commit_root="root", round_nonce="nonce")
+
+    ev = [e for e in res.events if e.get("action") == "surprise_axes"]
+    assert ev, f"selection not recorded for auditors: {res.events}"
+    drawn = ev[0]["axes"]
+    assert len(drawn) == 2 and set(drawn) <= {"cA", "cB", "cC"}, drawn
+
+    scored_axes = {a.axis for a in res.scored["s"].axes}
+    assert scored_axes == set(drawn) | {"fl"}, f"scored {scored_axes}, drawn {drawn}"
+    # the undrawn crown axis must not be scored at all — that is what makes it un-pre-fittable
+    assert len({"cA", "cB", "cC"} - scored_axes) == 1, scored_axes
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1063,7 +1123,8 @@ def main() -> int:
              test_extractive_axis, test_generator_specialist_denied_crown,
              test_corpus_stream_selection, test_bitrate_matches_published_formats,
              test_multi_constraint_compounds, test_score_at_budget_and_convergence_gate,
-             test_corpus_swap_invariance,
+             test_corpus_swap_invariance, test_surprise_axis_selection,
+             test_surprise_selection_in_crown_round,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

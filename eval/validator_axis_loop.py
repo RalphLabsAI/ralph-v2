@@ -62,7 +62,7 @@ def run_axis_round(
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     teacher_id: str = "glm", base_id: str = "base",
     items_per_axis: int = 64, max_new_tokens: int = 512,
-    overfit_check=None, signer=None,
+    overfit_check=None, signer=None, surprise_k: int | None = None,
 ) -> RoundOutcome:
     out = RoundOutcome()
 
@@ -89,7 +89,8 @@ def run_axis_round(
     commit_seed = derive_seed(commit_root, round_nonce, "axis-items")
     res = axis_round(round_no, commit_seed, specs, glm, base, tiers, tournament, subs,
                      registry=registry, items_per_axis=items_per_axis,
-                     max_new_tokens=max_new_tokens, overfit_check=overfit_check)
+                     max_new_tokens=max_new_tokens, overfit_check=overfit_check,
+                     surprise_k=surprise_k, commit_root=commit_root, round_nonce=round_nonce)
     out.weights = res.weights
 
     # 3. settle refundable anti-grind bonds (refunded iff the miner improved its own best)
