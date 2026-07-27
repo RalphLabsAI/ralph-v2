@@ -170,7 +170,7 @@ def run_v2_axis_epoch(
     commit_window: int = 100, make_safe_runner=None,
     teacher_id: str = "glm", base_id: str = "base",
     items_per_axis: int = 64, max_new_tokens: int = 512,
-    overfit_check=None, signer=None,
+    overfit_check=None, signer=None, surprise_k: int | None = None,
 ) -> EpochResult:
     """One v2 epoch on the AXIS substrate — the GLM-COVER production path (verifiable-outcome
     retention across deterministic-checker axes). Same chain I/O as run_v2_epoch; scores via
@@ -201,7 +201,7 @@ def run_v2_axis_epoch(
         tiers, tier_budgets, tournament, ledger, registry,
         teacher_id=teacher_id, base_id=base_id,
         items_per_axis=items_per_axis, max_new_tokens=max_new_tokens,
-        overfit_check=overfit_check, signer=signer,
+        overfit_check=overfit_check, signer=signer, surprise_k=surprise_k,
     )
     return _write_back(chain, tiers, tournament, outcome, round_no)
 

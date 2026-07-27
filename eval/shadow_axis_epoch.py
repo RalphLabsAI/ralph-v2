@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 
 from .axes.code_exec import CodeExec
+from .axes.doc_tasks import ConstrainedExtraction, LongContextReal, NumericComposition
 from .axes.extractive import ExtractiveQA
 from .axes.instruction import InstructionFollowing
 from .axes.long_context import LongContext
@@ -80,7 +81,7 @@ class FakeChain:
         pass
 
 
-def _tier_specs(fresh_docs, code_sandbox):
+def _tier_specs(fresh_docs, code_sandbox, ml_docs=()):
     # THE PIVOT (const's SN97 fix). CROWN = real∩verifiable capability retention on fresh,
     # post-commit real documents (extractive QA, answer is a verbatim span, exact-match, no
     # judge) — carries information a miner cannot pre-distill. FLOOR = the synthetic
@@ -88,8 +89,27 @@ def _tier_specs(fresh_docs, code_sandbox):
     # (degeneracy + no-negative) but do NOT set the crown, because a specialist can ace a
     # public generator offline without retaining GLM. code axis executes untrusted output ->
     # sandbox REQUIRED (RALPH_CODE_SANDBOX=auto only on a trusted dev box without bwrap).
-    return [
+    # CROWN POOL. Six formats, each stressing a DIFFERENT mechanism over real documents, so
+    # covering the pool is general capability rather than one narrow skill in six costumes —
+    # that is the property that makes surprise selection (draw k post-commit) a real defense
+    # instead of a gesture. Each is chosen against where compression measurably breaks, not by
+    # difficulty ("quantization amplifies existing weaknesses" — difficulty is the wrong axis).
+    crown = [
         AxisSpec(ExtractiveQA(fresh_docs), "extractive", 1.0, difficulty=1, role="crown"),
+        AxisSpec(NumericComposition(fresh_docs), "numeric_composition", 1.0, difficulty=1,
+                 role="crown"),
+        AxisSpec(LongContextReal(fresh_docs), "long_context_real", 1.0, difficulty=1,
+                 role="crown"),
+        AxisSpec(ConstrainedExtraction(fresh_docs), "constrained_extraction", 1.0, difficulty=1,
+                 role="crown"),
+    ]
+    if ml_docs:
+        # the incumbent's blind spot: zero multilingual in PrismML's 15-benchmark suite while
+        # independent testing measured Persian collapsing 79.8% -> 45.2% at 1-bit. Scored as its
+        # OWN axis so a strong English model cannot average it away.
+        crown.append(AxisSpec(ExtractiveQA(ml_docs, kinds=("number",)), "multilingual", 1.0,
+                              difficulty=1, role="crown"))
+    return crown + [
         # second CROWN axis: compounding verifiable constraints. This is where compression
         # measurably breaks (PrismML's own numbers: IFBench -15.7 vs MATH-500 -1.4), so it is
         # both the discriminative axis and the hard-to-Goodhart one — the score moves when
@@ -154,10 +174,22 @@ def main() -> int:
     from .corpus import split_by_commit
     # the corpus slice is seeded by the round nonce: in production this is post-commit chain
     # entropy, so which documents get scored cannot be known when the miner seals its weights.
-    docs, cut, desc = _load_corpus(f"{chain.commit_root(0, 0)}|{chain.block_hash(chain.current_block())}")
+    seed_str = f"{chain.commit_root(0, 0)}|{chain.block_hash(chain.current_block())}"
+    docs, cut, desc = _load_corpus(seed_str)
     stale, fresh = split_by_commit(docs, cut)
     print(f"corpus: {desc}; {len(stale)} stale / {len(fresh)} fresh (cut={cut})")
     code_sandbox = os.environ.get("RALPH_CODE_SANDBOX", "require")
+
+    # non-Latin slice for the multilingual crown axis (optional: skipped cleanly if offline)
+    ml_docs = []
+    try:
+        from .corpus_stream import MULTILINGUAL_MIX
+        ml_docs = load_stream_slice(f"{seed_str}|ml", n=int(os.environ.get("RALPH_ML_N", "150")),
+                                    mix=MULTILINGUAL_MIX, strict=True)
+        print(f"multilingual: {len(ml_docs)} non-Latin docs "
+              f"({pool_size(MULTILINGUAL_MIX):,}-row pool)")
+    except Exception as e:
+        print(f"multilingual axis SKIPPED (corpus unavailable: {e})")
 
     overfit_check = None
     if not os.environ.get("RALPH_OVERFIT_OFF"):
@@ -185,11 +217,21 @@ def main() -> int:
                   f"fresh slice; it needs >= 2 distinct origins")
         overfit_check = compose_preconditions(dind, inv)
 
+    specs = _tier_specs(fresh, code_sandbox, ml_docs)
+    n_crown = sum(1 for s in specs if s.role == "crown")
+    # Surprise selection only defends in proportion to the pool: with a small crown pool it
+    # just halves the signal for nothing. Arm it once the pool is big enough to be worth
+    # hiding, and draw roughly half.
+    surprise_k = int(os.environ.get("RALPH_SURPRISE_K", "0")) or (
+        max(2, n_crown // 2) if n_crown >= 4 else 0)
+    print(f"crown pool: {n_crown} axes; surprise_k={surprise_k or 'off'} "
+          f"({'drawn post-commit' if surprise_k else 'all score'})")
+
     result = run_v2_axis_epoch(
-        chain, 1, _tier_specs(fresh, code_sandbox), glm, base, tiers, budgets,
+        chain, 1, specs, glm, base, tiers, budgets,
         Tournament(tiers, margin=0.03), RegistrationLedger(), {},
         make_safe_runner=lambda cd: SafeStudentRunner(cd, name=runners[cd].split("/")[-1]),
-        items_per_axis=ITEMS, overfit_check=overfit_check,
+        items_per_axis=ITEMS, overfit_check=overfit_check, surprise_k=surprise_k,
         signer=Ed25519Signer(seed=b"shadow-operator-key-000000000000"[:32]),
     )
 

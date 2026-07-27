@@ -11,6 +11,7 @@ genuine improvement dethrones), and the deterministic long-context checker.
 from __future__ import annotations
 
 import random
+import re
 
 from eval.axes.code_exec import CodeExec
 from eval.axes.long_context import LongContext
@@ -1110,6 +1111,71 @@ def test_surprise_selection_in_crown_round():
     assert len({"cA", "cB", "cC"} - scored_axes) == 1, scored_axes
 
 
+def test_doc_task_axes():
+    """The three new crown formats. Surprise selection only defends in proportion to the pool,
+    and the pool only counts if each format stresses a DIFFERENT mechanism — ten variants of
+    'extract a span' is one narrow skill in ten costumes and a miner buys them all at once.
+
+    Each must be: answerable from the shown text (an impossible item fails the TEACHER too),
+    exact-match checkable, and unfoolable by the obvious cheap output."""
+    import json as _json
+    from eval.axes.doc_tasks import ConstrainedExtraction, LongContextReal, NumericComposition
+    from eval.corpus import synth_corpus
+
+    docs = synth_corpus(160, seed=21, commit_ts=100, span=5)
+
+    # --- composition: locate two anchored values, then combine (compounding) ---
+    nc = NumericComposition(docs)
+    items = nc.generate(seed=4, n=24, difficulty=1)
+    assert len(items) >= 12, f"too few composition items: {len(items)}"
+    for it in items:
+        anchors = re.findall(r'immediately after "([^"]+)"', it.prompt)
+        assert len(anchors) == 2, f"prompt quoting broke: {anchors}"
+        body = it.prompt.split("Passage:\n", 1)[1].rsplit("\n\nIn the passage", 1)[0]
+        vals = []
+        for a in anchors:
+            assert body.count(a) == 1, "anchor not unique -> ambiguous gold"
+            vals.append(int(re.search(r"\d{2,}", body[body.find(a) + len(a):]).group()))
+        expect = {"sum": vals[0] + vals[1], "difference": abs(vals[0] - vals[1]),
+                  "larger": max(vals)}[it.meta["op"]]
+        assert str(expect) == str(it.answer), f"{it.meta['op']}: {expect} != {it.answer}"
+        assert nc.check(it, f"Answer: {it.answer}")
+        assert not nc.check(it, "Answer: 9999999")
+        # answering only ONE of the two values must fail — that is the composition requirement
+        if str(vals[0]) != str(it.answer):
+            assert not nc.check(it, f"Answer: {vals[0]}"), "single hop accepted"
+
+    # --- long context over REAL (here synthetic-stand-in) documents ---
+    lc = LongContextReal(docs)
+    li = lc.generate(seed=2, n=8, difficulty=2)
+    assert li, "no long-context items"
+    for it in li:
+        assert str(it.answer) in it.prompt, "gold not present in the haystack"
+        assert it.meta["n_docs"] >= 5, it.meta
+        assert lc.check(it, f"Answer: {it.answer}")
+        assert not lc.check(it, "Answer: 13579")
+
+    # --- constrained extraction: content AND shape, independently ---
+    ce = ConstrainedExtraction(docs)
+    ci = ce.generate(seed=6, n=18, difficulty=1)
+    assert {i.meta["shape"] for i in ci} == {"csv", "lines", "json"}, "shapes not exercised"
+
+    def render(it):
+        v, s = it.answer["vals"], it.answer["shape"]
+        return {"csv": ",".join(v), "lines": "\n".join(v), "json": _json.dumps(v)}[s]
+
+    for it in ci:
+        body = it.prompt.split("Passage:\n", 1)[1].rsplit("\n\nList", 1)[0]
+        assert [m.group() for m in re.finditer(r"(?<![\w.])\d{2,}(?![\w.])", body)][:it.meta["k"]] \
+            == it.answer["vals"], "gold is not the first k numbers in document order"
+        assert ce.check(it, render(it)), f"correct answer rejected ({it.meta['shape']})"
+        # right content, wrong shape -> fail; right shape, wrong content -> fail
+        if it.meta["shape"] != "csv":
+            assert not ce.check(it, " ".join(it.answer["vals"])), "wrong shape accepted"
+        assert not ce.check(it, render(it).replace(it.answer["vals"][0], "424242", 1)), \
+            "wrong content accepted"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1124,7 +1190,7 @@ def main() -> int:
              test_corpus_stream_selection, test_bitrate_matches_published_formats,
              test_multi_constraint_compounds, test_score_at_budget_and_convergence_gate,
              test_corpus_swap_invariance, test_surprise_axis_selection,
-             test_surprise_selection_in_crown_round,
+             test_surprise_selection_in_crown_round, test_doc_task_axes,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

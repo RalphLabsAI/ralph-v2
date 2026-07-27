@@ -48,7 +48,12 @@ def _mint(doc, seed: int, kind: str, anchor_len: int) -> tuple[str, str] | None:
     r.shuffle(cands)
     for m in cands:
         anchor = " ".join(text[:m.start()].split()[-anchor_len:])
-        # the anchor must occur exactly once, so the gold span is unambiguous (fair check).
+        # The anchor must occur exactly once, so the gold span is unambiguous (fair check) —
+        # and must not contain a quote character, because the prompt renders it inside double
+        # quotes and real web text is full of them; an anchor with a quote silently breaks the
+        # delimiters and the item becomes unanswerable for the teacher too.
+        if any(c in anchor for c in '"“”\n\r'):
+            continue
         if text.count(anchor) != 1:
             continue
         word = "number" if kind == "number" else "word"

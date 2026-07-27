@@ -57,6 +57,27 @@ SOURCES = {
                     "CC-MAIN-2024-51"],
         "pool_rows": 275_924_241,
     },
+    # NON-LATIN real text. This is the incumbent's blind spot and our anti-clone lever in one:
+    # PrismML's 15-benchmark suite contains ZERO multilingual coverage, and independent testing
+    # measured Persian collapsing 79.8% -> 45.2% at 1-bit while English/coding held at 97-100%.
+    # A cloned Bonsai therefore LOSES here, which is the only kind of axis a cloner cannot
+    # supply. Digits are script-independent, so a numeric probe stays exactly checkable while
+    # the anchor forces genuine reading of Cyrillic/Han/Arabic context.
+    "fineweb2_rus": {
+        "dataset": "HuggingFaceFW/fineweb-2", "split": "train",
+        "text": "text", "date": "date",
+        "configs": ["rus_Cyrl"], "pool_rows": 699_118_293,
+    },
+    "fineweb2_cmn": {
+        "dataset": "HuggingFaceFW/fineweb-2", "split": "train",
+        "text": "text", "date": "date",
+        "configs": ["cmn_Hani"], "pool_rows": 636_092_280,
+    },
+    "fineweb2_arb": {
+        "dataset": "HuggingFaceFW/fineweb-2", "split": "train",
+        "text": "text", "date": "date",
+        "configs": ["arb_Arab"], "pool_rows": 62_019_605,
+    },
     # real journalism with true publication dates, one config per month — the closest thing
     # to a post-commit feed available as a dataset. Small per config; used as a MINORITY
     # source for genre diversity (a second source dilutes any single planted document).
@@ -70,6 +91,12 @@ SOURCES = {
 
 # weighted manifest: no single source is the whole eval (dilutes planting + genre-overfit).
 DEFAULT_MIX = (("fineweb", 0.7), ("bbc_news", 0.3))
+
+# Multilingual mix for the non-Latin crown axis. Kept SEPARATE from DEFAULT_MIX rather than
+# blended in: mixing a little Cyrillic into a mostly-English draw lets a strong English model
+# average over it, which is precisely how the incumbent's suite failed to see a 34-point
+# collapse. Scored as its own axis, it cannot be averaged away.
+MULTILINGUAL_MIX = (("fineweb2_rus", 0.4), ("fineweb2_cmn", 0.35), ("fineweb2_arb", 0.25))
 
 
 def _sub_seed(seed: int | str, tag: str) -> int:
