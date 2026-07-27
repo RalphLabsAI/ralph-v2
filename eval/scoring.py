@@ -27,6 +27,15 @@ MIN_AXIS_N = 30   # teacher-passed items required before an axis may gate/domina
                   # run had a 6-task axis (~3 points) flip negative on sampling noise and
                   # sink every student's soft-min — below this an axis is not "live".
 
+# SATURATION GUARD: minimum fraction of teacher-passed items the BASE must FAIL for the axis to
+# carry information. Retention divides by (teacher - base), so a saturated axis both amplifies
+# sampling noise (÷0.05 is a 20x multiplier) and measures nothing — and a non-discriminative
+# axis is precisely the one a miner can Goodhart while real capability rots. The compression
+# evidence is blunt: PrismML's own table has a 14x-compressed 27B scoring 96.06 on GSM8K vs the
+# FP16 teacher's 95.30 (the compressed model WINS) and 99.20 vs 99.40 on MATH-500. Those axes
+# cannot distinguish a 54 GB model from a 3.8 GB one, so they must not be allowed to vote.
+MIN_HEADROOM = 0.15
+
 
 def wilson_lower_bound(successes: int, n: int, z: float = 1.96) -> float:
     """Lower bound of the Wilson score interval. Returns 0.0 for n == 0."""
@@ -109,9 +118,11 @@ def axis_retention(
     s_rate, b_rate = s_pass / n, b_pass / n
     t_rate = 1.0
     denom = t_rate - b_rate
-    if denom <= 1e-9:
-        # base already matches the teacher here: no headroom, so this axis carries
-        # no information about compression quality this round. Not live.
+    if denom < MIN_HEADROOM:
+        # SATURATED: the base is already at (or near) teacher parity here, so this axis cannot
+        # separate a real compression from a bad one — and dividing by a tiny denominator would
+        # turn sampling noise into a retention swing. Not live: excluded from aggregation, and
+        # surfaced so an operator re-calibrates the axis rather than trusting a flat score.
         return AxisScore(axis, weight, t_pass, s_pass, b_pass, n, 0.0, 0.0, 0.0, live=False)
 
     retention = (s_rate - b_rate) / denom

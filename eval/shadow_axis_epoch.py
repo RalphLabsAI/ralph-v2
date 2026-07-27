@@ -20,6 +20,7 @@ from .axes.extractive import ExtractiveQA
 from .axes.instruction import InstructionFollowing
 from .axes.long_context import LongContext
 from .axes.math_gsm import MathGSM
+from .axes.multi_constraint import MultiConstraint
 from .axes.multihop import MultiHop
 from .axis_round import AxisSpec
 from .chain import Commitment, run_v2_axis_epoch
@@ -89,6 +90,11 @@ def _tier_specs(fresh_docs, code_sandbox):
     # sandbox REQUIRED (RALPH_CODE_SANDBOX=auto only on a trusted dev box without bwrap).
     return [
         AxisSpec(ExtractiveQA(fresh_docs), "extractive", 1.0, difficulty=1, role="crown"),
+        # second CROWN axis: compounding verifiable constraints. This is where compression
+        # measurably breaks (PrismML's own numbers: IFBench -15.7 vs MATH-500 -1.4), so it is
+        # both the discriminative axis and the hard-to-Goodhart one — the score moves when
+        # capability moves. Deterministic parsers, no judge.
+        AxisSpec(MultiConstraint(), "multi_constraint", 1.0, difficulty=2, role="crown"),
         AxisSpec(MathGSM(), "math", 1.0, difficulty=3, role="floor"),
         AxisSpec(CodeExec(sandbox=code_sandbox), "code", 1.0, difficulty=2, items=160, role="floor"),
         AxisSpec(InstructionFollowing(), "instruction", 1.0, difficulty=1, role="floor"),

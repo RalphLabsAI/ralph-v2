@@ -865,6 +865,133 @@ def test_bitrate_matches_published_formats():
     assert rep2.compression_x > 14.0, rep2.compression_x
 
 
+def test_multi_constraint_compounds():
+    """The discriminative axis. Compression damage COMPOUNDS on multi-constraint work (PrismML's
+    own numbers: IFBench -15.7 vs MATH-500 -1.4), so the checker must (a) require ALL constraints,
+    (b) actually separate a slightly-degraded model from a clean one at k>1, and (c) be a pure
+    parser. Property tested directly: joint pass ~ p^k, so per-constraint slippage that is
+    invisible at k=1 is stark at k=4 — that separation IS the anti-Goodhart signal."""
+    from eval.axes.multi_constraint import MultiConstraint
+    ax = MultiConstraint()
+
+    def compliant(item):
+        """Build a response satisfying every constraint (the 'perfect student')."""
+        specs = {s["kind"]: s for s in item.answer}
+        n = specs.get("exact_words", {}).get("n")
+        body_words = []
+        if "include" in specs:
+            body_words.append(specs["include"]["word"])
+        filler = [w for w in ["alpha", "delta", "sigma", "omega", "tau", "rho", "kappa", "iota"]
+                  if not (("forbid" in specs) and w == specs["forbid"]["word"])]
+        if "start_with" in specs:
+            body_words.insert(0, specs["start_with"]["word"])
+        if "bullets" in specs:
+            lines = []
+            for i in range(specs["bullets"]["n"]):
+                extra = body_words if i == 0 else []
+                lines.append("- " + " ".join(extra + [filler[i % len(filler)]]))
+            out = "\n".join(lines)
+        elif "sentences" in specs:
+            sents = []
+            for i in range(specs["sentences"]["n"]):
+                extra = body_words if i == 0 else []
+                sents.append(" ".join(extra + [filler[i % len(filler)]]) + ".")
+            out = " ".join(sents)
+        else:
+            target = (n or 12) - (1 if "end_with" in specs else 0)   # the token counts as a word
+            words = list(body_words)
+            while len(words) < target:
+                words.append(filler[len(words) % len(filler)])
+            out = " ".join(words[:target])
+        if "end_with" in specs:
+            out = out + " " + specs["end_with"]["token"]
+        if "lowercase" in specs:
+            # start_with is checked case-insensitively, and end_with is declared incompatible
+            # with lowercase in the axis, so a plain lowercase is always satisfiable here.
+            out = out.lower()
+        if "no_commas" in specs:
+            out = out.replace(",", "")
+        return out
+
+    for d in (1, 2, 3):
+        items = ax.generate(seed=5, n=12, difficulty=d)
+        assert all(len(it.answer) >= 2 for it in items), "not multi-constraint"
+        # a fully compliant response must pass, an empty one must not
+        # EVERY item must be satisfiable. An unsatisfiable combination (e.g. "end with END"
+        # + "be entirely lowercase") fails the teacher too, shrinking the teacher-passed
+        # subset and reading as student incapability — the worst bug class on an axis.
+        n_ok = sum(ax.check(it, compliant(it)) for it in items)
+        assert n_ok == len(items), (
+            f"unsatisfiable items at d={d}: {n_ok}/{len(items)} — "
+            f"{[i.meta['kinds'] for i in items if not ax.check(i, compliant(i))]}")
+        assert not any(ax.check(it, "") for it in items), "empty output accepted"
+        # dropping ONE constraint must fail the item — no partial credit
+        for it in items[:4]:
+            bad = compliant(it) + " , extra trailing words here"
+            if ax.check(it, bad):
+                continue     # that item had no constraint this perturbation violates
+            assert not ax.check(it, bad)
+
+    # THE COMPOUNDING PROPERTY: more constraints -> a partially-reliable model separates more
+    hi = ax.generate(seed=9, n=40, difficulty=3)
+    lo = ax.generate(seed=9, n=40, difficulty=1)
+    assert sum(len(i.answer) for i in hi) > sum(len(i.answer) for i in lo), "k did not grow"
+
+
+def test_score_at_budget_and_convergence_gate():
+    """Compression fails two ways — doesn't know, or doesn't FINISH — and a single scalar hides
+    the second. Independent Bonsai data: the competitor was MORE accurate when it converged
+    (100% vs 96%) and lost on cap rate (37% vs 10%). The gate must catch the non-terminating
+    model (the UID-107 '102x repeated phrase on Hi' signature) without punishing a hard axis."""
+    from eval.budget import BudgetReport, convergence_gate, score_at_budget
+
+    budget = 512
+    short = "Answer: 42"
+    looped = "wait let me reconsider " * 120          # runs to the wall
+
+    teacher = score_at_budget([True] * 9 + [False], [short] * 10, budget)
+    assert teacher.cap_rate == 0.0 and abs(teacher.score - 0.9) < 1e-9
+
+    # a looping student: never right, always capped
+    looper = score_at_budget([False] * 10, [looped] * 10, budget)
+    assert looper.cap_rate == 1.0, looper.as_dict()
+    ok, why = convergence_gate(looper, teacher)
+    assert not ok and "terminate" in why, why
+
+    # the informative split: same score, very different reasons
+    mixed = score_at_budget([True] * 6 + [False] * 4, [short] * 6 + [looped] * 4, budget)
+    assert abs(mixed.score - 0.6) < 1e-9
+    assert abs(mixed.cap_rate - 0.4) < 1e-9
+    assert abs(mixed.acc_if_converged - 1.0) < 1e-9, "accuracy-if-converged wrong"
+    ok2, why2 = convergence_gate(mixed, teacher)
+    assert not ok2, "a 40%-capped student passed the convergence gate"
+
+    # an honest student that simply gets things wrong must NOT be failed for convergence
+    wrong = score_at_budget([False] * 5 + [True] * 5, [short] * 10, budget)
+    ok3, _ = convergence_gate(wrong, teacher)
+    assert ok3, "an honest-but-wrong student was failed by the convergence gate"
+
+
+def test_saturation_guard_retires_flat_axes():
+    """A saturated axis cannot separate a 54 GB teacher from a 3.8 GB student (PrismML: ternary
+    27B scores 96.06 on GSM8K vs FP16's 95.30 — it WINS), and a non-discriminative axis is
+    exactly what a miner Goodharts while capability rots. Such an axis must go non-live."""
+    from eval.scoring import MIN_HEADROOM, axis_retention
+
+    n = 200
+    tp = [True] * n
+    # base nearly matches the teacher -> saturated -> must NOT be live
+    bp = [i % 20 != 0 for i in range(n)]        # base passes 95%
+    sat = axis_retention("gsm8k_like", 1.0, tp, [True] * n, bp)
+    assert not sat.live, f"saturated axis stayed live (headroom {1 - 0.95} < {MIN_HEADROOM})"
+
+    # a genuinely discriminative axis (base fails 60%) stays live and scores
+    bp2 = [i % 10 < 4 for i in range(n)]        # base passes 40%
+    disc = axis_retention("ifbench_like", 1.0, tp, [i % 10 < 8 for i in range(n)], bp2)
+    assert disc.live, "discriminative axis went non-live"
+    assert disc.retention > 0.5, disc.retention
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -876,7 +1003,9 @@ def main() -> int:
              test_miner_submission_roundtrip, test_code_exec_sandbox_blocks_payload,
              test_bond_refund_keyed_by_coldkey, test_long_context_argmax_and_id,
              test_extractive_axis, test_generator_specialist_denied_crown,
-             test_corpus_stream_selection, test_bitrate_matches_published_formats]
+             test_corpus_stream_selection, test_bitrate_matches_published_formats,
+             test_multi_constraint_compounds, test_score_at_budget_and_convergence_gate,
+             test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
         try:

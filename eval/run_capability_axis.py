@@ -28,6 +28,7 @@ from eval.axes.extractive import ExtractiveQA
 from eval.axes.instruction import InstructionFollowing
 from eval.axes.long_context import LongContext
 from eval.axes.math_gsm import MathGSM
+from eval.axes.multi_constraint import MultiConstraint
 from eval.axes.multihop import MultiHop
 from eval.axis_round import AxisSpec, axis_round
 from eval.koth import Submission, Tier, Tournament
@@ -78,6 +79,8 @@ def main() -> int:
     _, _fresh = split_by_commit(_docs, _cut)
     specs = [
         AxisSpec(ExtractiveQA(_fresh), "extractive", weight=1.0, difficulty=1, role="crown"),
+        # discriminative crown axis: compounding constraints, where compression actually breaks
+        AxisSpec(MultiConstraint(), "multi_constraint", weight=1.0, difficulty=2, role="crown"),
         AxisSpec(MathGSM(), "math", weight=1.0, difficulty=3, role="floor"),
         # hard pool kept (broader cover); teacher clears it at ~31%, so sample MORE items
         # rather than dumbing it down: 0.31*160 ~ 50 teacher-passed >> MIN_AXIS_N=30.
