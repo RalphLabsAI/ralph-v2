@@ -819,6 +819,52 @@ def test_corpus_stream_selection():
     assert cs.pool_size() > 10 ** 9, f"pool too small to deter enumeration: {cs.pool_size()}"
 
 
+def test_bitrate_matches_published_formats():
+    """A quantization crown must measure the bits actually in the weights, not the dtype header.
+    Ground truth = PrismML's own published arithmetic for the formats they ship:
+        binary  1 + 16/128        = 1.125
+        ternary log2(3) + 16/128  = 1.70996
+    Also covers the trap their `-unpacked` repos create: a genuinely 1-bit model stored in a
+    BF16 container reads as 16 bpw from headers, so header arithmetic cannot run this subnet."""
+    import math
+    from eval.bitrate import TIERS, bit_tier_gate, measure_state_dict, tensor_code_bits
+
+    r = random.Random(0)
+    N = 128 * 40
+
+    def grouped(levels):
+        out = []
+        for _ in range(N // 128):
+            s = r.uniform(0.01, 0.3)
+            out += [s * r.choice(levels) for _ in range(128)]
+        return out
+
+    b, kb = tensor_code_bits(grouped([-1, 1]))
+    t, kt = tensor_code_bits(grouped([-1, 0, 1]))
+    assert abs(b - 1.125) < 1e-6, f"binary bpw {b} != 1.125 (PrismML Q1_0)"
+    assert abs(t - 1.70996) < 1e-4, f"ternary bpw {t} != 1.70996 (PrismML Q2_0)"
+    assert (kb, kt) == (2, 3), f"codebook sizes wrong: {kb}, {kt}"
+
+    # dense weights must NOT read as cheap — they fall back to the container width
+    dense, _ = tensor_code_bits([r.gauss(0, 0.02) for _ in range(N)])
+    assert dense > 8.0 or math.isinf(dense), f"fp16-ish weights read as {dense} bpw"
+
+    # the `-unpacked` trap: 1-bit information, 16-bit container
+    rep = measure_state_dict({"lm_head.w": (grouped([-1, 1]), 16),
+                              "embed.w": (grouped([-1, 1]), 16)})
+    assert abs(rep.code_bits - 1.125) < 1e-6, f"achievement lost: {rep.code_bits}"
+    assert rep.container_bits == 16.0, rep.container_bits
+    ok, why = bit_tier_gate(rep, TIERS[0])
+    assert not ok and any("container" in w for w in why), f"unshippable artifact passed: {why}"
+
+    # a properly packed binary artifact clears the same tier
+    rep2 = measure_state_dict({"lm_head.w": (grouped([-1, 1]), 2),
+                               "embed.w": (grouped([-1, 1]), 2)})
+    ok2, why2 = bit_tier_gate(rep2, TIERS[0])
+    assert ok2, f"honest binary artifact rejected: {why2}"
+    assert rep2.compression_x > 14.0, rep2.compression_x
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -830,7 +876,7 @@ def main() -> int:
              test_miner_submission_roundtrip, test_code_exec_sandbox_blocks_payload,
              test_bond_refund_keyed_by_coldkey, test_long_context_argmax_and_id,
              test_extractive_axis, test_generator_specialist_denied_crown,
-             test_corpus_stream_selection]
+             test_corpus_stream_selection, test_bitrate_matches_published_formats]
     failed = 0
     for t in tests:
         try:
