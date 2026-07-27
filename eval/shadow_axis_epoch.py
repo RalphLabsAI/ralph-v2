@@ -141,10 +141,20 @@ def _load_corpus(seed):
         return (docs, median_commit_ts(docs),
                 f"{len(docs)} real docs from a {pool_size():,}-row pool "
                 f"(fingerprint {corpus_fingerprint(docs)[:12]})")
-    except Exception as e:  # offline / datasets missing -> synthetic stand-in
+    except Exception as e:
+        # FAIL CLOSED. Silently substituting synth_corpus turns the real-corpus crown back into
+        # the closed, enumerable generator the entire pivot exists to escape — and still crowns,
+        # on one printed line of warning. An HF outage must stop the round, not quietly change
+        # what the subnet is measuring. RALPH_SYNTH_CORPUS=1 is a dev escape hatch only.
+        if not os.environ.get("RALPH_SYNTH_CORPUS"):
+            raise RuntimeError(
+                f"real corpus unavailable ({e}). Refusing to crown on synthetic text — that is "
+                f"the closed generator this design exists to avoid. Set RALPH_SYNTH_CORPUS=1 "
+                f"for offline development only."
+            ) from e
         from .corpus import synth_corpus
         docs = synth_corpus(n, seed=20260724, commit_ts=1000, span=200)
-        return docs, 1000, f"{len(docs)} SYNTHETIC docs (real corpus unavailable: {e})"
+        return docs, 1000, f"{len(docs)} SYNTHETIC docs — DEV ONLY, NOT CROWNABLE ({e})"
 
 
 def main() -> int:

@@ -33,8 +33,8 @@ import random
 import re
 
 from ..core import Item
+from ..textnorm import NUM_RE as _NUM, make_anchor, norm_digits, same_number
 
-_NUM = re.compile(r"(?<![\w.])\d{2,}(?![\w.])")
 _CAP = re.compile(r"\b[A-Z][a-z]{2,}\b")
 
 
@@ -44,17 +44,13 @@ def _mint(doc, seed: int, kind: str, anchor_len: int) -> tuple[str, str] | None:
     text = doc.text
     pat = _NUM if kind == "number" else _CAP
     r = random.Random(f"{seed}|{doc.id}|{kind}")
-    cands = [m for m in pat.finditer(text) if len(text[:m.start()].split()) >= anchor_len]
+    cands = list(pat.finditer(text))
     r.shuffle(cands)
     for m in cands:
-        anchor = " ".join(text[:m.start()].split()[-anchor_len:])
-        # The anchor must occur exactly once, so the gold span is unambiguous (fair check) —
-        # and must not contain a quote character, because the prompt renders it inside double
-        # quotes and real web text is full of them; an anchor with a quote silently breaks the
-        # delimiters and the item becomes unanswerable for the teacher too.
-        if any(c in anchor for c in '"“”\n\r'):
-            continue
-        if text.count(anchor) != 1:
+        # script-aware: word anchor where the script is spaced, character window where it is
+        # not (unspaced CJK has no "previous words"). Unique + quote-free, or skipped.
+        anchor = make_anchor(text, m.start(), anchor_len)
+        if anchor is None:
             continue
         word = "number" if kind == "number" else "word"
         prompt = (f"[doc {doc.id}] Passage:\n{text}\n\n"
@@ -113,7 +109,11 @@ class ExtractiveQA:
             seg = output
         gold = str(item.answer)
         if item.meta.get("kind") == "number":
-            m = re.search(r"-?\d[\d,]*", seg)
-            return m is not None and m.group().replace(",", "") == gold.replace(",", "")
+            # compare NUMERICALLY across digit families: an Arabic passage may render the gold
+            # as ٢٠٢٤ while the model answers 2024 — it read the passage correctly and must not
+            # be scored wrong for normalizing.
+            m = re.search(r"-?[0-9٠-٩۰-۹०-९௦-௯０-９][0-9٠-٩۰-۹०-९௦-௯０-９,]*", norm_digits(seg)) \
+                or re.search(r"-?[0-9][0-9,]*", norm_digits(seg))
+            return m is not None and same_number(m.group(), gold)
         m = re.search(r"[A-Za-z][A-Za-z0-9'\-]+", seg)
         return m is not None and m.group().lower() == gold.lower()

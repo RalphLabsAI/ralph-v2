@@ -52,6 +52,34 @@ class HFRunner:
         )
         self._model.eval()
 
+    def _gen_config(self, max_new_tokens: int):
+        """A VALIDATOR-OWNED decode config, fully specified.
+
+        `generation_config.json` is an allowlisted `.json`, so it is hashed into the committed
+        identity — but hashing is not freezing. `from_pretrained` loads it into
+        `model.generation_config`, and passing only max_new_tokens/do_sample/pad_token_id left
+        `num_beams`, `bad_words_ids`, `sequence_bias`, `suppress_tokens`,
+        `no_repeat_ngram_size`, `renormalize_logits` and friends under miner control. That is a
+        $0 copy-the-king exploit: download the crowned bytes, add {"num_beams": 8}, and the new
+        content hash is a legitimately different artifact that beats the king on exact-match
+        span tasks with no training at all — while multiplying validator cost 8x.
+
+        Passing an explicit GenerationConfig makes the model's own config inert for the call, so
+        every submission is decoded identically. Greedy, because scoring must be reproducible."""
+        from transformers import GenerationConfig
+        return GenerationConfig(
+            max_new_tokens=max_new_tokens, min_new_tokens=0,
+            do_sample=False, num_beams=1, num_beam_groups=1,
+            temperature=1.0, top_k=0, top_p=1.0, typical_p=1.0,
+            repetition_penalty=1.0, encoder_repetition_penalty=1.0, length_penalty=1.0,
+            no_repeat_ngram_size=0, bad_words_ids=None, force_words_ids=None,
+            sequence_bias=None, suppress_tokens=None, begin_suppress_tokens=None,
+            forced_bos_token_id=None, forced_eos_token_id=None, forced_decoder_ids=None,
+            exponential_decay_length_penalty=None, renormalize_logits=False,
+            early_stopping=False, use_cache=True,
+            pad_token_id=self._tok.pad_token_id, eos_token_id=self._tok.eos_token_id,
+        )
+
     def _render(self, prompt: str) -> str:
         try:
             return self._tok.apply_chat_template(
@@ -78,8 +106,7 @@ class HFRunner:
             batch = texts[i:i + self._batch_size]
             enc = self._tok(batch, return_tensors="pt", padding=True, truncation=False).to(self._model.device)
             with torch.no_grad():
-                gen = self._model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
-                                           pad_token_id=self._tok.pad_token_id)
+                gen = self._model.generate(**enc, generation_config=self._gen_config(max_new_tokens))
             new = gen[:, enc["input_ids"].shape[1]:]
             outs.extend(self._tok.batch_decode(new, skip_special_tokens=True))
         return outs
@@ -94,9 +121,9 @@ class HFRunner:
             batch = texts[i:i + self._batch_size]
             enc = self._tok(batch, return_tensors="pt", padding=True, truncation=False).to(self._model.device)
             with torch.no_grad():
-                # greedy: scoring must be reproducible
-                gen = self._model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
-                                           pad_token_id=self._tok.pad_token_id)
+                # validator-owned decode: the miner's generation_config.json cannot influence
+                # scoring (see _gen_config — hashed is not frozen).
+                gen = self._model.generate(**enc, generation_config=self._gen_config(max_new_tokens))
             # left-padded -> every row's prompt ends at the same column; slice uniformly
             new = gen[:, enc["input_ids"].shape[1]:]
             outs.extend(self._tok.batch_decode(new, skip_special_tokens=True))

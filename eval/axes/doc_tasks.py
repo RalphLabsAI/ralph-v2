@@ -29,8 +29,7 @@ import random
 import re
 
 from ..core import Item
-
-_NUM = re.compile(r"(?<![\w.])\d{2,}(?![\w.])")
+from ..textnorm import NUM_RE as _NUM, make_anchor, norm_digits, same_number
 
 
 def _anchored(text: str, m, anchor_len: int) -> str | None:
@@ -42,13 +41,7 @@ def _anchored(text: str, m, anchor_len: int) -> str | None:
     and an anchor containing one silently breaks the delimiters so the model cannot tell where
     the anchor ends. Found on real fineweb text, and it is the same fairness bug class as an
     unsatisfiable constraint — the teacher fails it too."""
-    before = text[:m.start()].split()[-anchor_len:]
-    if len(before) < anchor_len:
-        return None
-    anchor = " ".join(before)
-    if any(c in anchor for c in '"“”\n\r'):
-        return None
-    return anchor if text.count(anchor) == 1 else None
+    return make_anchor(text, m.start(), anchor_len)
 
 
 def _pairs(doc, rng, anchor_len: int):
@@ -58,7 +51,7 @@ def _pairs(doc, rng, anchor_len: int):
         a = _anchored(doc.text, m, anchor_len)
         if a is not None:
             try:
-                out.append((a, int(m.group())))
+                out.append((a, int(norm_digits(m.group()))))
             except ValueError:
                 pass
     rng.shuffle(out)
@@ -110,7 +103,7 @@ class NumericComposition:
         return items
 
     def check(self, item: Item, output: str) -> bool:
-        return _num_answer(output) == str(item.answer)
+        return same_number(_num_answer(output), item.answer)
 
 
 class LongContextReal:
@@ -166,7 +159,7 @@ class LongContextReal:
         return items
 
     def check(self, item: Item, output: str) -> bool:
-        return _num_answer(output) == str(item.answer)
+        return same_number(_num_answer(output), item.answer)
 
 
 class ConstrainedExtraction:
@@ -220,18 +213,22 @@ class ConstrainedExtraction:
         spec = item.answer
         body = output.strip()
         want, sh = spec["vals"], spec["shape"]
+        # compare NUMERICALLY element-wise: an Arabic passage renders gold as Arabic-Indic while
+        # a model may answer in ASCII. Shape is still exact — that half is the point of the axis.
+        def eq(got: list) -> bool:
+            return len(got) == len(want) and all(same_number(g, w) for g, w in zip(got, want))
+
         if sh == "csv":
             line = body.splitlines()[0].strip() if body.splitlines() else ""
-            return [p.strip() for p in line.split(",")] == want
+            return eq([p.strip() for p in line.split(",")])
         if sh == "lines":
-            got = [ln.strip() for ln in body.splitlines() if ln.strip()]
-            return got == want
+            return eq([ln.strip() for ln in body.splitlines() if ln.strip()])
         m = re.search(r"\[.*?\]", body, re.S)
         if not m:
             return False
         try:
             import json as _json
-            return [str(x) for x in _json.loads(m.group())] == want
+            return eq([str(x) for x in _json.loads(m.group())])
         except Exception:
             return False
 
@@ -248,5 +245,6 @@ def _num_answer(output: str) -> str | None:
         return None
     else:
         seg = output
+    seg = norm_digits(seg)
     m = re.search(r"-?\d[\d,]*", seg)
     return m.group().replace(",", "") if m else None

@@ -1255,6 +1255,52 @@ def test_king_is_revalidated_and_vacated():
     assert tour.kings["t"].model_id == "new", f"throne not re-crowned: {tour.kings.get('t')}"
 
 
+def test_script_aware_numbers():
+    """The multilingual axis is the only one a cloned artifact loses on, and two bugs made it
+    a no-op — both invisible on English test data:
+
+    1. `(?<![\\w.])\\d{2,}(?![\\w.])` finds NOTHING in unspaced CJK, because Python's `\\w`
+       matches Han. Chinese web text is predominantly unspaced, so cmn_Hani (35% of the mix)
+       minted ZERO items. Verified on real fineweb-2 text: 0 probes before, 12 after.
+    2. Arabic renders numerals as Arabic-Indic (٢٠٢٤). Those matched `\\d` and became the GOLD,
+       so a model correctly answering 2024 was scored WRONG. The axis punished the right answer.
+    """
+    from eval.axes.extractive import ExtractiveQA
+    from eval.corpus import Doc
+    from eval.textnorm import find_numbers, norm_digits, same_number
+
+    def nums(t):
+        return [m.group() for m, _ in find_numbers(t)]
+
+    # digits embedded in non-Latin script must be found
+    assert nums("公司在2024年宣布了新的政策") == ["2024"], "CJK digits still invisible"
+    assert nums("компания в 2024 году") == ["2024"]
+    assert nums("أعلنت الشركة ٢٠٢٤ عن خطط") == ["٢٠٢٤"], "Arabic-Indic not found"
+    assert nums("売上は１２３４でした") == ["１２３４"], "fullwidth digits not found"
+    # ...but a digit run glued to an ASCII token, or a decimal, is still not a standalone number
+    assert nums("abc123 and 1.5 and x9y") == [], "Latin-token veto regressed"
+
+    # numeric equality across digit families and separators
+    assert same_number("2024", "٢٠٢٤") and same_number("2,024", "2024")
+    assert same_number("１２３４", "1234")
+    assert not same_number("2024", "2025")
+    assert norm_digits("٢٠٢٤") == "2024"
+
+    # end-to-end: a CJK document must mint a probe, and an ASCII answer to an
+    # Arabic-Indic gold must be accepted
+    zh = Doc("zh1", "公司在2024年宣布了新的政策和计划。该项目预计在2031年完成建设工作。", 100)
+    ar = Doc("ar1", "أعلنت الشركة عن أرباح ٢٠٢٤ في التقرير السنوي الجديد لهذا العام كله.", 100)
+    ax = ExtractiveQA([zh, ar], kinds=("number",))
+    items = ax.generate(seed=3, n=8, difficulty=1)
+    assert any(i.meta["doc"] == "zh1" for i in items), "no probe minted from CJK document"
+    for it in items:
+        assert ax.check(it, f"Answer: {it.answer}"), "verbatim gold rejected"
+        # the model normalizing to ASCII must still be scored correct
+        assert ax.check(it, f"Answer: {norm_digits(str(it.answer))}"), \
+            f"ASCII answer rejected for gold {it.answer!r}"
+        assert not ax.check(it, "Answer: 5150")
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1271,6 +1317,7 @@ def main() -> int:
              test_corpus_swap_invariance, test_surprise_axis_selection,
              test_surprise_selection_in_crown_round, test_doc_task_axes,
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
+             test_script_aware_numbers,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

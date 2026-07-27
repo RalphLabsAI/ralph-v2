@@ -38,6 +38,11 @@ _DTYPE_BITS = {
     "F64": 64, "F32": 32, "F16": 16, "BF16": 16, "F8_E4M3": 8, "F8_E5M2": 8,
     "I64": 64, "I32": 32, "I16": 16, "I8": 8, "U8": 8, "BOOL": 8,
     "I4": 4, "U4": 4,
+    # unsigned packing widths used by real quantized artifacts (MLX packs weights into U32,
+    # GPTQ/AWQ into I32/U16). Their absence made `.get(dt, 16)` fail OPEN: an MLX U32 pack
+    # reported 16.0 bpw and sailed through a 16-bit tier, while a GPTQ I32 pack reported 32
+    # and was rejected — the gate punished the deployable form and rewarded the container.
+    "U16": 16, "U32": 32, "U64": 64,
 }
 
 
@@ -117,7 +122,12 @@ def inspect_checkpoint(ckpt_dir: str | Path) -> Inspection:
             for s in shape:
                 n *= s
             params += n
-            bits = _DTYPE_BITS.get(dt, 16)
+            if dt not in _DTYPE_BITS:
+                # HARD REJECT on an unknown dtype rather than assuming 16. Guessing here is how
+                # an unrecognized packing silently understates its own bit budget.
+                reasons.append(f"unknown dtype {dt!r} in {p.name} — cannot verify bit budget")
+                continue
+            bits = _DTYPE_BITS[dt]
             bits_total += n * bits
             hist[dt] = hist.get(dt, 0) + n
 
