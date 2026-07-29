@@ -1668,6 +1668,93 @@ def test_step_extraction():
     assert pool_rows() > 10_000_000, pool_rows()
 
 
+def test_observer_round():
+    """The round: four of the five rollouts are miner-INDEPENDENT and must be computed once,
+    so an extra miner costs one generation plus one forward pass. Also pins the properties that
+    make the round fair — the observer is drawn post-commit, and the discard decision is made
+    before any miner is involved."""
+    from eval.observer_round import (build_shared, pick_observer, score_submission)
+    from eval.steps import Trajectory
+
+    calls = {"parent": 0, "obs_dist": 0, "obs_gen": 0, "miner": 0}
+
+    def d(a, b, c):
+        return {"a": a, "b": b, "c": c}
+
+    class StubObserver:
+        """Predicts from whatever step is glued to the prefix: 'X' -> peaked on a, 'Y' -> on c,
+        nothing -> flat. That makes 'same effect' and 'different effect' controllable."""
+        def generate(self, prompts, max_new_tokens=128):
+            calls["obs_gen"] += 1
+            return ["cont cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            calls["obs_dist"] += 1
+            if prefix.rstrip().endswith("X"):
+                return [d(0.8, 0.1, 0.1)] * 6
+            if prefix.rstrip().endswith("Y"):
+                return [d(0.1, 0.1, 0.8)] * 6
+            return [d(0.34, 0.33, 0.33)] * 6      # unconditioned baseline
+
+    class StubStepper:
+        def __init__(self, tok, who):
+            self.tok, self.who = tok, who
+
+        def generate(self, prompts, max_new_tokens=256):
+            calls[self.who] += 1
+            return [self.tok] * len(prompts)
+
+    # 12 samples at one depth so a single slice clears min_per_slice=8; the thin-slice guard
+    # is exercised separately below.
+    trajs = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"prefix {i}", step="ref",
+                        index=0) for i in range(12)]
+    obs = StubObserver()
+    parent = StubStepper("X", "parent")
+
+    shared = build_shared(trajs, parent, obs, observer_name="qwen")
+    assert len(shared) == 12 and all(s.usable for s in shared), [s.reason for s in shared]
+    # ONE batched parent call for all trajectories, not one per trajectory
+    assert calls["parent"] == 1, calls
+    parent_dist_calls = calls["obs_dist"]
+
+    # a miner reproducing the parent's effect scores ~1; a miner moving the observer elsewhere
+    # scores far lower — and neither is compared on WORDING, only on effect
+    good = score_submission(shared, StubStepper("X", "miner"), obs)
+    bad = score_submission(shared, StubStepper("Y", "miner"), obs)
+    assert good.score > 0.99, good.as_dict()
+    assert bad.score < 0.2, bad.as_dict()
+    assert good.n_scored == 12 and good.n_discarded == 0
+
+    # PER-MINER COST: one generation call, and one observer pass per usable sample. The parent
+    # rollouts, C, P_G and P_0 are NOT recomputed.
+    before = calls["obs_dist"]
+    _ = score_submission(shared, StubStepper("X", "miner"), obs)
+    assert calls["obs_dist"] - before == 12, "shared rollouts were recomputed per miner"
+    assert calls["parent"] == 1, "parent re-rolled for a later miner"
+
+    # an EMPTY miner step is inert, and must be SCORED as such rather than discarded —
+    # otherwise saying nothing is a way to dodge the hard samples
+    empty = score_submission(shared, StubStepper("", "miner"), obs)
+    assert empty.n_discarded == 0, empty.as_dict()
+    assert empty.score == 0.0 and any("inert" in r for r in empty.reasons), empty.as_dict()
+
+    # DISCARD IS DECIDED BEFORE ANY MINER RUNS: if the PARENT does not move the observer, the
+    # sample is unusable for everyone, and no miner can influence that
+    flat_parent = build_shared(trajs, StubStepper("", "parent"), obs, "qwen")
+    assert all(not s.usable for s in flat_parent), [s.reason for s in flat_parent]
+
+    # OBSERVER DRAWN POST-COMMIT: reproducible for an auditor, unpredictable before the nonce
+    pool = ["kimi", "qwen", "llama", "mistral"]
+    assert pick_observer("root", "n1", pool) == pick_observer("root", "n1", pool)
+    picks = {pick_observer("root", f"n{i}", pool) for i in range(40)}
+    assert len(picks) > 1, "observer never changes with the nonce"
+    assert picks <= set(pool)
+
+    # a slice too thin to trust must not decide the crown
+    thin = score_submission(shared[:4], StubStepper("X", "miner"), obs)
+    assert thin.score == 0.0 and any("slice" in r for r in thin.reasons), thin.as_dict()
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1685,7 +1772,7 @@ def main() -> int:
              test_surprise_selection_in_crown_round, test_doc_task_axes,
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
              test_script_aware_numbers, test_gguf_intake, test_pinned_parent,
-             test_observer_kl_step_scoring, test_step_extraction,
+             test_observer_kl_step_scoring, test_step_extraction, test_observer_round,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
