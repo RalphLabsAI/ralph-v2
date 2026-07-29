@@ -1,8 +1,8 @@
 # SN40 v2 — The Model Compression Subnet
 
-**One line:** miners compress a frontier open model — starting with **GLM** — into a small
-student that keeps the teacher's *capability*; the best student per size tier wears a crown,
-and every crown ships as a downloadable open model.
+**One line:** miners compress a pinned open model — starting with **GLM** — to a low bit budget
+with its architecture unchanged; the best compression per bit tier wears a crown, and every
+crown ships as a downloadable, runnable open model.
 
 **Reference point:** PrismML's Ternary Bonsai showed what one lab gets from aggressive
 compression (much smaller, faster, HF-trending). v2 makes that a standing market — a
@@ -12,48 +12,66 @@ the public lessons of earlier distillation-KOTH attempts
 
 ## How it works
 
-Fix a **(teacher, permitted student-base) pair** — the pair, not just the teacher, because
-*match beats strength* (OpenThoughts, [arXiv:2506.04178](https://arxiv.org/abs/2506.04178)
-Table 8: QwQ-32B is a better teacher than the stronger DeepSeek-R1). Miners submit a
-**student checkpoint** into a size tier. The validator scores the artifact itself — download
-it, measure what it can do — and never inspects or trusts the private training process.
+The task is **PrismML/Bonsai's task**: take one **pinned parent** model, leave the architecture
+untouched, and re-store its weights at a low bit budget. Miners submit a compressed checkpoint
+(safetensors **or GGUF**) into a bit tier. The validator scores the artifact itself and never
+inspects or trusts the private training process.
 
 Each round:
 
-1. **Front door** — economics → safety inspect (safetensors-only, no remote code, params/
-   bits from tensor headers) → tier fit → **content-hash + commit-reveal** (you're judged on
-   the exact bytes you committed to; no bait-and-switch). No untrusted weights load until all
-   of this passes.
-2. **Score** — the crown is decided on **real, post-commit content** (see below). GLM authors
-   the reference on the same items, then the student and the reigning king answer them.
-3. **Aggregate** — per-axis normalized retention `(student − base) / (teacher − base)` on the
-   items GLM itself passes, combined **worst-domain** (soft-min). Your weakest axis is your
-   score. Cap 1.25 (beating the teacher is the interesting case); negative retention on any
-   axis is an automatic reject.
-4. **Crown** — KOTH dethrone-on-margin, plus a signed reproducible round record.
+1. **Front door** — economics → safety inspect (no pickles, no remote code) → **bit budget
+   measured from the tensor data** → **pinned-parent shape check** → **content-hash +
+   commit-reveal**. No untrusted weights load until all of it passes.
+2. **Score** — observer-KL over trajectory steps (below).
+3. **Crown** — KOTH, incumbent re-scored *and re-gated* every round, dethrone on a paired
+   bootstrap lower bound of the worst-slice difference — **and refused if the margin sits inside
+   the validator's own measured noise floor.**
+4. **Publish** — a signed, reproducible round record.
 
-## The crown is real∩verifiable, not synthetic generators
+## The crown: semantic equivalence by downstream effect
 
-Every distillation-KOTH before this (SN97/Distil's own post-mortem is explicit about it) got
-gamed the same way: score on a **synthetic/procedural generator**, and a miner learns the
-*generator* — a cheap specialist that aces every "fresh" instance without retaining the
-teacher's capability. Freshness of *instances* doesn't help: the generator is public, so
-there is no held-out information. The score climbs while real capability stays flat (Goodhart;
-GSM-Symbolic / GSM1k / RULER all show the same decoupling).
+Every distillation-KOTH before this got gamed the same way. Score **token agreement with the
+teacher** and you pay for *style*: SN97's KL-crowned king mimicked "wait, let me reconsider"
+filler, never produced an answer, and was worse than the un-finetuned base on 5/5 reasoning
+benchmarks. Score **generated questions** and you pay for question-answering: probe formats are
+public, so fitting them is a cheap narrow skill that transfers to nothing.
 
-So the crown is set by a **deterministic checker over REAL text that is fresh after the
-commit**, the one place where CPU-auditable *and* un-pre-distillable both hold:
+So we score neither. Two steps are equivalent when they move an **independent observer** into
+the same predictive state:
 
-| role | axis | checker |
-|---|---|---|
-| **crown** | **extractive QA over fresh real docs** | the answer is a **verbatim span in the document** — exact-match, no judge, no KL. A doc published *after* the seal carries information the miner could not have distilled. |
-| floor | math / code / instruction / long-context / multi-hop | the synthetic generators — deterministic, but the distribution is closed. **Demoted to a liveness/calibration floor:** they gate (a broken or degenerate student is disqualified) but **cannot set the crown.** |
+1. From trajectory prefix `K`, the **pinned parent** produces its step, and so does the miner.
+2. The observer continues from `K + parent_step`; call that continuation `C`.
+3. Measure the observer's per-position distribution over **the same `C`**, conditioned on
+   `K + parent_step`, on `K + miner_step`, and on `K` alone.
 
-A wrong answer fails the checker no matter how GLM-like it reads, so **style earns nothing**
-(no KL in the reward — bring any KL you like to your *trainer*). And because the crown rides
-on the fresh-real axis, a generator-specialist that aces every synthetic floor axis but reads
-fresh documents only at base level is **not crownable** — necessity, not just sufficiency, is
-tested (`tests/test_crown_path.py::test_generator_specialist_denied_crown`).
+That gives disagreement `s`, parent effect `d_G`, and miner effect `d_A`. The score rewards
+**effect similarity** (low `s`) and **effect magnitude** (low `|d_A − d_G|`), both normalised by
+`d_G` so the metric is scale-invariant across trajectories.
+
+**There is no style channel.** A paraphrase carrying the same information scores 0.80; doing
+nothing scores 0.14; moving the observer the wrong way scores 0.02. Miners cannot overfit to
+GLM's wording — they have to extract the information GLM added at that step.
+
+Three properties that keep it fair, each pinned by a test:
+
+- **The observer is drawn from the round nonce**, so a miner cannot pre-fit which observer it
+  will face.
+- **Discards are decided by the parent's effect alone.** Samples where the parent moves the
+  observer nowhere carry no signal and are dropped — but never based on miner output, or a miner
+  could bury its hard samples by emitting bland steps.
+- **Worst-slice aggregation** over (observer × language × depth), so a strong slice cannot buy a
+  weak one.
+
+Scale is the anti-overfit lever, and here it works for a specific reason: the pre-fit attack is
+"memorize the parent's step at every `K`", which requires running the parent across the corpus
+and training the student to match — **that is distillation**. The cheat and the job are the same
+activity. ~42M verified trajectories across reasoning, agentic-code, dialogue and non-Latin
+sources ([`eval/steps.py`](eval/steps.py)); SWE-ZERO is deduped to ≤5 rollouts per task because
+its 12.29M rows are only ~122,908 unique pull requests.
+
+The old capability axes remain as a cheap **canary**, not the crown, because observer-KL is
+structurally blind to exactly one failure: a student that moves the observer correctly while
+being unusable.
 
 ## Anti-gaming — economics, not detection
 
@@ -78,41 +96,45 @@ The last team proved you **cannot detect** copying on a shared base. v2 makes ga
 
 ## The honest claim
 
-The crown certifies **verifiable capability retention of GLM** across a broad, freshly-minted
-distribution. It does *not* certify "is specifically a compressed GLM" — no behavioral eval
-can prove lineage (a different, equally-capable model passes the same checkers). We claim
-exactly what the eval proves.
+The crown certifies that a submitted artifact, at a **measured bit budget**, adds
+**approximately the same information to a trajectory as the pinned parent does**, as judged by
+independent observer models on trajectories the miner did not choose.
 
-## Roadmap (not yet built)
+It does *not* certify lineage. The pinned-parent check is a shape/architecture ADMISSION gate,
+not a proof of descent — nothing behavioural can prove descent, since a different model of
+identical shape would pass the same checks. And observer-KL measures informational equivalence,
+not capability: a student could move the observer correctly and still be unusable. That is the
+one blind spot, it is why the capability canary is kept, and we claim exactly what the eval
+proves and no more.
 
-The current subnet crowns capability retention per size tier. These are designed but not
-implemented, and the code does not claim them:
+## Not yet done — read this before running it anywhere real
 
-- **Bit-tier structure + capability-per-compute** — 1.58/2/4-bit tiers, effective-bits audit
-  by recompression, and a compute denominator (teacher generation + training + scoring FLOPs,
-  reconciled) in the ranking. Today: size tiers, compute declared-not-ranked.
-- **pass@k gate** — a mode-collapse detector (pass@1 can't see it); needs a determinism
-  redesign (seeded sampling) before it's turned on. Currently a no-op.
-- **Throughput attestation** — a non-forgeable "runs this fast on real hardware" bonus
-  (reusing Ralph's TDX+H100-CC stack).
-- **Live post-commit corpus feed + provenance** — the extractive crown axis and the
-  genre-overfit gate are built and run on a timestamped dataset (CC-News); the un-pre-
-  distillability guarantee needs the fresh half to come from a *live* post-commit feed with
-  source-provenance attestation and a grind-resistant randomness beacon for the round nonce.
-  This is the load-bearing remaining infra.
-- **Real-repo code axis** — a second crown axis: fresh commits + their real test suites (run
-  the tests = deterministic, un-pre-distillable), pinned dependency snapshot, sandboxed.
-- **Delivery** — GGUF / "run the king on your phone", GLM-4.5-Air as a second rung,
-  first-committer-wins + delayed reveal, never-shrink ratchet.
-- **Chain integration** — the round is wired to a `ChainIO` boundary and tested against a
-  fake chain; the live-validator wiring + testnet shakedown is the remaining engineering.
+The mechanism is complete and tested end to end against a fake chain. What has **not** happened:
+
+- **No run with real models, ever.** Every number in this repo comes from stubs or from real
+  *data*; parent + observer + a genuinely quantized student on a GPU has never been executed
+  once. Four of the last five real bugs here only appeared against real inputs, so expect that
+  first run to surface more.
+- **The noise floor is unmeasured.** `eval/determinism.py` gates crowns on it, but the number
+  itself needs a GPU run. SN97 measured 2-5 percentage points of run-to-run variance on
+  logit-derived metrics; if ours lands there, the crown may be unable to resolve honest
+  differences and the aggregation needs retuning. **This single number decides whether the
+  mechanism works.**
+- **No artifact locator.** A crown publishes a content hash with no `artifact_uri` and no
+  per-file manifest, so there is no path from "king" to bytes you can download.
+- **No miner has ever submitted anything.** The end-to-end submission flow is untested by a
+  third party.
+- **Chain integration is FakeChain only**, and the validator box needs `bubblewrap` for the
+  sandboxed code canary.
+- **`eval/budget.py`** (score-at-budget / convergence gate) is written and tested but not wired
+  into the crown path.
 
 ## Run it
 
 ```bash
 pip install -r requirements.txt        # one dep for the tests: pynacl
-python -m tests.test_crown_path        # 33/33, CPU (incl. the generator-specialist denial)
-python -m eval.run_capability_axis     # real GLM + student ladder: per-axis retention, crown
+python -m tests.test_crown_path        # 41/41, CPU
+python -m eval.run_capability_axis     # the capability CANARY on real models (GPU)
 python -m eval.shadow_axis_epoch       # the full operator epoch end to end (fake chain)
 ```
 
