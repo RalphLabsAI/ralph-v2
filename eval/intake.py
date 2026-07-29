@@ -29,6 +29,8 @@ class IntakeDecision:
     content_hash: str = ""
     # measured bit budget (bitrate.BitReport) when the tier declares one. None = not measured.
     bits: object = None
+    # parent.ParentCheck when the tier pins a parent. None = no parent declared.
+    parent: object = None
 
 
 def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | None = None,
@@ -76,6 +78,17 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
     else:
         bits_report = None
 
+    # 3c. PINNED PARENT. The task is "compress this specific model, architecture unchanged", so
+    #     an artifact that is not shape-compatible with the tier's parent is not a submission to
+    #     this tier at all. Header-only. Not a provenance proof — no behavioural test can be —
+    #     but it stops a foreign artifact being scored against a denominator it never had.
+    parent_check = None
+    if getattr(tier, "parent", None) is not None:
+        from .parent import parent_compat
+        parent_check = parent_compat(ckpt_dir, tier.parent, inspection=insp)
+        if not parent_check.ok:
+            return IntakeDecision(False, insp, reasons=parent_check.reasons, bits=bits_report)
+
     # 4. identity: content-hash the artifact, and fetch-verify it against the commitment
     #    when one was supplied. Done before any runner is built (no untrusted load yet).
     from .identity import content_hash, verify_reveal
@@ -93,4 +106,5 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
     # accepted — record the submission (degeneracy + pass@k gates run later, on outputs)
     if ledger is not None:
         ledger.record(hotkey, coldkey, bond_posted)
-    return IntakeDecision(True, insp, reasons=[], content_hash=chash, bits=bits_report)
+    return IntakeDecision(True, insp, reasons=[], content_hash=chash, bits=bits_report,
+                          parent=parent_check)

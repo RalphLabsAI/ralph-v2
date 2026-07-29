@@ -1436,6 +1436,74 @@ def test_gguf_intake():
         assert not read_gguf(Path(d) / "model.gguf").ok
 
 
+def test_pinned_parent():
+    """The task is "compress THIS model, architecture unchanged" — Bonsai's actual shape. Pinning
+    the parent is what makes the score well-defined:
+
+      * scoring against the MINER'S DECLARED parent invites weak-parent farming (declare a
+        lobotomised parent, retention -> 1.0; the degenerate limit is parent == student);
+      * scoring absolute capability rewards the strongest artifact from anywhere, which is the
+        clone attack in a tie;
+      * scoring against a PINNED parent is identical for every miner in the tier and the miner
+        does not choose the denominator.
+
+    Header-only, so it costs nothing. It is an ADMISSION gate, not provenance — nothing here
+    proves descent, and no behavioural test can."""
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.gates import TierBudget
+    from eval.intake import intake
+    from eval.parent import PARENTS, ParentSpec, parent_compat
+
+    def write_gguf(path, params_per_tensor, n_tensors, arch, ggml_type=35):
+        out = bytearray(b"GGUF" + struct.pack("<I", 3))
+        out += struct.pack("<QQ", n_tensors, 1)
+        k = b"general.architecture"
+        out += struct.pack("<Q", len(k)) + k + struct.pack("<I", 8)
+        v = arch.encode()
+        out += struct.pack("<Q", len(v)) + v
+        side = int(params_per_tensor ** 0.5)
+        for i in range(n_tensors):
+            nb = f"blk.{i}.attn_q.weight".encode()
+            out += struct.pack("<Q", len(nb)) + nb
+            out += struct.pack("<I", 2) + struct.pack("<QQ", side, side)
+            out += struct.pack("<I", ggml_type) + struct.pack("<Q", 0)
+        Path(path).write_bytes(bytes(out))
+
+    spec = ParentSpec(name="test/parent-8b", arch="qwen2", weight_params=4 * 1024 * 1024)
+
+    # the parent's own compressed forms are admitted — architecture is unchanged, only the
+    # storage width differs, so the element count is identical across quantizations
+    for tt in (35, 8, 1):                      # TQ2_0 (ternary), Q8_0, F16
+        with tempfile.TemporaryDirectory() as d:
+            write_gguf(Path(d) / "m.gguf", 1024 * 1024, 4, "qwen2", tt)
+            c = parent_compat(d, spec)
+            assert c.ok, f"honest compression of the pinned parent rejected (type {tt}): {c.reasons}"
+            assert c.measured_params == 4 * 1024 * 1024
+
+    # a FOREIGN artifact is refused, on size and on architecture
+    with tempfile.TemporaryDirectory() as d:
+        write_gguf(Path(d) / "m.gguf", 1024 * 1024, 1, "llama")
+        c = parent_compat(d, spec)
+        assert not c.ok
+        assert any("architecture" in r for r in c.reasons), c.reasons
+        assert any("params" in r for r in c.reasons), c.reasons
+
+    # and the gate is actually enforced by the front door, not merely available
+    with tempfile.TemporaryDirectory() as d:
+        write_gguf(Path(d) / "m.gguf", 1024 * 1024, 1, "llama")
+        t = TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0, parent=spec)
+        dec = intake(d, t)
+        assert not dec.accepted, "foreign artifact accepted into a pinned-parent tier"
+        t_open = TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)
+        assert intake(d, t_open).accepted, "tier without a pinned parent should still accept"
+
+    # the shipped registry entry must be a real measurement, not a placeholder
+    q = PARENTS["qwen2.5-0.5b-instruct"]
+    assert q.weight_params == 630_095_872 and q.arch == "qwen2"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1452,7 +1520,7 @@ def main() -> int:
              test_corpus_swap_invariance, test_surprise_axis_selection,
              test_surprise_selection_in_crown_round, test_doc_task_axes,
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
-             test_script_aware_numbers, test_gguf_intake,
+             test_script_aware_numbers, test_gguf_intake, test_pinned_parent,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

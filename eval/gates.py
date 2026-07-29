@@ -172,6 +172,11 @@ class TierBudget:
     # Optional bitrate.BitTier. When set, intake ALSO measures true bits/weight from the tensor
     # data, because header dtypes cannot see a 1.125-bit model inside a BF16 container.
     bit_tier: object = None
+    # Optional parent.ParentSpec. When set, intake also requires the artifact to be
+    # SHAPE-COMPATIBLE with the pinned parent — this is what makes the task "compress THIS
+    # model" rather than "submit any strong small model", and what makes retention-vs-parent
+    # mean the same thing for every submission in the tier.
+    parent: object = None
 
 
 def tier_gate(insp: Inspection, tier: TierBudget) -> tuple[bool, list[str]]:
