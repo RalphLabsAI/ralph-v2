@@ -44,6 +44,9 @@ class Commitment:
     revealed_hash: str = ""
     salt: str = ""
     committed_value: str = ""
+    # where the bytes live (hf://repo@rev, ipfs://cid, https://...). Without this a crown is an
+    # unresolvable digest and "every crown ships a downloadable model" is not deliverable.
+    artifact_uri: str = ""
 
 
 @runtime_checkable

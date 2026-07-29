@@ -1911,6 +1911,70 @@ def test_observer_epoch_end_to_end():
         assert chain.record is not None and chain.record.verify_signature()
 
 
+def test_artifact_manifest():
+    """A crown published a rolling content_hash and nothing else: an opaque digest with no
+    locator and no file list, so nobody could fetch the king or prove the published file set was
+    the scored one. For a subnet whose deliverable IS the artifact, that is the difference
+    between a leaderboard and a product.
+
+    Also closes a real hole. gates only rejects a file whose suffix is non-empty and not
+    allowlisted, and identity only hashes KNOWN suffixes — so a SUFFIX-LESS file passed
+    inspection AND escaped the hash entirely. Uninspected, unhashed bytes could ride along."""
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.artifact import build_manifest, verify_manifest
+    from eval.identity import content_hash
+
+    def make(d, n=4):
+        p = Path(d)
+        hdr = {"w": {"dtype": "F32", "shape": [n], "data_offsets": [0, 4 * n]}}
+        hb = _json.dumps(hdr).encode()
+        with open(p / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hb)) + hb + b"\0" * (4 * n))
+        (p / "config.json").write_text('{"hidden_size":8}')
+
+    with tempfile.TemporaryDirectory() as d:
+        make(d)
+        m = build_manifest(d, artifact_uri="hf://acme/bonsai-1b@abc123")
+        assert m.artifact_uri.startswith("hf://"), m.artifact_uri
+        assert m.root == content_hash(d), "manifest root must equal the committed identity"
+        assert {f.path for f in m.files} == {"model.safetensors", "config.json"}
+        assert all(f.size > 0 and len(f.sha256) == 64 for f in m.files)
+        assert m.total_bytes > 0
+        ok, why = verify_manifest(d, m)
+        assert ok, why
+        # the manifest is serialisable, so it can be published in the round record
+        assert _json.loads(m.to_json())["root"] == m.root
+
+        # ANY drift is a rejection: changed bytes...
+        (Path(d) / "config.json").write_text('{"hidden_size":9}')
+        ok2, why2 = verify_manifest(d, m)
+        assert not ok2 and any("sha256 mismatch" in r for r in why2), why2
+        (Path(d) / "config.json").write_text('{"hidden_size":8}')
+        assert verify_manifest(d, m)[0]
+
+        # ...a missing file...
+        (Path(d) / "config.json").unlink()
+        ok3, why3 = verify_manifest(d, m)
+        assert not ok3 and any("missing file" in r for r in why3), why3
+        (Path(d) / "config.json").write_text('{"hidden_size":8}')
+
+        # ...an undeclared extra weight file...
+        (Path(d) / "extra.safetensors").write_bytes(b"\x00" * 16)
+        ok4, why4 = verify_manifest(d, m)
+        assert not ok4 and any("undeclared file" in r for r in why4), why4
+        (Path(d) / "extra.safetensors").unlink()
+
+        # ...and THE STOWAWAY: a suffix-less file, which slips past both the gates allowlist
+        # and the identity hash, so the root still matches and only the manifest catches it.
+        (Path(d) / "payload").write_bytes(b"uninspected bytes")
+        assert content_hash(d) == m.root, "control: the rolling hash does NOT see this file"
+        ok5, why5 = verify_manifest(d, m)
+        assert not ok5 and any("uninspected bytes" in r for r in why5), why5
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1929,7 +1993,7 @@ def main() -> int:
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
              test_script_aware_numbers, test_gguf_intake, test_pinned_parent,
              test_observer_kl_step_scoring, test_step_extraction, test_observer_round,
-             test_determinism_gate, test_observer_epoch_end_to_end,
+             test_determinism_gate, test_observer_epoch_end_to_end, test_artifact_manifest,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
