@@ -147,6 +147,10 @@ class MinerScore:
     n_discarded: int = 0
     mean_effect: float = 0.0        # mean d_miner over scored samples — the liveness signal
     per_slice: dict = field(default_factory=dict)
+    # raw per-sample scores per slice. The KOTH dethrone test is a paired bootstrap over these
+    # vectors (koth.softmin_lcb_diff), exactly as it was over per-axis vectors — so the crown
+    # machinery, the copy-guard and the noise margin all carry over unchanged.
+    slice_samples: dict = field(default_factory=dict)
     reasons: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -180,6 +184,7 @@ def score_miner(samples: list[tuple[str, StepEffect]], alpha: float = 1.0, beta:
     for k, v in by_slice.items():
         if len(v) >= min_per_slice:
             out.per_slice[k] = sum(v) / len(v)
+            out.slice_samples[k] = v
     if not out.per_slice:
         out.reasons.append(f"no slice reached {min_per_slice} samples")
         return out

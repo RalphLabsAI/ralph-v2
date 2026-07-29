@@ -1817,6 +1817,100 @@ def test_determinism_gate():
     assert ok3, why3
 
 
+def test_observer_epoch_end_to_end():
+    """The full OBSERVER-KL epoch through the chain boundary: read commits -> draw nonce ->
+    intake (economics, safety, bit budget, pinned parent, commit-reveal) -> observer drawn from
+    the nonce -> shared rollouts -> per-miner scoring -> KOTH with the king re-gated -> noise
+    gate -> signed record -> weights on chain.
+
+    This is the test that says the pivot is WIRED rather than sitting beside the old path. Two
+    substrates is how the predecessor ended up fixing one while shipping the other, and how our
+    own overfit gate and surprise-axis selection became dead code."""
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.chain import Commitment, run_v2_observer_epoch
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.koth import Tier, Tournament
+    from eval.shadow_axis_epoch import FakeChain
+    from eval.signing import Ed25519Signer
+    from eval.steps import Trajectory
+
+    def make_ckpt(d, n):
+        p = Path(d)
+        hdr = {"w": {"dtype": "F32", "shape": [n], "data_offsets": [0, 4 * n]}}
+        hb = _json.dumps(hdr).encode()
+        with open(p / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hb)) + hb + b"\0" * (4 * n))
+        (p / "config.json").write_text('{"hidden_size":8}')
+
+    def d3(a, b, c):
+        return {"a": a, "b": b, "c": c}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            if prefix.rstrip().endswith("X"):
+                return [d3(0.8, 0.1, 0.1)] * 6
+            if prefix.rstrip().endswith("Y"):
+                return [d3(0.1, 0.1, 0.8)] * 6
+            return [d3(0.34, 0.33, 0.33)] * 6
+
+    class Step:
+        def __init__(self, tok):
+            self.tok = tok
+
+        def generate(self, prompts, max_new_tokens=256):
+            return [self.tok] * len(prompts)
+
+    with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
+        # DIFFERENT sizes: identical bytes would content-address to the SAME model_id, which
+        # is correct behaviour (an exact copy is the same artifact) but collapses the two
+        # submissions into one and makes the test vacuous.
+        make_ckpt(da, 4)
+        make_ckpt(db, 8)
+        commits, runners = [], {}
+        for i, (dd, tok) in enumerate([(da, "X"), (db, "Y")]):
+            h, salt = content_hash(dd), f"s{i}"
+            commits.append(Commitment(f"hot{i}", f"cold{i}", "t", dd, 1.0,
+                                      revealed_hash=h, salt=salt,
+                                      committed_value=commit_value(h, salt)))
+            runners[dd] = Step(tok)                    # hot0 matches the parent, hot1 does not
+
+        trajs = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"p{i}", step="ref", index=0)
+                 for i in range(12)]
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        budgets = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
+        chain = FakeChain(commits)
+        tour = Tournament(tiers, margin=0.03)
+
+        res = run_v2_observer_epoch(
+            chain, 1, trajs, Step("X"), {"kimi": Obs(), "qwen": Obs()},
+            tiers, budgets, tour, RegistrationLedger(), {},
+            make_safe_runner=lambda cd: runners[cd],
+            signer=Ed25519Signer(seed=b"o" * 32))
+
+        assert set(res.outcome.accepted) == {"hot0", "hot1"}, res.outcome.rejected
+        assert res.outcome.observer in {"kimi", "qwen"}, res.outcome.observer
+        # the miner that reproduces the parent's EFFECT wins; the one that moves the observer
+        # elsewhere does not — and neither was compared on wording
+        h0 = content_hash(da)
+        assert tour.kings["t"].model_id == h0, (tour.kings, res.outcome.scores)
+        assert res.outcome.scores[h0]["score"] > 0.9, res.outcome.scores
+        assert res.outcome.scores[content_hash(db)]["score"] < 0.3
+        # the validator measured and published its own noise floor
+        assert res.outcome.noise and "max_kl" in res.outcome.noise, res.outcome.noise
+        # chain write-back actually happened, and the record is signed
+        assert chain.weights and sum(chain.weights.values()) > 0
+        assert "t" in chain.kings
+        assert chain.record is not None and chain.record.verify_signature()
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1835,7 +1929,7 @@ def main() -> int:
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
              test_script_aware_numbers, test_gguf_intake, test_pinned_parent,
              test_observer_kl_step_scoring, test_step_extraction, test_observer_round,
-             test_determinism_gate,
+             test_determinism_gate, test_observer_epoch_end_to_end,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

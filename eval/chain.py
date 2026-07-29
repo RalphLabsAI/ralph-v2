@@ -206,6 +206,49 @@ def run_v2_axis_epoch(
     return _write_back(chain, tiers, tournament, outcome, round_no)
 
 
+def run_v2_observer_epoch(
+    chain: ChainIO, round_no: int,
+    trajectories, parent, observers: dict,
+    tiers: list[Tier], tier_budgets: dict[str, TierBudget],
+    tournament: Tournament, ledger: RegistrationLedger, registry: dict,
+    commit_window: int = 100, make_safe_runner=None, parent_id: str = "parent",
+    max_step_tokens: int = 256, max_cont_tokens: int = 128,
+    signer=None, canary=None, noise_safety: float = 3.0,
+) -> EpochResult:
+    """One v2 epoch on the OBSERVER-KL substrate — the crown path.
+
+    Same chain I/O as the axis epoch: read the commitment window, take the nonce from a block
+    drawn AFTER it closed, run the round, write back crown/weights/record. The round itself
+    draws its observer from that nonce, so which observer a miner faces is unknowable at seal
+    time (const's rotation idea, made un-pre-fittable rather than merely varied)."""
+    from .validator_observer_loop import CommittedSubmission as ObsCommitted, run_observer_round
+
+    if make_safe_runner is None:
+        from .runners import SafeStudentRunner
+        make_safe_runner = lambda cd: SafeStudentRunner(cd)
+
+    now = chain.current_block()
+    lo, hi = now - commit_window, now
+    commits = chain.read_commitments(lo, hi)
+    commit_root = chain.commit_root(lo, hi)
+    round_nonce = chain.block_hash(now)
+
+    committed = [
+        ObsCommitted(hotkey=c.hotkey, coldkey=c.coldkey, tier=c.tier, ckpt_dir=c.ckpt_dir,
+                     declared_compute_h100h=c.declared_compute_h100h, bond_posted=c.bond_posted,
+                     make_runner=(lambda cd=c.ckpt_dir: make_safe_runner(cd)),
+                     revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value)
+        for c in commits
+    ]
+    outcome = run_observer_round(
+        round_no, commit_root, round_nonce, committed, trajectories, parent, observers,
+        tiers, tier_budgets, tournament, ledger, registry, parent_id=parent_id,
+        signer=signer, max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens,
+        noise_safety=noise_safety, canary=canary,
+    )
+    return _write_back(chain, tiers, tournament, outcome, round_no)
+
+
 def _write_back(chain: ChainIO, tiers, tournament, outcome, round_no) -> EpochResult:
     """Crown per tier, set weights, publish the auditable record."""
     for tier in tiers:
