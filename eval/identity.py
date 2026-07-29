@@ -23,7 +23,8 @@ import hashlib
 from pathlib import Path
 
 # every file type that can change model behavior
-HASHED_SUFFIXES = {".safetensors", ".json", ".txt", ".model", ".tiktoken", ".vocab", ".merges"}
+HASHED_SUFFIXES = {".safetensors", ".gguf", ".json", ".txt", ".model", ".tiktoken",
+                   ".vocab", ".merges"}
 _CHUNK = 1 << 20
 
 

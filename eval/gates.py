@@ -29,6 +29,11 @@ from pathlib import Path
 
 ALLOWED_FILES = {
     ".safetensors", ".json", ".txt", ".model", ".tiktoken", ".vocab", ".merges",
+    # GGUF is the form the product actually ships in (PrismML's Bonsai releases are Q1_0 /
+    # Q2_0, and Q1_0 is upstream in llama.cpp). Admitting it is header-only — see eval/gguf.py.
+    # It is in identity.HASHED_SUFFIXES too; allowing a weight format without hashing it would
+    # unbind the weights from commit-reveal and make a post-commit swap free.
+    ".gguf",
 }
 FORBIDDEN_FILES = {".py", ".bin", ".pt", ".pth", ".pkl", ".ckpt", ".h5", ".msgpack", ".so", ".sh"}
 MAX_TOTAL_BYTES = 400 * 1024**3   # 400 GB hard cap (decompression-bomb / smuggle guard)
@@ -91,8 +96,9 @@ def inspect_checkpoint(ckpt_dir: str | Path) -> Inspection:
         elif suf and suf not in ALLOWED_FILES:
             reasons.append(f"file type not on allowlist: {p.name}")
 
-    if not st_files:
-        reasons.append("no .safetensors weights found (safetensors-only)")
+    gg_files = sorted(d.glob("*.gguf"))
+    if not st_files and not gg_files:
+        reasons.append("no weights found (.safetensors or .gguf required)")
 
     # tokenizer must not carry remote code
     for cfg in ("tokenizer_config.json", "config.json"):
@@ -104,6 +110,26 @@ def inspect_checkpoint(ckpt_dir: str | Path) -> Inspection:
                     reasons.append(f"{cfg} carries auto_map/custom code (trust_remote_code path)")
             except Exception:
                 reasons.append(f"unparseable {cfg}")
+
+    # GGUF artifact: params + TRUE bits/weight come from the per-tensor ggml types, which is
+    # exact arithmetic (each type has a fixed block size and bytes-per-block) rather than the
+    # inference the safetensors path has to do. Header-only, no native parser — see eval/gguf.py.
+    if gg_files and not st_files:
+        from .gguf import read_gguf
+        params, bits_total, hist = 0, 0.0, {}
+        for g in gg_files:
+            gi = read_gguf(g)
+            if not gi.ok:
+                reasons.extend(f"{g.name}: {r}" for r in gi.reasons)
+                continue
+            params += gi.params
+            bits_total += gi.bits_per_weight * gi.params
+            for k, v in gi.type_hist.items():
+                hist[k] = hist.get(k, 0) + v
+        eff = (bits_total / params) if params else 0.0
+        return Inspection(ok=(not reasons and params > 0), params=params,
+                          serialized_bytes=total, effective_bits_per_param=round(eff, 4),
+                          dtype_hist=hist, reasons=reasons)
 
     # integrity: recompute params + effective bits from the tensor headers
     params, bits_total, hist = 0, 0, {}

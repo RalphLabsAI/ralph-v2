@@ -1359,6 +1359,83 @@ def test_script_aware_numbers():
         assert not ax.check(it, "Answer: 5150")
 
 
+def test_gguf_intake():
+    """The subnet's deliverable is a checkpoint that RUNS on a phone, and the format that ships
+    is GGUF (PrismML's Bonsai releases are Q1_0 / Q2_0). Intake was safetensors-only, so the only
+    sub-2-bit form that survived was their BF16 `-unpacked` container — the free clone vector.
+    The subnet could not receive its own product.
+
+    Header-only parse, no native parser. GGUF also gives EXACT bits/weight, because each ggml
+    type has a fixed block size and bytes-per-block — no sampling or level counting needed."""
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.gates import inspect_checkpoint
+    from eval.gguf import GGML_TYPES, read_gguf, type_bits
+    from eval.identity import HASHED_SUFFIXES, content_hash
+
+    # published block layouts must give the published widths
+    assert type_bits(8) == 8.5, "Q8_0 != 8.5 bpw"
+    assert abs(type_bits(34) - 1.6875) < 1e-9, "TQ1_0 != 1.6875 bpw"
+    assert abs(type_bits(35) - 2.0625) < 1e-9, "TQ2_0 != 2.0625 bpw"
+    assert type_bits(1) == 16.0 and type_bits(0) == 32.0
+    assert type_bits(9999) is None, "unknown ggml type must not be guessed"
+
+    # a weight format that is allowed but NOT hashed would unbind weights from commit-reveal
+    # and make a post-commit swap free — the two lists must move together.
+    assert ".gguf" in HASHED_SUFFIXES, "gguf allowed at intake but excluded from the identity hash"
+
+    def write_gguf(path, tensors, arch="qwen2"):
+        """Minimal valid GGUF: magic, version, counts, one metadata string, tensor table."""
+        out = bytearray(b"GGUF" + struct.pack("<I", 3))
+        out += struct.pack("<QQ", len(tensors), 1)
+        k = b"general.architecture"
+        out += struct.pack("<Q", len(k)) + k + struct.pack("<I", 8)
+        v = arch.encode()
+        out += struct.pack("<Q", len(v)) + v
+        for name, (dims, tt) in tensors.items():
+            nb = name.encode()
+            out += struct.pack("<Q", len(nb)) + nb
+            out += struct.pack("<I", len(dims)) + struct.pack(f"<{len(dims)}Q", *dims)
+            out += struct.pack("<I", tt) + struct.pack("<Q", 0)
+        Path(path).write_bytes(bytes(out))
+
+    with tempfile.TemporaryDirectory() as d:
+        # ternary body (TQ2_0) with an fp16 output head — the mixed-precision shape real
+        # quantized artifacts have, and the reason an advertised label understates true bpw.
+        write_gguf(Path(d) / "model.gguf", {
+            "blk.0.attn_q.weight": ((4096, 4096), 35),
+            "blk.0.ffn_down.weight": ((4096, 4096), 35),
+            "output.weight": ((4096, 4096), 1),
+            "blk.0.attn_norm.weight": ((4096,), 0),      # 1-D: the negligible tail, excluded
+        })
+        gi = read_gguf(Path(d) / "model.gguf")
+        assert gi.ok, gi.reasons
+        assert gi.arch == "qwen2" and gi.n_tensors == 4
+        # (2 x 1.6875... no: TQ2_0 = 2.0625) two ternary tensors + one fp16 head
+        expect = (2 * 2.0625 + 16.0) / 3
+        assert abs(gi.bits_per_weight - expect) < 1e-3, f"{gi.bits_per_weight} != {expect}"
+
+        (Path(d) / "config.json").write_text('{"hidden_size":4096}')
+        insp = inspect_checkpoint(d)
+        assert insp.ok, insp.reasons
+        assert insp.params == 3 * 4096 * 4096, insp.params
+        assert abs(insp.effective_bits_per_param - expect) < 1e-3
+        # the artifact must be covered by the identity hash
+        assert content_hash(d)
+
+    # an unknown ggml type is a HARD REJECT, never a guessed width
+    with tempfile.TemporaryDirectory() as d:
+        write_gguf(Path(d) / "model.gguf", {"blk.0.attn_q.weight": ((256, 256), 250)})
+        gi = read_gguf(Path(d) / "model.gguf")
+        assert not gi.ok and any("unknown ggml type" in r for r in gi.reasons), gi.reasons
+
+    # a truncated / non-GGUF file must fail closed rather than raise
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "model.gguf").write_bytes(b"NOTGGUF" + b"\x00" * 32)
+        assert not read_gguf(Path(d) / "model.gguf").ok
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1375,7 +1452,7 @@ def main() -> int:
              test_corpus_swap_invariance, test_surprise_axis_selection,
              test_surprise_selection_in_crown_round, test_doc_task_axes,
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
-             test_script_aware_numbers,
+             test_script_aware_numbers, test_gguf_intake,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
