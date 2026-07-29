@@ -10,6 +10,7 @@ genuine improvement dethrones), and the deterministic long-context checker.
 """
 from __future__ import annotations
 
+import math
 import random
 import re
 
@@ -1504,6 +1505,96 @@ def test_pinned_parent():
     assert q.weight_params == 630_095_872 and q.arch == "qwen2"
 
 
+def test_observer_kl_step_scoring():
+    """Observer-KL: two steps are equivalent when they move an INDEPENDENT observer into the
+    same predictive state. Scored on downstream EFFECT, never on wording — which is why the
+    style-mimicry that beat SN97's KL crown has no channel here.
+
+    Written to break it, not to confirm it. Every case below is a way a miner could try to win
+    without carrying the teacher's information."""
+    from eval.observer_kl import (MIN_TEACHER_EFFECT, StepEffect, kl, sample_score,
+                                  score_miner, step_effect)
+
+    def dist(**kw):
+        return dict(kw)
+
+    # --- the KL primitive on sparse top-k supports ---
+    assert kl(dist(a=1.0), dist(a=1.0)) == 0.0, "identical distributions must score 0"
+    assert kl(dist(a=0.9, b=0.1), dist(a=0.1, b=0.9)) > 0.5
+    # a token one side proposes and the other never did must cost something FINITE
+    only = kl(dist(z=1.0), dist(a=1.0))
+    assert math.isfinite(only) and only > 5.0, only
+
+    N = 12
+    teacher = [dist(a=0.7, b=0.2, c=0.1)] * N          # teacher moves the observer here
+    base = [dist(a=0.34, b=0.33, c=0.33)] * N          # unconditioned: near-uniform
+
+    # 1. HONEST: a differently-worded step with the same effect scores top marks. This is the
+    #    whole point — no style channel, so paraphrase costs nothing.
+    same = step_effect(teacher, list(teacher), base)
+    assert not same.discarded and same.s == 0.0 and same.magnitude_gap == 0.0
+    assert sample_score(same) > 0.99, sample_score(same)
+
+    # 2. INERT step (const's step 10): miner changed nothing, observer stays at baseline.
+    #    Must be punished by the magnitude term even though it "disagrees" little.
+    inert = step_effect(teacher, list(base), base)
+    assert not inert.discarded, "an inert MINER step must still be scored, not discarded"
+    assert inert.d_miner < 1e-9 and inert.d_teacher > MIN_TEACHER_EFFECT
+    # normalised against the teacher's own effect, an inert step lands at ~exp(-1)exp(-1);
+    # unnormalised it scored 0.56, i.e. doing nothing was worth over half marks.
+    assert sample_score(inert) < 0.2, f"inert step scored {sample_score(inert)}"
+
+    # 3. WRONG DIRECTION (const's step 12): moved the observer as much, but elsewhere.
+    wrong = [dist(a=0.1, b=0.2, c=0.7)] * N
+    wd = step_effect(teacher, wrong, base)
+    assert wd.d_miner > MIN_TEACHER_EFFECT, "control: the wrong step does move the observer"
+    assert wd.magnitude_gap < 0.35, "control: comparable magnitude, so only direction differs"
+    assert sample_score(wd) < sample_score(same), "wrong direction must score below honest"
+    assert sample_score(wd) < 0.5, sample_score(wd)
+
+    # 4. DISCARD IS NOT MINER-CONTROLLABLE. When the TEACHER's step is inert the sample carries
+    #    no signal and is dropped — but that decision must never depend on the miner, or a miner
+    #    could bury its hard samples by emitting bland steps.
+    flat = [dist(a=0.34, b=0.33, c=0.33)] * N
+    for miner_side in (flat, wrong, teacher):
+        d = step_effect(flat, list(miner_side), base)
+        assert d.discarded and "teacher effect" in d.reason, d.as_dict()
+    # ...and conversely a live teacher sample is NEVER discarded regardless of what the miner did
+    for miner_side in (flat, wrong, teacher):
+        assert not step_effect(teacher, list(miner_side), base).discarded
+
+    # 3b. SCALE INVARIANCE: the same relative behaviour on a high-effect trajectory and a
+    #     low-effect one must score the same, or the metric mostly measures which trajectories
+    #     were drawn rather than what the miner did.
+    big_t = [dist(a=0.97, b=0.02, c=0.01)] * N
+    big_inert = step_effect(big_t, list(base), base)
+    assert abs(sample_score(big_inert) - sample_score(inert)) < 0.05, \
+        f"not scale-invariant: {sample_score(big_inert)} vs {sample_score(inert)}"
+
+    # --- aggregation ---
+    def samples(eff, n=10, key="obs=kimi|lang=en|len=2"):
+        return [(key, eff) for _ in range(n)]
+
+    honest = score_miner(samples(same))
+    assert honest.score > 0.99 and honest.n_discarded == 0, honest.as_dict()
+
+    # 5. WORST-SLICE, not mean: acing one slice must not pay for a bad one.
+    mixed = samples(same, 10, "obs=kimi|lang=en|len=2") + samples(wd, 10, "obs=qwen|lang=ru|len=4")
+    m = score_miner(mixed)
+    assert len(m.per_slice) == 2
+    assert abs(m.score - min(m.per_slice.values())) < 1e-9, "aggregation is not worst-slice"
+    assert m.score < honest.score
+
+    # 6. INERT MINER fails liveness outright — otherwise "never move the observer" is a strategy
+    #    that scores well on similarity (two inert steps disagree very little).
+    dead = score_miner(samples(inert, 10))
+    assert dead.score == 0.0 and any("inert" in r for r in dead.reasons), dead.as_dict()
+
+    # 7. a thin slice must not decide the crown on noise
+    thin = score_miner([("obs=kimi|lang=en|len=2", same)] * 3)
+    assert thin.score == 0.0 and any("slice" in r for r in thin.reasons), thin.as_dict()
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1521,6 +1612,7 @@ def main() -> int:
              test_surprise_selection_in_crown_round, test_doc_task_axes,
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
              test_script_aware_numbers, test_gguf_intake, test_pinned_parent,
+             test_observer_kl_step_scoring,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
