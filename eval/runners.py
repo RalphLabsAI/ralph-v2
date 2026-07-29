@@ -111,6 +111,48 @@ class HFRunner:
             outs.extend(self._tok.batch_decode(new, skip_special_tokens=True))
         return outs
 
+    # Top-k support for observer distributions. Full-vocab KL over a 150k vocabulary would be
+    # ~600KB per position and unrecordable; SN97 ran top-128 for the same reason. The KL is
+    # taken over the union of the two supports, so a token one side proposes and the other never
+    # did still costs (see observer_kl.kl).
+    TOPK = 128
+    # Probabilities are ROUNDED before they leave this function. Logit arithmetic is not
+    # bit-stable across batch composition or kernel choice, and an unrounded low-order bit turns
+    # into a KL difference that looks like a real score difference. Rounding is the cheapest part
+    # of making a crown decision reproducible; the harness measures what is left
+    # (eval/determinism.py).
+    PROB_DECIMALS = 6
+
+    def distributions(self, prefix: str, continuation: str) -> list[dict]:
+        """The observer's per-position next-token distribution over `continuation`, given
+        `prefix`. Teacher-forced: no sampling, one forward pass, so it is a pure function of
+        (prefix, continuation) up to kernel noise.
+
+        Position alignment is the subtle part. With P prefix tokens and C continuation tokens,
+        the logits at index P-1 predict continuation[0], index P predicts continuation[1], and so
+        on — so the C distributions wanted are at indices P-1 .. P+C-2. Off by one here silently
+        compares the wrong positions and every KL becomes noise."""
+        self._load()
+        import torch
+
+        pre = self._tok(prefix, return_tensors="pt", truncation=False)["input_ids"]
+        full = self._tok(prefix + continuation, return_tensors="pt",
+                         truncation=False)["input_ids"]
+        n_pre, n_full = pre.shape[1], full.shape[1]
+        if n_full <= n_pre:
+            return []
+        full = full.to(self._model.device)
+        with torch.no_grad():
+            logits = self._model(input_ids=full).logits[0]          # [n_full, vocab]
+        out: list[dict] = []
+        k = min(self.TOPK, logits.shape[-1])
+        for pos in range(n_pre - 1, n_full - 1):
+            probs = torch.softmax(logits[pos].float(), dim=-1)
+            vals, idx = torch.topk(probs, k)
+            out.append({int(i): round(float(v), self.PROB_DECIMALS)
+                        for v, i in zip(vals.tolist(), idx.tolist())})
+        return out
+
     def generate(self, prompts: Sequence[str], max_new_tokens: int = 512) -> list[str]:
         self._load()
         import torch

@@ -1755,6 +1755,68 @@ def test_observer_round():
     assert thin.score == 0.0 and any("slice" in r for r in thin.reasons), thin.as_dict()
 
 
+def test_determinism_gate():
+    """Observer-KL is derived from logits, and logit arithmetic is not bit-stable — batch
+    composition, kernel choice and dtype all move low-order bits, and a KL turns that into what
+    looks like a real score difference. SN97 measured 2-5pp of run-to-run variance on IFEval and
+    then published 0.42-1.2pp margins as findings; a crown decided inside the noise band is a
+    lottery a miner wins by resubmitting.
+
+    So the validator measures its own noise floor and refuses to crown inside it."""
+    from eval.determinism import crownable, margin_floor, measure_noise
+
+    class Stable:
+        def distributions(self, prefix, continuation):
+            return [{1: 0.7, 2: 0.2, 3: 0.1}] * 5
+
+    class Jittery:
+        """Same input, slightly different answer each call — the real failure mode."""
+        def __init__(self, eps):
+            self.eps, self.n = eps, 0
+
+        def distributions(self, prefix, continuation):
+            self.n += 1
+            d = self.eps * (self.n % 3)
+            return [{1: 0.7 + d, 2: 0.2 - d, 3: 0.1}] * 5
+
+    class ShapeShifter:
+        def __init__(self):
+            self.n = 0
+
+        def distributions(self, prefix, continuation):
+            self.n += 1
+            return [{1: 0.7, 2: 0.3}] * (5 if self.n % 2 else 4)
+
+    stable = measure_noise(Stable(), "K", "C", repeats=4)
+    assert stable.identical and stable.max_kl == 0.0, stable.as_dict()
+    assert not stable.reasons, stable.reasons
+
+    # jitter sized like the real thing: SN97 measured 2-5 PERCENTAGE POINTS of run-to-run
+    # variance, not 1e-6. At realistic magnitudes the noise-scaled floor dominates the absolute
+    # one, which is the regime the gate exists for.
+    jit = measure_noise(Jittery(0.06), "K", "C", repeats=4)
+    assert not jit.identical and jit.max_kl > 0.0, jit.as_dict()
+    assert any("non-deterministic" in r for r in jit.reasons)
+    assert jit.max_prob_delta > 0.0
+
+    # a run that returns a different NUMBER of positions is not reproducible at all
+    shifty = measure_noise(ShapeShifter(), "K", "C", repeats=3)
+    assert any("position count differs" in r for r in shifty.reasons), shifty.as_dict()
+
+    # the floor scales with measured noise and never collapses to zero
+    assert margin_floor(stable) > 0.0, "a perfect run must still not license a 0-margin crown"
+    assert margin_floor(jit) > margin_floor(stable), (margin_floor(jit), margin_floor(stable))
+
+    # THE GATE: a margin inside the noise band is not crownable; a clear one is
+    ok, why = crownable(margin=jit.max_kl * 0.5, noise=jit)
+    assert not ok and "noise floor" in why, why
+    ok2, why2 = crownable(margin=jit.max_kl * 10, noise=jit)
+    assert ok2, why2
+    # and on a perfectly stable observer a real margin still passes
+    ok3, why3 = crownable(margin=0.05, noise=stable)
+    assert ok3, why3
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1773,6 +1835,7 @@ def main() -> int:
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
              test_script_aware_numbers, test_gguf_intake, test_pinned_parent,
              test_observer_kl_step_scoring, test_step_extraction, test_observer_round,
+             test_determinism_gate,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
