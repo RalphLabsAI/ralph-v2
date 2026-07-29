@@ -1595,6 +1595,79 @@ def test_observer_kl_step_scoring():
     assert thin.score == 0.0 and any("slice" in r for r in thin.reasons), thin.as_dict()
 
 
+def test_step_extraction():
+    """Observer-KL needs (prefix K, step K->K+1) pairs, which raw web text cannot give — fineweb
+    has no step boundaries. Each source therefore carries a BOUNDARY RULE, and the two ways this
+    silently produces garbage are pinned here:
+
+      * a wrong field name or delimiter yields an EMPTY corpus, indistinguishable from a quiet
+        source (a <think> parser returns zero on OpenThoughts-114k, which uses
+        <|begin_of_thought|>);
+      * row count != unique content. SWE-ZERO advertises 12.29M rows; sampling 120 rows across
+        six offsets spanning the whole set returned EIGHT distinct instance_id — ~100 rollouts
+        per pull request. Uniform sampling makes 122,908 memorized tasks look like a 12M corpus,
+        which would quietly falsify the entire "scale is the anti-overfit lever" argument.
+    """
+    from eval.steps import (TRAJECTORY_SOURCES, StepSpec, dedup_rows, extract_steps,
+                            pool_rows, verify_source)
+
+    # --- message boundaries: a step is one assistant turn, boundary is a list index ---
+    spec = StepSpec(kind="message", msg_keys=("role", "content"))
+    row = {"messages": [{"role": "user", "content": "fix the bug"},
+                        {"role": "assistant", "content": "THOUGHT: look at the repo"},
+                        {"role": "user", "content": "ok"},
+                        {"role": "assistant", "content": "THOUGHT: patch it"}]}
+    st = extract_steps(row, spec, "messages", "src", "r0")
+    assert len(st) == 2, st
+    assert st[0].step == "THOUGHT: look at the repo"
+    assert "fix the bug" in st[0].prefix
+    # the prefix must NOT contain the step it is being asked to predict
+    for s in st:
+        assert s.step not in s.prefix, "step leaked into its own prefix"
+    # a leading assistant turn has no prefix and must be skipped, not emitted with an empty K
+    lead = extract_steps({"messages": [{"role": "assistant", "content": "hi"}]}, spec,
+                         "messages", "s", "r")
+    assert lead == [], lead
+
+    # --- tool_call boundaries ---
+    tc = StepSpec(kind="tool_call")
+    row2 = {"gen": "reason\n<tool_call>\nprint(1)\n</tool_call>\n```output\n1\n```\nmore\n"
+                   "<tool_call>\nprint(2)\n</tool_call>"}
+    st2 = extract_steps(row2, tc, "gen", "s", "r")
+    assert len(st2) == 2 and st2[0].step.startswith("<tool_call>")
+    assert "print(2)" not in st2[0].prefix, "later step visible in an earlier prefix"
+
+    # --- para boundaries inside <think>, and the WRONG-DELIMITER case ---
+    pa = StepSpec(kind="para")
+    row3 = {"response": "<think>\nfirst block\n\nsecond block\n\nthird block\n</think>\nanswer"}
+    st3 = extract_steps(row3, pa, "response", "s", "r")
+    assert [s.step for s in st3] == ["second block", "third block"], [s.step for s in st3]
+    # OpenThoughts-114k's delimiter: a <think> parser must return NOTHING rather than guess
+    assert extract_steps({"response": "<|begin_of_thought|>a\n\nb<|end_of_thought|>"},
+                         pa, "response", "s", "r") == []
+
+    # --- verify_source must FAIL LOUDLY on a source that yields nothing ---
+    ok, msg = verify_source("glaive_r1", [{"response": "no think tags here"}])
+    assert not ok and "extracted 0 steps" in msg, msg
+    ok2, _ = verify_source("glaive_r1", [{"response": "<think>a\n\nb\n\nc</think>"}])
+    assert ok2
+
+    # --- dedup: the check that keeps the scale claim honest ---
+    fake = [{"instance_id": f"task{i // 100}", "messages": []} for i in range(1000)]
+    kept = list(dedup_rows(fake, "instance_id", 5))
+    assert len(kept) == 50, len(kept)
+    assert len({r["instance_id"] for r in kept}) == 10
+    assert TRAJECTORY_SOURCES["swe_zero"]["max_per_key"] == 5, "SWE-ZERO dedup cap removed"
+    assert TRAJECTORY_SOURCES["swe_zero"]["dedup_key"] == "instance_id"
+
+    # every source must declare a boundary rule and a real licence
+    for name, s in TRAJECTORY_SOURCES.items():
+        assert isinstance(s["step"], StepSpec), name
+        assert s["license"], f"{name} has no licence — a validator cannot legally pull it"
+        assert s["pool_rows"] > 0, name
+    assert pool_rows() > 10_000_000, pool_rows()
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1612,7 +1685,7 @@ def main() -> int:
              test_surprise_selection_in_crown_round, test_doc_task_axes,
              test_dethrone_rewards_the_anti_clone_strategy, test_king_is_revalidated_and_vacated,
              test_script_aware_numbers, test_gguf_intake, test_pinned_parent,
-             test_observer_kl_step_scoring,
+             test_observer_kl_step_scoring, test_step_extraction,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
