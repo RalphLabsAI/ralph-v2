@@ -1975,6 +1975,104 @@ def test_artifact_manifest():
         assert not ok5 and any("uninspected bytes" in r for r in why5), why5
 
 
+def test_miner_submit_and_chain_adapter():
+    """The two things that were missing for a miner to actually submit: somewhere to publish a
+    commitment, and a validator that reads the real chain instead of FakeChain.
+
+    Pins the bug this flow shipped with first: the state file holding the SALT was written INSIDE
+    the checkpoint dir, where `.json` is hashed — so it changed the content hash after it was
+    computed (breaking commit-reveal, measured) AND would have published the salt with the
+    model."""
+    import json as _json
+    import struct
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+    from eval.chain_bittensor import BittensorChainIO, build_commitment_envelope
+    from eval.gates import TierBudget
+    from eval.intake import intake
+
+    def gguf(path, n=3, tt=35):
+        out = bytearray(b"GGUF" + struct.pack("<I", 3)) + struct.pack("<QQ", n, 1)
+        k = b"general.architecture"
+        out += struct.pack("<Q", len(k)) + k + struct.pack("<I", 8)
+        v = b"qwen2"
+        out += struct.pack("<Q", len(v)) + v
+        for i in range(n):
+            nb = f"blk.{i}.attn_q.weight".encode()
+            out += struct.pack("<Q", len(nb)) + nb
+            out += struct.pack("<I", 2) + struct.pack("<QQ", 512, 512)
+            out += struct.pack("<I", tt) + struct.pack("<Q", 0)
+        Path(path).write_bytes(bytes(out))
+
+    with tempfile.TemporaryDirectory() as base:
+        d = Path(base) / "my-model"
+        d.mkdir()
+        gguf(d / "model.gguf")
+        (d / "config.json").write_text('{"hidden_size":512}')
+        r = subprocess.run([sys.executable, "-m", "miner.submit", "commit", "--ckpt", str(d),
+                            "--tier", "ternary-4b", "--uri", "hf://acme/demo@v1", "--dry-run"],
+                           capture_output=True, text=True, cwd=str(Path(__file__).parent.parent))
+        assert r.returncode == 0, r.stdout + r.stderr
+
+        # the salt must NOT be inside the directory the miner publishes
+        assert sorted(p.name for p in d.iterdir()) == ["config.json", "model.gguf"], \
+            "submission state (with the salt) leaked into the published checkpoint dir"
+        st = _json.loads((Path(base) / "my-model.ralph-submission.json").read_text())
+
+        # and the commitment must still verify against the artifact — writing state must not
+        # have perturbed the hash
+        dec = intake(str(d), TierBudget(name="ternary-4b", max_params=10 ** 12,
+                                        max_effective_bits=3.0),
+                     revealed_hash=st["content_hash"], salt=st["salt"],
+                     committed_value=st["commit_value"])
+        assert dec.accepted, dec.reasons
+
+        # the validator adapter parses the miner's envelope, and refuses anything else
+        class _Inner:
+            class MG:
+                hotkeys = ["hkA", "hkB", "hkC"]
+                coldkeys = ["ckA", "ckB", "ckC"]
+            metagraph = MG()
+
+            class Sub:
+                def get_commitment(self, netuid, uid):
+                    return {0: st["envelope"], 1: "legacy-v1-handshake",
+                            2: '{"v":9,"tier":"x"}'}[uid]
+            subtensor = Sub()
+
+            def get_uid(self, hk):
+                return {"hkA": 0, "hkB": 1, "hkC": 2}[hk]
+
+            def get_current_block(self):
+                return 1234
+
+            def get_block_hash(self, b):
+                return f"0x{b}"
+
+        io = BittensorChainIO(inner=_Inner(), netuid=40,
+                              fetch_dir_for=lambda hk, uri: str(d) if hk == "hkA" else "",
+                              reveals={"hkA": {"content_hash": st["content_hash"],
+                                               "salt": st["salt"]}})
+        cs = io.read_commitments(1100, 1234)
+        assert len(cs) == 1 and cs[0].hotkey == "hkA", cs
+        assert cs[0].tier == "ternary-4b" and cs[0].artifact_uri == "hf://acme/demo@v1"
+        # a v1 handshake and an unknown version are SKIPPED with reasons, never guessed at
+        assert len(io.skipped) == 2, io.skipped
+        assert any("not JSON" in w for _, w in io.skipped)
+        assert any("not a v2" in w for _, w in io.skipped)
+        assert len(io.commit_root(1100, 1234)) == 64
+
+        # WRITES ARE OFF BY DEFAULT — nothing may touch a live signer by accident
+        assert io.set_weights({"hkA": 1.0}) is False
+        io.set_king("ternary-4b", "hkA", "mid")
+        assert [e[0] for e in io.log] == ["set_weights", "set_king"], io.log
+
+    env = build_commitment_envelope("ternary-4b", "cv", "hf://x@1")
+    assert _json.loads(env)["v"] == 2 and len(env) < 300, env
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -1994,6 +2092,7 @@ def main() -> int:
              test_script_aware_numbers, test_gguf_intake, test_pinned_parent,
              test_observer_kl_step_scoring, test_step_extraction, test_observer_round,
              test_determinism_gate, test_observer_epoch_end_to_end, test_artifact_manifest,
+             test_miner_submit_and_chain_adapter,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
