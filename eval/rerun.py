@@ -378,10 +378,30 @@ def report(a: Audit, out=sys.stdout) -> int:
     return a.exit_code
 
 
+def audit_history(sink_root: str, out=sys.stdout) -> int:
+    """`--history <dir>`: is the published TRAIL complete? Answers a different question from
+    auditing one record — a round that was paid out and never published has no record to audit,
+    so only walking the index can find it."""
+    from .publish import LocalSink, RecordPublisher, verify_history
+    h = verify_history(RecordPublisher(LocalSink(sink_root)))
+    w = out.write
+    w(f"\n  published trail: {h.n_rounds} rounds, head={h.head}\n")
+    for label, items in (("GAPS (scored but never published)", h.gaps),
+                         ("BROKEN (no longer fetches or verifies)", h.broken),
+                         ("ANCHOR MISMATCH", h.mismatched),
+                         ("unanchored", h.unanchored)):
+        if items:
+            w(f"    {label}: {items}\n")
+    w(f"  {'COMPLETE' if h.ok else 'INCOMPLETE TRAIL'}\n\n")
+    return 0 if h.ok else 1
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print(__doc__)
         return 2
+    if argv[0] == "--history":
+        return audit_history(argv[1])
     path, pool, obs_name = argv[0], "", ""
     i = 1
     while i < len(argv):

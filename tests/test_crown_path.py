@@ -2396,6 +2396,253 @@ def test_rerun_audits_and_catches_a_rigged_record():
                    for c in a3.checks), [c.name for c in a3.failed]
 
 
+def test_publisher_is_fail_closed():
+    """The audit tool is useless if nothing publishes records — and v1 proves the failure is
+    silent. There, scoring ran fine for weeks while the audit trail rotted: the publisher was
+    fail-OPEN, the on-chain anchor went 22 days stale, and king.json's lineage regressed from 50
+    entries to 6 because a cold-started process overwrote a fuller index with its own empty state.
+
+    So the ordering is inverted (publish -> verify -> heartbeat -> set_weights) and every step
+    below is a way that inversion can be defeated."""
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.chain import Commitment, run_v2_observer_epoch
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.koth import Tier, Tournament
+    from eval.publish import (INDEX, LocalSink, PublishError, RecordPublisher, publish_and_gate,
+                              record_name)
+    from eval.shadow_axis_epoch import FakeChain
+    from eval.signing import Ed25519Signer
+    from eval.steps import Trajectory
+
+    pool = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"p{i}", step="s", index=0)
+            for i in range(200)]
+    d3 = lambda x, y, z: {"a": x, "b": y, "c": z}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            t = prefix.rstrip()[-1:]
+            return [d3(0.8, 0.1, 0.1)] * 6 if t == "X" else \
+                [d3(0.55, 0.25, 0.20)] * 6 if t == "W" else [d3(0.34, 0.33, 0.33)] * 6
+
+    class Step:
+        def __init__(self, tok):
+            self.tok = tok
+
+        def generate(self, prompts, max_new_tokens=256):
+            return [self.tok] * len(prompts)
+
+    class AnchoringChain(FakeChain):
+        """Records the digest per round the way a real chain commitment does — the half of the
+        trail an operator cannot rewrite after the fact."""
+
+        def __init__(self, commits):
+            super().__init__(commits)
+            self.anchors = {}
+            self.weight_calls = 0
+
+        def publish_record(self, record):
+            self.anchors[record.round] = record.sha256()
+
+        def record_anchors(self):
+            return dict(self.anchors)
+
+        def set_weights(self, w):
+            self.weight_calls += 1
+            return super().set_weights(w)
+
+    with tempfile.TemporaryDirectory() as dd:
+        def ck(name, n):
+            q = Path(dd) / name
+            q.mkdir()
+            hb = _json.dumps({"w": {"dtype": "F32", "shape": [n],
+                                    "data_offsets": [0, 4 * n]}}).encode()
+            (q / "model.safetensors").write_bytes(struct.pack("<Q", len(hb)) + hb + b"\0" * 4 * n)
+            (q / "config.json").write_text('{"hidden_size":8}')
+            return str(q)
+
+        weak, strong = ck("weak", 4), ck("strong", 6)
+        runners = {weak: Step("W"), strong: Step("X")}
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        obs = {"kimi": Obs(), "qwen": Obs()}
+        bud = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
+        sig = Ed25519Signer(seed=b"z" * 32)
+
+        def cm(hot, cd):
+            hh, ss = content_hash(cd), "s" + hot
+            return Commitment(hot, "c" + hot, "t", cd, 1.0, revealed_hash=hh, salt=ss,
+                              committed_value=commit_value(hh, ss))
+
+        def epoch(chain, rnd, cd, pub, tour, reg, led, **kw):
+            chain._commits = [cm(f"hot{rnd}", cd)]
+            return run_v2_observer_epoch(
+                chain, rnd, pool, Step("X"), obs, tiers, bud, tour, led, reg,
+                make_safe_runner=lambda c: runners[c], signer=sig, n_items=20,
+                corpus_spec="glaive_r1@rev=abc|order=stream", publisher=pub, **kw)
+
+        # ---- 1. HAPPY PATH: record is fetchable, indexed, anchored, and weights got set
+        root = str(Path(dd) / "sink1")
+        pubr = RecordPublisher(LocalSink(root), window=8,
+                              state_path=str(Path(dd) / "hwm1.json"))
+        chain = AnchoringChain([])
+        tour, reg, led = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        r1 = epoch(chain, 1, weak, pubr, tour, reg, led)
+        assert r1.publish.ok, r1.publish
+        assert r1.weights_set and chain.weight_calls == 1
+        idx = _json.loads((Path(root) / INDEX).read_text())
+        assert [e["round"] for e in idx["rounds"]] == [1] and idx["head"] == 1
+        assert chain.anchors[1] == r1.record_sha256
+        # the published bytes are the record an auditor would re-run
+        got = _json.loads((Path(root) / idx["rounds"][0]["name"]).read_text())
+        assert got["manifest"]["item_indices"] == r1.outcome.item_indices
+
+        # ---- 2. WRITE THAT SILENTLY DROPS. The sink says success and stores nothing — the
+        #         object-store failure that made v1's index claim more rounds than it served.
+        class BlackHole(LocalSink):
+            def put(self, name, blob):
+                return f"file://{name}"          # accepted, never stored
+
+        try:
+            RecordPublisher(BlackHole(str(Path(dd) / "sink2"))).publish(r1.outcome.record)
+            raise AssertionError("a write that stored nothing was accepted")
+        except PublishError as e:
+            assert "cannot be fetched back" in str(e), e
+
+        # ---- 3. READ-BACK MISMATCH (truncation / partial write)
+        class Truncating(LocalSink):
+            def get(self, name):
+                b = super().get(name)
+                return b[:-5] if b and name.startswith("rounds/") else b
+
+        try:
+            RecordPublisher(Truncating(str(Path(dd) / "sink3"))).publish(r1.outcome.record)
+            raise AssertionError("a truncated read-back was accepted")
+        except PublishError as e:
+            assert "reads back different" in str(e), e
+
+        # ---- 4. PUBLISH-THEN-DELETE. The obvious tamper: score honestly, publish, then remove
+        #         the round an auditor is objecting to. Only a WINDOW re-check catches it, and the
+        #         penalty has to land on the CURRENT round because that is the only leverage.
+        (Path(root) / idx["rounds"][0]["name"]).unlink()
+        before = chain.weight_calls
+        r2 = epoch(chain, 2, strong, pubr, tour, reg, led)
+        assert not r2.publish.ok, r2.publish
+        assert [x["round"] for x in r2.publish.stale_rounds] == [1], r2.publish.stale_rounds
+        assert not r2.weights_set and chain.weight_calls == before, "paid out on a deleted history"
+        assert any(e.get("action") == "withhold_weights" for e in r2.outcome.events)
+        # the crown was NOT written on chain either
+        assert 2 not in [k for k, v in chain.kings.items()] or chain.kings.get("t")
+
+        # ---- 5. ANCHOR MISMATCH. The chain is the authority; a published record that disagrees
+        #         with what was anchored is a swap.
+        root5 = str(Path(dd) / "sink5")
+        p5 = RecordPublisher(LocalSink(root5), window=8)
+        p5.publish(r1.outcome.record)
+        stale, checked, n_anch = p5.verify_window(1, {1: "0" * 64})
+        assert checked == [1] and stale and "anchor" in stale[0]["why"], (stale, checked)
+        stale, _, n_anch = p5.verify_window(1, {1: r1.outcome.record.sha256()})
+        assert not stale and n_anch == 1
+
+        # ---- 6. HISTORY REWRITE. Re-publishing a round with different content would let an
+        #         operator replace the very round being challenged.
+        rec_b = r1.outcome.record
+        import copy as _copy
+        forged = _copy.deepcopy(rec_b)
+        forged.weights = {"someone_else": 1.0}
+        forged.signature = forged.signer = forged.sig_scheme = ""
+        forged.sign(sig)
+        try:
+            p5.publish(forged)
+            raise AssertionError("a round was silently rewritten")
+        except PublishError as e:
+            assert "refusing to replace" in str(e), e
+
+        # ---- 7. THE V1 LINEAGE BUG ITSELF. A transient index read failure must not be read as
+        #         "no history yet" — that is how 50 entries became 6.
+        class FlakyIndex(LocalSink):
+            blind = False
+
+            def get(self, name):
+                if name == INDEX and self.blind:
+                    return None                  # read failed, index is actually still there
+                return super().get(name)
+
+        root7 = str(Path(dd) / "sink7")
+        fl = FlakyIndex(root7)
+        p7 = RecordPublisher(fl, state_path=str(Path(dd) / "hwm7.json"))
+        p7.publish(r1.outcome.record)
+        assert len(_json.loads((Path(root7) / INDEX).read_text())["rounds"]) == 1
+        fl.blind = True
+        try:
+            p7.publish(forged)
+            raise AssertionError("a failed index read was treated as an empty history")
+        except PublishError as e:
+            assert "v1 lineage bug" in str(e), e
+        # and the high-water mark survives a restart, so a cold start cannot shrink it either
+        p7b = RecordPublisher(fl, state_path=str(Path(dd) / "hwm7.json"))
+        assert p7b._hwm == 1
+        try:
+            p7b.publish(forged)
+            raise AssertionError("a cold-started process shrank the history")
+        except PublishError as e:
+            assert "v1 lineage bug" in str(e), e
+
+        # ---- 8. UNSIGNED RECORDS NEVER ENTER THE HISTORY. Publishing one buys no
+        #         accountability, so it is refused before it can be paid out.
+        unsigned = _copy.deepcopy(r1.outcome.record)
+        unsigned.signature = unsigned.signer = unsigned.sig_scheme = ""
+        rep = publish_and_gate(RecordPublisher(LocalSink(str(Path(dd) / "sink8"))), unsigned)
+        assert not rep.ok and "unsigned" in rep.reasons[0]
+        assert rep.published is None
+
+        # ---- 9. A MISCONFIGURED PRODUCTION BOX CANNOT RUN UNAUDITED
+        import os as _os
+        _os.environ["RALPH_REQUIRE_PUBLISH"] = "1"
+        try:
+            epoch(AnchoringChain([]), 3, strong, None, Tournament(tiers, margin=0.03), {},
+                  RegistrationLedger())
+            raise AssertionError("ran a round with no publisher while RALPH_REQUIRE_PUBLISH=1")
+        except PublishError as e:
+            assert "no publisher" in str(e), e
+        finally:
+            _os.environ.pop("RALPH_REQUIRE_PUBLISH", None)
+
+        # ---- 10. GAPS IN THE TRAIL. A round that was scored, paid out and never published has
+        #          no record to audit, so no per-record check can see it. Only walking the index
+        #          finds it — and that is the shape v1 had: 57 crowns in the report repo against
+        #          6 lineage entries, with nothing comparing the two.
+        from eval.publish import verify_history
+        root_g = str(Path(dd) / "sinkg")
+        pg = RecordPublisher(LocalSink(root_g))
+        chg = AnchoringChain([])
+        tg, rg, lg = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        for rnd in (1, 2, 4):                       # round 3 never published
+            e = epoch(chg, rnd, strong if rnd > 1 else weak, pg, tg, rg, lg)
+            assert e.publish.ok, (rnd, e.publish)
+        h = verify_history(pg, chg.record_anchors)
+        assert h.n_rounds == 3 and h.head == 4
+        assert h.gaps == [3], h.gaps
+        assert not h.broken and not h.mismatched and not h.unanchored
+        assert not h.ok, "a hole in the trail must not read as complete"
+
+        # ---- 11. RECOVERY. Once publishing works again the round pays out normally — the gate
+        #          holds emission, it does not brick the subnet.
+        root10 = str(Path(dd) / "sink10")
+        p10 = RecordPublisher(LocalSink(root10), window=8)
+        ch10 = AnchoringChain([])
+        t10, r10, l10 = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        e10 = epoch(ch10, 4, strong, p10, t10, r10, l10)
+        assert e10.publish.ok and e10.weights_set and ch10.weight_calls == 1
+        assert e10.publish.anchors_checked == 1, e10.publish
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -2418,6 +2665,7 @@ def main() -> int:
              test_miner_submit_and_chain_adapter,
              test_nonce_selects_items_and_record_is_rerunnable,
              test_rerun_audits_and_catches_a_rigged_record,
+             test_publisher_is_fail_closed,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

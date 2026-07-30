@@ -73,6 +73,10 @@ class EpochResult:
     round_no: int
     outcome: RoundOutcome
     record_sha256: str
+    # what publishing did. `publish.ok is False` means NO weights were set this round — the
+    # previous crown keeps earning until the operator fixes publishing.
+    publish: object = None
+    weights_set: bool = False
 
 
 def run_v2_epoch(
@@ -82,6 +86,7 @@ def run_v2_epoch(
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     commit_window: int = 100, make_safe_runner=None,
     pile_id: str = "pile", n_points: int = 120, self_frac: float = 0.0,
+    publisher=None, require_publish: bool | None = None,
 ) -> EpochResult:
     """One v2 epoch: read the sealed commit window, draw the nonce, score, write back.
 
@@ -117,7 +122,8 @@ def run_v2_epoch(
         pile_id=pile_id, n_points=n_points, self_frac=self_frac,
     )
 
-    return _write_back(chain, tiers, tournament, outcome, round_no)
+    return _write_back(chain, tiers, tournament, outcome, round_no,
+                       publisher=publisher, require_publish=require_publish)
 
 
 def run_v2_env_epoch(
@@ -128,6 +134,7 @@ def run_v2_env_epoch(
     commit_window: int = 100, make_agent=None,
     teacher_id: str = "glm", base_id: str = "base", pile_id: str = "env-pile",
     n_points: int = 300, self_frac: float = 0.4,
+    publisher=None, require_publish: bool | None = None,
 ) -> EpochResult:
     """One v2 epoch on the ENV substrate (the validated, production scoring path). Same
     chain I/O as run_v2_epoch; scores via run_env_round. `make_agent(ckpt_dir) -> Agent`
@@ -162,7 +169,8 @@ def run_v2_env_epoch(
         teacher_id=teacher_id, base_id=base_id, pile_id=pile_id,
         n_points=n_points, self_frac=self_frac,
     )
-    return _write_back(chain, tiers, tournament, outcome, round_no)
+    return _write_back(chain, tiers, tournament, outcome, round_no,
+                       publisher=publisher, require_publish=require_publish)
 
 
 def run_v2_axis_epoch(
@@ -174,6 +182,7 @@ def run_v2_axis_epoch(
     teacher_id: str = "glm", base_id: str = "base",
     items_per_axis: int = 150, max_new_tokens: int = 512,
     overfit_check=None, signer=None, surprise_k: int | None = None,
+    publisher=None, require_publish: bool | None = None,
 ) -> EpochResult:
     """One v2 epoch on the AXIS substrate — the GLM-COVER production path (verifiable-outcome
     retention across deterministic-checker axes). Same chain I/O as run_v2_epoch; scores via
@@ -206,7 +215,8 @@ def run_v2_axis_epoch(
         items_per_axis=items_per_axis, max_new_tokens=max_new_tokens,
         overfit_check=overfit_check, signer=signer, surprise_k=surprise_k,
     )
-    return _write_back(chain, tiers, tournament, outcome, round_no)
+    return _write_back(chain, tiers, tournament, outcome, round_no,
+                       publisher=publisher, require_publish=require_publish)
 
 
 def run_v2_observer_epoch(
@@ -218,6 +228,7 @@ def run_v2_observer_epoch(
     max_step_tokens: int = 256, max_cont_tokens: int = 128,
     signer=None, canary=None, noise_safety: float = 3.0,
     n_items: int = 64, corpus_spec: str = "",
+    publisher=None, require_publish: bool | None = None,
 ) -> EpochResult:
     """One v2 epoch on the OBSERVER-KL substrate — the crown path.
 
@@ -250,20 +261,57 @@ def run_v2_observer_epoch(
         signer=signer, max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens,
         noise_safety=noise_safety, canary=canary, n_items=n_items, corpus_spec=corpus_spec,
     )
-    return _write_back(chain, tiers, tournament, outcome, round_no)
+    return _write_back(chain, tiers, tournament, outcome, round_no,
+                       publisher=publisher, require_publish=require_publish)
 
 
-def _write_back(chain: ChainIO, tiers, tournament, outcome, round_no) -> EpochResult:
-    """Crown per tier, set weights, publish the auditable record."""
+def _write_back(chain: ChainIO, tiers, tournament, outcome, round_no,
+                publisher=None, require_publish: bool | None = None) -> EpochResult:
+    """PUBLISH FIRST, then crown and pay. The old order was set_king -> set_weights ->
+    publish_record, which paid out a round before anyone could check it and kept paying when
+    publishing broke. That is not hypothetical: v1's publisher was fail-open, its on-chain anchor
+    went 22 days stale, and the lineage regressed from 50 entries to 6 while scoring ran fine.
+
+    `require_publish` defaults to True whenever a publisher is configured, and can be forced on
+    with RALPH_REQUIRE_PUBLISH=1 so a production box cannot be started without one by accident."""
+    import os as _os
+    from .publish import PublishError, publish_and_gate
+
+    forced = _os.environ.get("RALPH_REQUIRE_PUBLISH", "").strip() not in ("", "0", "false")
+    if require_publish is None:
+        require_publish = publisher is not None or forced
+    if require_publish and publisher is None:
+        raise PublishError("RALPH_REQUIRE_PUBLISH is set but no publisher was configured — "
+                           "refusing to run a round whose record nobody can fetch")
+
+    res = EpochResult(round_no, outcome, outcome.record.sha256() if outcome.record else "")
+    if publisher is not None:
+        # pass the RESOLVER, not a snapshot: the current round is anchored inside
+        # publish_and_gate, so a snapshot taken here would never contain it
+        rep = publish_and_gate(publisher, outcome.record,
+                               anchors=getattr(chain, "record_anchors", None),
+                               anchor_fn=getattr(chain, "publish_record", None))
+        res.publish = rep
+        if not rep.ok and require_publish:
+            # FAIL CLOSED. No crown written on chain, no weights set. Emission does not stop —
+            # the previously set weights persist, so the last verifiably published crown keeps
+            # earning. A hold, not a halt; see publish.py for why that residual is stated openly.
+            outcome.events.append({
+                "round": round_no, "action": "withhold_weights",
+                "reason": "; ".join(rep.reasons) or "record not verifiably published",
+                "stale_rounds": rep.stale_rounds})
+            return res
+    elif outcome.record is not None:
+        chain.publish_record(outcome.record)
+
     for tier in tiers:
         king = tournament.kings.get(tier.name)
         if king is not None:
             chain.set_king(tier.name, king.miner, king.model_id)
     chain.set_weights(outcome.weights)
+    res.weights_set = True
     if getattr(outcome, "refunds", None):
         settle = getattr(chain, "settle_bonds", None)
         if settle is not None:
             settle(outcome.refunds)
-    if outcome.record is not None:
-        chain.publish_record(outcome.record)
-    return EpochResult(round_no, outcome, outcome.record.sha256() if outcome.record else "")
+    return res
