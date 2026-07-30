@@ -139,6 +139,22 @@ def main() -> int:
     if all(x is not None for x in ns):
         v["noise_monotone"] = all(a >= b - 1e-9 for a, b in zip(ns, ns[1:]))
         v["noise_range"] = round(max(ns) - min(ns), 6)
+        # A BARE monotone flag over the whole sweep is the wrong question, and answering it was
+        # misleading. The metric saturates: once a model is badly damaged its steps are garbage,
+        # and garbage still moves the observer SOME amount, so the score plateaus instead of
+        # falling to the inert floor. Whether one nearly-destroyed model outscores another by a
+        # hair does not decide anything — crowns are decided among GOOD compressions. So split the
+        # curve and report the two regimes separately.
+        TOP = 0.05
+        top = [curve[f"noise_{s}"] for s in SIGMAS if s <= TOP]
+        tail = [curve[f"noise_{s}"] for s in SIGMAS if s > TOP]
+        v["monotone_in_crown_regime"] = all(a >= b - 1e-9 for a, b in zip(top, top[1:]))
+        if tail:
+            v["tail_wobble"] = round(max(tail) - min(tail), 6)
+            # the decision-relevant question: does a REAL quantization beat the LUCKIEST heavily
+            # damaged model by more than the dethrone margin?
+            if q4 is not None:
+                v["quant_beats_luckiest_damage_by"] = round(q4 - max(tail), 6)
     # the question that decides whether a crown means anything: does a REAL 4-bit quantization
     # outrank a model damaged badly enough to be useless?
     worst = curve.get(f"noise_{SIGMAS[-1]}")
