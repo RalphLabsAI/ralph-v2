@@ -52,6 +52,15 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
+def _sha(parts) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for x in parts:
+        h.update((x or "").encode())
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
 def _gpu() -> dict:
     try:
         import torch
@@ -112,7 +121,7 @@ def main() -> int:
         student = parent
         rep["student"] = f"{PARENT}@fp16 (4-bit unavailable)"
         rep["student_warning"] = str(e)
-    log(f"loading control {OTHER} (a DIFFERENT model — must score LOW)…")
+    log(f"loading control {OTHER} (a DIFFERENT model)…")
     other = HFRunner(OTHER)
 
     # ---- A/B: the whole round, REPEATS times, on identical inputs ------------------------
@@ -136,6 +145,12 @@ def main() -> int:
             f"student={ms_student.score:.6f} other={ms_other.score:.6f} "
             f"({runs[-1]['secs']}s)")
 
+    # FINGERPRINTS. Within-box determinism says nothing about whether two boxes scored the same
+    # exam the same way, and comparing scores alone cannot tell a kernel difference from a
+    # different generated step. These hashes make the cross-GPU question answerable.
+    rep["items_sha"] = _sha(t.prefix for t in trajs)
+    rep["parent_steps_sha"] = _sha(runs[0]["parent_steps"])
+    rep["continuations_sha"] = _sha(runs[0]["continuations"])
     rep["runs"] = [{k: v for k, v in r.items()
                     if k not in ("parent_steps", "continuations", "student_slices")}
                    for r in runs]
@@ -165,14 +180,24 @@ def main() -> int:
     rep["max_per_sample_delta"] = max(per_sample) if per_sample else 0.0
 
     # C. batch sensitivity — does a miner's score depend on who else submitted?
+    #
+    # The first version of this probe was VACUOUS and reported a reassuring 0.0: it built a
+    # 16-sample shared set but then sliced back to [:8] BEFORE scoring, so the miner generated over
+    # 8 prefixes in both arms and the batch composition never actually changed. Fixed by varying
+    # the runner's batch_size, which is what genuinely re-partitions the work: the same sample is
+    # scored at a different position within a different-sized batch.
     log("batch-composition probe…")
-    alone = score_submission([s for s in build_shared(trajs[:8], parent, observer, "obs")],
-                             student, observer)
-    padded_shared = build_shared(trajs[:8] + trajs[8:16], parent, observer, "obs")
-    padded = score_submission(padded_shared[:8], student, observer)
-    rep["batch_alone"] = alone.score
-    rep["batch_padded"] = padded.score
-    rep["batch_sensitivity"] = abs(alone.score - padded.score)
+    sub8 = build_shared(trajs[:8], parent, observer, "obs")
+    b_default = score_submission(sub8, student, observer)
+    old_bs = getattr(student, "_batch_size", 8)
+    try:
+        student._batch_size = 3          # re-partitions 8 samples as 3+3+2 instead of 8
+        b_repart = score_submission(sub8, student, observer)
+    finally:
+        student._batch_size = old_bs
+    rep["batch_default"] = b_default.score
+    rep["batch_repartitioned"] = b_repart.score
+    rep["batch_sensitivity"] = abs(b_default.score - b_repart.score)
 
     # D. the old single-sequence KL floor, for continuity with what the code gates on today
     probe = [s for s in build_shared(trajs[:4], parent, observer, "obs") if s.usable]
@@ -182,12 +207,60 @@ def main() -> int:
                           batch_variations=[p.prefix for p in probe[1:]])
         rep["kl_floor"] = n.as_dict()
 
+    # ---- THE LADDER. The different-model control turned out to be the wrong test for THIS
+    # subnet: a foreign model is already refused by the pinned-parent admission gate (architecture
+    # and parameter count must match), so its score is not what decides anything. What decides
+    # crowns is whether the metric ORDERS same-architecture compressions correctly. So: the parent
+    # itself (must be ~1.0 — it is trivially its own best compression), 8-bit, 4-bit, and a
+    # deliberately DAMAGED copy at the same width (must score clearly worst). If the order is
+    # wrong, or 4-bit and damaged are indistinguishable, the crown cannot rank compressions.
+    log("ladder: fp16 / 8-bit / 4-bit / damaged, all the same architecture…")
+    shared = build_shared(trajs, parent, observer, "obs")
+    ladder = {}
+    ladder["parent_fp16"] = score_submission(shared, parent, observer).score
+    try:
+        eight = HFRunner(PARENT, load_in_8bit=True)
+        ladder["quant_8bit"] = score_submission(shared, eight, observer).score
+        del eight
+    except Exception as e:
+        ladder["quant_8bit"] = None
+        rep["eight_bit_error"] = str(e)
+    ladder["quant_4bit"] = sum(sv) / len(sv)
+    try:
+        dmg = HFRunner(PARENT, load_in_4bit=True)
+        dmg._load()
+        import torch
+        with torch.no_grad():
+            n = 0
+            for name, prm in dmg._model.named_parameters():
+                if prm.dtype.is_floating_point and prm.dim() >= 2 and n < 40:
+                    prm.add_(torch.randn_like(prm) * 0.05 * prm.std())
+                    n += 1
+        ladder["damaged"] = score_submission(shared, dmg, observer).score
+        ladder["damaged_layers_perturbed"] = n
+        del dmg
+    except Exception as e:
+        ladder["damaged"] = None
+        rep["damaged_error"] = str(e)
+    ladder["different_model"] = sum(ov) / len(ov)
+    rep["ladder"] = ladder
+    log("  ladder: " + ", ".join(f"{k}={v if v is None else round(v, 4)}"
+                                 for k, v in ladder.items()))
+
     # ---- discrimination: is the metric measuring compression at all? ---------------------
     rep["student_mean"] = sum(sv) / len(sv)
     rep["other_mean"] = sum(ov) / len(ov)
     rep["discrimination"] = rep["student_mean"] - rep["other_mean"]
+    lad = rep.get("ladder", {})
+    ordered = None
+    if lad.get("parent_fp16") is not None and lad.get("damaged") is not None:
+        ordered = lad["parent_fp16"] >= lad["quant_4bit"] > lad["damaged"]
+        rep["ladder_gap_4bit_vs_damaged"] = lad["quant_4bit"] - lad["damaged"]
     rep["verdict"] = {
-        "discriminates": rep["discrimination"] > 0.15,
+        "ladder_ordered": ordered,
+        "ranks_compressions": bool(ordered) and
+        rep.get("ladder_gap_4bit_vs_damaged", 0) > 0.05,
+        "discriminates_vs_foreign_model": rep["discrimination"] > 0.15,
         "margin_resolvable": rep["round_noise_retention"] < 0.05,
         "text_stable": rep["text_identical"],
     }
@@ -201,7 +274,9 @@ def main() -> int:
     log(f"  KL floor (old measurement)  : {rep.get('kl_floor', {}).get('max_kl')}")
     log(f"  4-bit student  mean score   : {rep['student_mean']:.4f}")
     log(f"  different model mean score  : {rep['other_mean']:.4f}")
-    log(f"  DISCRIMINATION              : {rep['discrimination']:+.4f}")
+    log(f"  DISCRIMINATION vs foreign   : {rep['discrimination']:+.4f}")
+    log(f"  parent_steps_sha            : {rep['parent_steps_sha']}  (compare across GPUs)")
+    log(f"  ladder                      : {rep.get('ladder')}")
     log(f"  verdict: {rep['verdict']}")
     log(f"wrote {OUT}")
     return 0

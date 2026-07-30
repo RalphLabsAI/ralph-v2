@@ -23,7 +23,7 @@ class HFRunner:
     def __init__(self, model_id: str, device: str = "auto", dtype: str = "bfloat16",
                  revision: str | None = None, name: str | None = None,
                  trust_remote_code: bool = False, batch_size: int = 8,
-                 load_in_4bit: bool = False):
+                 load_in_4bit: bool = False, load_in_8bit: bool = False):
         self.model_id = model_id
         self.revision = revision
         self.name = name or model_id
@@ -34,6 +34,7 @@ class HFRunner:
         # student is a genuine compression of the pinned parent — same architecture, fewer bits —
         # which is the actual task, and there was no way to construct one without it.
         self._load_in_4bit = load_in_4bit
+        self._load_in_8bit = load_in_8bit
         self._model = None
         self._tok = None
 
@@ -52,7 +53,10 @@ class HFRunner:
         self._tok.padding_side = "left"
         if self._tok.pad_token_id is None:
             self._tok.pad_token = self._tok.eos_token
-        if self._load_in_4bit:
+        if self._load_in_8bit:
+            from transformers import BitsAndBytesConfig
+            kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        elif self._load_in_4bit:
             from transformers import BitsAndBytesConfig
             kw["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_quant_type="nf4",
