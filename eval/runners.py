@@ -38,6 +38,28 @@ class HFRunner:
         self._model = None
         self._tok = None
 
+    # DETERMINISM IS A PROPERTY OF THE BOX, NOT OF THE DESIGN — measured, not assumed.
+    #
+    # On an H100 PCIe (torch 2.11+cu128), four identical generate() calls over the SAME batch of
+    # the same 24 prefixes returned FOUR DIFFERENT outputs. On an A100 and an L40S (torch
+    # 2.13+cu130) the same code was bit-exact. The A100/L40S "noise floor is 0.0" result was a
+    # property of those two boxes, and would have shipped as if it were a property of the
+    # mechanism.
+    #
+    # It is LENGTH-DEPENDENT, which is what identifies the cause: deterministic at 32 and 64 new
+    # tokens, nondeterministic at 128 and 256. That is a KV-length kernel heuristic switching to a
+    # split-K attention reduction whose atomics accumulate in nondeterministic order. Confirming
+    # it: torch.use_deterministic_algorithms(True) + CUBLAS_WORKSPACE_CONFIG=:4096:8 + TF32 off +
+    # reduced-precision-reduction off did NOT fix it, while pinning the attention implementation
+    # DID — both eager and the SDPA MATH backend are bit-exact at 256 on the same box.
+    #
+    # Why this matters more than its size: the crown is decided by greedy decoding, so a flipped
+    # near-tie changes the STEP TEXT, not just a logit. The parent scored against itself must be
+    # exactly 1.0 by construction (s = 0, |d_A - d_G| = 0); on the H100 it scored 0.8754. A
+    # 12-point self-inconsistency is not noise to be tolerated inside a margin, it means the round
+    # was not scoring what it believed it was scoring.
+    ATTN_IMPLEMENTATION = "eager"
+
     def _load(self):
         if self._model is not None:
             return
@@ -45,6 +67,8 @@ class HFRunner:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         kw = {"trust_remote_code": self._trust}
+        if self.ATTN_IMPLEMENTATION:
+            kw["attn_implementation"] = self.ATTN_IMPLEMENTATION
         if self.revision:
             kw["revision"] = self.revision
         self._tok = AutoTokenizer.from_pretrained(self.model_id, **kw)
@@ -324,6 +348,28 @@ class SafeStudentRunner(HFRunner):
         super().__init__(str(d), device=device, dtype=dtype,
                          name=name or f"student:{d.name}", trust_remote_code=False,
                          batch_size=batch_size)
+
+    # DETERMINISM IS A PROPERTY OF THE BOX, NOT OF THE DESIGN — measured, not assumed.
+    #
+    # On an H100 PCIe (torch 2.11+cu128), four identical generate() calls over the SAME batch of
+    # the same 24 prefixes returned FOUR DIFFERENT outputs. On an A100 and an L40S (torch
+    # 2.13+cu130) the same code was bit-exact. The A100/L40S "noise floor is 0.0" result was a
+    # property of those two boxes, and would have shipped as if it were a property of the
+    # mechanism.
+    #
+    # It is LENGTH-DEPENDENT, which is what identifies the cause: deterministic at 32 and 64 new
+    # tokens, nondeterministic at 128 and 256. That is a KV-length kernel heuristic switching to a
+    # split-K attention reduction whose atomics accumulate in nondeterministic order. Confirming
+    # it: torch.use_deterministic_algorithms(True) + CUBLAS_WORKSPACE_CONFIG=:4096:8 + TF32 off +
+    # reduced-precision-reduction off did NOT fix it, while pinning the attention implementation
+    # DID — both eager and the SDPA MATH backend are bit-exact at 256 on the same box.
+    #
+    # Why this matters more than its size: the crown is decided by greedy decoding, so a flipped
+    # near-tie changes the STEP TEXT, not just a logit. The parent scored against itself must be
+    # exactly 1.0 by construction (s = 0, |d_A - d_G| = 0); on the H100 it scored 0.8754. A
+    # 12-point self-inconsistency is not noise to be tolerated inside a margin, it means the round
+    # was not scoring what it believed it was scoring.
+    ATTN_IMPLEMENTATION = "eager"
 
     def _load(self):
         if self._model is not None:

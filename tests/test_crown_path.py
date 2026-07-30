@@ -2827,6 +2827,96 @@ def test_publisher_is_fail_closed():
         assert e10.publish.anchors_checked == 1, e10.publish
 
 
+def test_identity_canary_catches_a_nondeterministic_box():
+    """The parent scored against itself must be EXACTLY 1.0, and a validator that cannot reproduce
+    that has no business ranking anyone else.
+
+    This gate exists because of a measured result, not a hypothetical. On an H100 PCIe the noise
+    probe reported a clean floor while the parent scored 0.8754 against itself — generate() was
+    nondeterministic above ~64 new tokens on that box (deterministic at 32/64, not at 128/256,
+    which is a KV-length kernel heuristic switching to a split-K reduction with atomics). An A100
+    and an L40S returned exactly 1.0 on the same code. So determinism is a property of the hardware
+    and kernel selection, and a box can be silently unfit while every other gate passes."""
+    from eval.determinism import identity_check
+    from eval.observer_round import build_shared
+    from eval.steps import Trajectory
+
+    d3 = lambda x, y, z: {"a": x, "b": y, "c": z}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            return [d3(0.8, 0.1, 0.1)] * 6 if prefix.rstrip().endswith("X") \
+                else [d3(0.34, 0.33, 0.33)] * 6
+
+    class Steady:
+        def generate(self, prompts, max_new_tokens=256):
+            return ["X"] * len(prompts)
+
+    class Flaky:
+        """Deterministic for the shared rollout, then drifts — exactly the H100's failure shape:
+        the same call with the same batch returns different text on a later invocation."""
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, prompts, max_new_tokens=256):
+            self.calls += 1
+            if self.calls <= 1:
+                return ["X"] * len(prompts)
+            return ["X" if i % 4 else "W" for i in range(len(prompts))]
+
+    trajs = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"p{i}", step="s", index=0)
+             for i in range(16)]
+    obs = Obs()
+
+    # a deterministic box: the identity is exact, to the last bit
+    shared = build_shared(trajs, Steady(), obs, "obs")
+    ok, info = identity_check(shared, Steady(), obs)
+    assert ok, info
+    assert info["score"] == 1.0, info
+
+    # a box whose generation drifts: caught, with the shortfall quantified
+    flaky = Flaky()
+    shared2 = build_shared(trajs, flaky, obs, "obs")
+    ok2, info2 = identity_check(shared2, flaky, obs)
+    assert not ok2, info2
+    assert info2["shortfall"] > 0.01, info2
+    assert "disagrees with itself" in info2["verdict"], info2
+
+    # and the round ABORTS rather than crowning on a box that fails it — annotating the record
+    # would leave the crown standing, which is the wrong side to fail on
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.koth import Tier, Tournament
+    from eval.validator_observer_loop import CommittedSubmission, run_observer_round
+
+    with tempfile.TemporaryDirectory() as dd:
+        hb = _json.dumps({"w": {"dtype": "F32", "shape": [4],
+                                "data_offsets": [0, 16]}}).encode()
+        (Path(dd) / "model.safetensors").write_bytes(struct.pack("<Q", len(hb)) + hb + b"\0" * 16)
+        (Path(dd) / "config.json").write_text('{"hidden_size":8}')
+        h, salt = content_hash(dd), "s0"
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        out = run_observer_round(
+            1, "root", "nonce",
+            [CommittedSubmission("hot0", "cold0", "t", dd, 1.0, revealed_hash=h, salt=salt,
+                                 committed_value=commit_value(h, salt),
+                                 make_runner=lambda: Steady())],
+            trajs, Flaky(), {"kimi": obs}, tiers,
+            {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)},
+            Tournament(tiers, margin=0.03), RegistrationLedger(), {}, n_items=16)
+        assert any(e.get("action") == "abort" and "identity" in e.get("reason", "")
+                   for e in out.events), out.events
+        assert not out.weights, "crowned on a box that cannot reproduce the identity"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -2850,6 +2940,7 @@ def main() -> int:
              test_nonce_selects_items_and_record_is_rerunnable,
              test_rerun_audits_and_catches_a_rigged_record,
              test_publisher_is_fail_closed,
+             test_identity_canary_catches_a_nondeterministic_box,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

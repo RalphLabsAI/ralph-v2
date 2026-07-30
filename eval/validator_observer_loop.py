@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .determinism import crownable, measure_noise
+from .determinism import crownable, identity_check, measure_noise
 from .economics import RegistrationLedger
 from .gates import TierBudget, degeneracy_flags
 from .intake import intake
@@ -122,6 +122,7 @@ class ObserverRoundOutcome:
     noise: dict = field(default_factory=dict)
     item_indices: list = field(default_factory=list)
     corpus_spec: str = ""
+    identity: dict = field(default_factory=dict)
     # the tier->King map as it stood BEFORE this round scored anything. tournament.consider()
     # mutates in place, so without a snapshot a withheld round's crown survives in memory and the
     # next round writes it on chain — the gate would withhold payment and then pay anyway.
@@ -199,6 +200,20 @@ def run_observer_round(
     noise = measure_noise(observer, probe.prefix + "\n" + probe.parent_step, probe.continuation,
                           repeats=3)
     out.noise = noise.as_dict()
+
+    # 4b. IDENTITY CANARY — strictly stronger than the noise probe, and it caught a box the noise
+    #     probe passed. The parent scored against itself must be exactly 1.0 by construction; an
+    #     H100 PCIe returned 0.8754 because generate() is nondeterministic above ~64 new tokens
+    #     there, while an A100 and an L40S returned exactly 1.0 on the same code. A validator that
+    #     cannot reproduce the identity is unfit to rank anyone, so this ABORTS the round rather
+    #     than annotating it.
+    id_ok, id_info = identity_check(shared, parent, observer, max_step_tokens=max_step_tokens)
+    out.identity = id_info
+    if not id_ok:
+        out.events.append({"round": round_no, "action": "abort",
+                           "reason": "identity check failed: " + id_info.get("verdict", ""),
+                           "identity": id_info})
+        return out
 
     # 5. score each submission: one generation + one observer pass per usable sample
     scored: dict[str, Scored] = {}
@@ -305,6 +320,7 @@ def run_observer_round(
         "max_step_tokens": max_step_tokens,
         "max_cont_tokens": max_cont_tokens,
         "noise_safety": noise_safety,
+        "identity": out.identity,
         "frozen_rollouts": True,
         "versions": _versions(),
     }

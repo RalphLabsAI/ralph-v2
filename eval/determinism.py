@@ -99,3 +99,40 @@ def crownable(margin: float, noise: NoiseReport, safety: float = 3.0) -> tuple[b
         return False, (f"margin {margin:.6f} is inside the measured noise floor {need:.6f} "
                        f"(max same-input KL {noise.max_kl:.2e} x{safety:g}) — not crownable")
     return True, f"margin {margin:.6f} clears the noise floor {need:.6f}"
+
+
+# ---------------------------------------------------------------------------------------------
+# IDENTITY CANARY
+# ---------------------------------------------------------------------------------------------
+
+IDENTITY_TOLERANCE = 1e-6
+
+
+def identity_check(shared, parent, observer, max_step_tokens: int = 256) -> tuple[bool, dict]:
+    """Score the PINNED PARENT as if it were a submission. It must come back at exactly 1.0.
+
+    This is the cheapest and strictest determinism test available, and it is strictly better than
+    the noise probe it complements. By construction, when the miner's step IS the parent's step,
+    s = KL(P_G || P_A) = 0 and |d_A - d_G| = 0, so sample_score = exp(0)exp(0) = 1 for every
+    sample and the worst-slice aggregate is 1. There is no modelling assumption to argue about:
+    any shortfall is the pipeline disagreeing with itself.
+
+    MEASURED VALUE OF THIS GATE. On an H100 PCIe the noise probe reported a clean floor while this
+    check returned 0.8754 — a 12-point self-inconsistency, caused by generate() being
+    nondeterministic above ~64 new tokens on that box (see runners.HFRunner.ATTN_IMPLEMENTATION).
+    An A100 and an L40S returned exactly 1.0 on the same code. So determinism is a property of the
+    hardware and the kernel selection, and a validator can be silently unfit to award crowns while
+    every other gate passes. Run this at startup and refuse to score if it fails: a box that cannot
+    reproduce the identity has no business ranking anyone else.
+    """
+    from .observer_round import score_submission
+    ms = score_submission(shared, parent, observer, max_step_tokens=max_step_tokens)
+    info = {"score": ms.score, "n_scored": ms.n_scored, "reasons": list(ms.reasons),
+            "shortfall": round(1.0 - ms.score, 6)}
+    ok = abs(ms.score - 1.0) <= IDENTITY_TOLERANCE and not ms.reasons
+    if not ok:
+        info["verdict"] = (
+            f"parent scored {ms.score:.6f} against itself, not 1.0 — the pipeline disagrees with "
+            f"itself by {1.0 - ms.score:.4f}. Almost always nondeterministic generation: check "
+            f"attn_implementation and try a shorter max_step_tokens.")
+    return ok, info
