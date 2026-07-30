@@ -29,8 +29,36 @@ from .economics import RegistrationLedger
 from .gates import TierBudget, degeneracy_flags
 from .intake import intake
 from .koth import MIN_CROWN_LB, Scored, Submission, Tier, Tournament
-from .observer_round import build_shared, pick_observer, score_submission
+from .observer_round import build_shared, pick_observer, score_submission, select_trajectories
 from .round_record import RoundRecord, build_round_record
+
+
+def _sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256((text or "").encode()).hexdigest()
+
+
+def _versions() -> dict:
+    """Pin the stack a re-run must match. Logit arithmetic is not portable across these, so an
+    auditor comparing numbers needs to know which stack produced them."""
+    out = {}
+    try:
+        import torch
+        out["torch"] = torch.__version__
+    except Exception:
+        pass
+    try:
+        import transformers
+        out["transformers"] = transformers.__version__
+    except Exception:
+        pass
+    try:
+        from .runners import HFRunner
+        out["topk"] = HFRunner.TOPK
+        out["prob_decimals"] = HFRunner.PROB_DECIMALS
+    except Exception:
+        pass
+    return out
 
 
 @dataclass
@@ -56,6 +84,8 @@ class ObserverRoundOutcome:
     refunds: dict = field(default_factory=dict)
     observer: str = ""
     noise: dict = field(default_factory=dict)
+    item_indices: list = field(default_factory=list)
+    corpus_spec: str = ""
     events: list = field(default_factory=list)
     scores: dict = field(default_factory=dict)
 
@@ -63,16 +93,24 @@ class ObserverRoundOutcome:
 def run_observer_round(
     round_no: int, commit_root: str, round_nonce: str,
     committed: list[CommittedSubmission],
-    trajectories, parent, observers: dict,
+    trajectory_pool, parent, observers: dict,
     tiers: list[Tier], tier_budgets: dict[str, TierBudget],
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     parent_id: str = "parent", signer=None,
     max_step_tokens: int = 256, max_cont_tokens: int = 128,
     noise_safety: float = 3.0, canary=None,
+    n_items: int = 64, corpus_spec: str = "",
 ) -> ObserverRoundOutcome:
-    """`observers`: name -> observer model. The round's observer is DRAWN FROM THE NONCE, so a
-    miner cannot know which one it will face; `canary(sub, runner) -> (ok, info)` is the optional
-    capability tripwire."""
+    """`trajectory_pool` is a LARGE pool; which items are scored is drawn from the nonce.
+
+    That argument used to be the scored list itself, which meant the OPERATOR CHOSE THE EXAM —
+    the same trust a single-validator subnet has, but invisible because no record showed it. Now
+    the selection derives from commit_root+round_nonce and the chosen indices are signed into the
+    record, so an auditor re-derives the identical exam.
+
+    `corpus_spec` must identify the pool's ORDERING (source + revision + dedup rule): an index is
+    only meaningful against a pinned ordering. `observers`: name -> model; the round's observer is
+    also drawn from the nonce. `canary(sub, runner) -> (ok, info)` is the capability tripwire."""
     out = ObserverRoundOutcome()
 
     # 1. front door. Nothing untrusted is loaded until economics, safety, the bit budget, the
@@ -95,6 +133,12 @@ def run_observer_round(
     obs_name = pick_observer(commit_root, round_nonce, sorted(observers))
     observer = observers[obs_name]
     out.observer = obs_name
+
+    # 2b. WHICH items are scored is post-commit entropy, not an operator choice
+    trajectories, item_idx = select_trajectories(trajectory_pool, commit_root, round_nonce,
+                                                n_items)
+    out.item_indices = list(item_idx)
+    out.corpus_spec = corpus_spec
 
     # 3. shared rollouts — the miner-independent four-fifths of the work, once per round
     shared = build_shared(trajectories, parent, observer, obs_name,
@@ -172,12 +216,33 @@ def run_observer_round(
         if refund:
             out.refunds[s.sub.miner] = refund
     out.weights = tournament.weights()
-    pts = [{"rollout_id": s.traj_id, "k": s.index if hasattr(s, "index") else 0,
-            "mode": "observer_kl"} for s in usable[:64]]
+    # POINTS: every usable sample, not a truncated 64, and each carries the FROZEN parent step
+    # and continuation C. That is what turns a re-run into a pure forward pass: the auditor does
+    # not have to reproduce batched greedy generation (the noisiest part of the round, and the
+    # part the zero-noise measurement never covered) — only the observer's distributions over
+    # text the record hands it.
+    pts = [{"rollout_id": s.traj_id, "k": 0, "mode": "observer_kl",
+            "prefix_sha256": _sha(s.prefix), "parent_step": s.parent_step,
+            "continuation": s.continuation, "d_parent": round(s.d_parent, 6)}
+           for s in usable]
+    manifest = {
+        "corpus_spec": corpus_spec,
+        "item_indices": list(out.item_indices),
+        "n_items_requested": n_items,
+        "observer": obs_name,
+        "observer_pool": sorted(observers),
+        "parent": parent_id,
+        "max_step_tokens": max_step_tokens,
+        "max_cont_tokens": max_cont_tokens,
+        "noise_safety": noise_safety,
+        "frozen_rollouts": True,
+        "versions": _versions(),
+    }
     out.record = build_round_record(round_no, commit_root, round_nonce, parent_id,
                                     f"observer:{obs_name}", "unconditioned",
                                     f"trajectories:{len(usable)}", pts, scored, out.events,
-                                    out.weights)
+                                    out.weights, manifest=manifest, noise=out.noise,
+                                    safety=noise_safety)
     if signer is not None:
         out.record.sign(signer)
     return out

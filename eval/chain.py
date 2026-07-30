@@ -211,12 +211,13 @@ def run_v2_axis_epoch(
 
 def run_v2_observer_epoch(
     chain: ChainIO, round_no: int,
-    trajectories, parent, observers: dict,
+    trajectory_pool, parent, observers: dict,
     tiers: list[Tier], tier_budgets: dict[str, TierBudget],
     tournament: Tournament, ledger: RegistrationLedger, registry: dict,
     commit_window: int = 100, make_safe_runner=None, parent_id: str = "parent",
     max_step_tokens: int = 256, max_cont_tokens: int = 128,
     signer=None, canary=None, noise_safety: float = 3.0,
+    n_items: int = 64, corpus_spec: str = "",
 ) -> EpochResult:
     """One v2 epoch on the OBSERVER-KL substrate — the crown path.
 
@@ -244,10 +245,10 @@ def run_v2_observer_epoch(
         for c in commits
     ]
     outcome = run_observer_round(
-        round_no, commit_root, round_nonce, committed, trajectories, parent, observers,
+        round_no, commit_root, round_nonce, committed, trajectory_pool, parent, observers,
         tiers, tier_budgets, tournament, ledger, registry, parent_id=parent_id,
         signer=signer, max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens,
-        noise_safety=noise_safety, canary=canary,
+        noise_safety=noise_safety, canary=canary, n_items=n_items, corpus_spec=corpus_spec,
     )
     return _write_back(chain, tiers, tournament, outcome, round_no)
 

@@ -148,6 +148,39 @@ def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: O
     return score_miner(samples, alpha=alpha, beta=beta)
 
 
+def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
+                        tag: str = "observer-items"):
+    """Draw WHICH trajectories are scored from POST-COMMIT entropy, and record the choice.
+
+    This closes the largest hole in the crown path. `run_observer_round` used to accept a
+    trajectory LIST from its caller, which meant the operator chose the exam — the same trust
+    the single-validator subnets have, except invisible, because no record showed it. With the
+    selection derived from `commit_root ‖ round_nonce`:
+
+      * the operator cannot pick favourable items (the nonce comes from a block drawn after the
+        commitment window closed);
+      * an auditor re-derives the identical selection and re-runs the round;
+      * the chosen indices go in the signed record, so the claim is checkable rather than
+        asserted.
+
+    Returns (selected, indices). Indices are into the pool AS PASSED, so the record must also
+    pin the corpus spec that produced the pool — an index is only meaningful against a known,
+    revision-pinned ordering."""
+    import random as _r
+    total = len(pool)
+    if total == 0:
+        return [], []
+    k = min(n, total)
+    rng = _r.Random(derive_seed(commit_root, round_nonce, tag))
+    idx = sorted(rng.sample(range(total), k))
+    return [pool[i] for i in idx], idx
+
+
+def derive_seed(commit_root: str, round_nonce: str, tag: str) -> int:
+    from .seeds import derive_seed as _d
+    return _d(commit_root, round_nonce, tag)
+
+
 def pick_observer(commit_root: str, round_nonce: str, pool: Sequence[str]) -> str:
     """Draw the round's observer from POST-COMMIT entropy.
 

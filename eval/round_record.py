@@ -46,6 +46,16 @@ class RoundRecord:
     submissions: list        # [SubmissionRecord...]
     events: list             # tournament events (crown/hold/dethrone)
     weights: dict
+    # RE-RUN MANIFEST. Rule: if a value moved the crown, it is in canonical(). Anything omitted
+    # is something an auditor has to guess, and a guess is where v1's auditor died — its replay
+    # diverged on 37 of 40 real reports because the report omitted state the scorer carried.
+    manifest: dict = field(default_factory=dict)
+    # The measured noise floor the crown was gated on. determinism.py promises "publish both
+    # numbers either way"; keeping it OUT of the signed body made the gating number unverifiable.
+    noise: dict = field(default_factory=dict)
+    # Tolerance is derived from the MEASURED floor, not assumed. The old 0.02 default was ~200x
+    # looser than the measured forward-pass floor, i.e. it would certify a materially wrong
+    # re-run. build_round_record() sets this from `noise` when one is supplied.
     reproduction_tolerance: float = 0.02   # allowed |retention| drift on re-run
     # signature over canonical() — attributes the record to a validator identity. A bare
     # hash proves self-consistency only; anyone can mint an alternative record + hash.
@@ -100,15 +110,31 @@ class RoundRecord:
 
 def build_round_record(round_no: int, commit_root: str, round_nonce: str, teacher: str,
                        judge: str, base: str, pile_id: str, points, scored: dict,
-                       events: list, weights: dict) -> RoundRecord:
-    pts = [{"rollout_id": p.rollout_idx if hasattr(p, "rollout_idx") else p.get("rollout_id"),
-            "k": getattr(p, "k", None) if hasattr(p, "k") else p.get("k"),
-            "mode": getattr(p, "mode", None) if hasattr(p, "mode") else p.get("mode")}
-           for p in points]
+                       events: list, weights: dict, manifest: dict | None = None,
+                       noise: dict | None = None, safety: float = 3.0) -> RoundRecord:
+    def _pt(p):
+        if not isinstance(p, dict):
+            return {"rollout_id": getattr(p, "rollout_idx", None), "k": getattr(p, "k", None),
+                    "mode": getattr(p, "mode", None)}
+        # PASS THROUGH every key the caller supplied. This used to project onto
+        # {rollout_id, k, mode}, which silently discarded the frozen parent_step and
+        # continuation — i.e. exactly the fields that make a re-run a pure forward pass. A
+        # record that drops what the scorer used is how v1's auditor came to diverge on 92% of
+        # reports, so the default here is KEEP, not filter.
+        return dict(p)
+
+    pts = [_pt(p) for p in points]
     subs = [SubmissionRecord(
         model_id=mid, miner=s.sub.miner, tier=s.sub.tier,
         retention=round(s.retention, 6), retention_lb=round(s.retention_lb, 6),
         per_point=[round(x, 4) for x in s.per_point], gates_ok=s.gates_ok, reasons=s.reasons)
         for mid, s in scored.items()]
-    return RoundRecord(round_no, commit_root, round_nonce, teacher, judge, base, pile_id,
-                       pts, subs, events, weights)
+    rec = RoundRecord(round_no, commit_root, round_nonce, teacher, judge, base, pile_id,
+                      pts, subs, events, weights,
+                      manifest=dict(manifest or {}), noise=dict(noise or {}))
+    if noise:
+        # derive the acceptance band from the MEASURED floor instead of a fixed 0.02, which was
+        # ~200x looser than measured and would certify a materially wrong re-run.
+        mk = float(noise.get("max_kl", 0.0) or 0.0)
+        rec.reproduction_tolerance = max(1e-4, safety * mk)
+    return rec

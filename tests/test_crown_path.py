@@ -2073,6 +2073,114 @@ def test_miner_submit_and_chain_adapter():
     assert _json.loads(env)["v"] == 2 and len(env) < 300, env
 
 
+def test_nonce_selects_items_and_record_is_rerunnable():
+    """TWO properties that decide whether "one validator" is a trust assumption or a checkable
+    convenience.
+
+    1. THE OPERATOR MUST NOT CHOOSE THE EXAM. run_observer_round used to take the scored
+       trajectory LIST from its caller, so the operator picked the items and no record showed it
+       — the same trust a single-validator subnet has, but invisible. Selection now derives from
+       commit_root+round_nonce and the indices are signed into the record.
+    2. THE RECORD MUST BE SUFFICIENT TO RE-RUN. v1's auditor diverged on 37 of 40 real reports
+       because the report omitted state the scorer carried. So the record freezes the parent step
+       and continuation C, pins the stack, and carries the noise floor the crown was gated on."""
+    from eval.observer_round import select_trajectories
+    from eval.steps import Trajectory
+
+    pool = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"p{i}", step="s", index=0)
+            for i in range(400)]
+
+    # reproducible for an auditor, and it MOVES with the nonce
+    a, ia = select_trajectories(pool, "root", "nonceA", 24)
+    a2, ia2 = select_trajectories(pool, "root", "nonceA", 24)
+    b, ib = select_trajectories(pool, "root", "nonceB", 24)
+    assert ia == ia2 and [t.id for t in a] == [t.id for t in a2], "selection not reproducible"
+    assert ia != ib, "nonce did not change which items are scored"
+    assert len(ia) == len(set(ia)) == 24
+    assert all(pool[i].id == t.id for i, t in zip(ia, a)), "indices do not match the selection"
+    # spread across the pool, not a prefix an operator could arrange
+    assert max(ia) > 200, ia
+
+    # ---- the record, from a real round ----
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+    from eval.chain import Commitment, run_v2_observer_epoch
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.koth import Tier, Tournament
+    from eval.shadow_axis_epoch import FakeChain
+    from eval.signing import Ed25519Signer
+
+    def mk(d, n):
+        hdr = {"w": {"dtype": "F32", "shape": [n], "data_offsets": [0, 4 * n]}}
+        hb = _json.dumps(hdr).encode()
+        with open(Path(d) / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hb)) + hb + b"\0" * (4 * n))
+        (Path(d) / "config.json").write_text('{"hidden_size":8}')
+
+    def d3(x, y, z):
+        return {"a": x, "b": y, "c": z}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            if prefix.rstrip().endswith("X"):
+                return [d3(0.8, 0.1, 0.1)] * 6
+            return [d3(0.34, 0.33, 0.33)] * 6
+
+    class Step:
+        def __init__(self, tok):
+            self.tok = tok
+
+        def generate(self, prompts, max_new_tokens=256):
+            return [self.tok] * len(prompts)
+
+    with tempfile.TemporaryDirectory() as dd:
+        mk(dd, 4)
+        h, salt = content_hash(dd), "s0"
+        commits = [Commitment("hot0", "cold0", "t", dd, 1.0, revealed_hash=h, salt=salt,
+                              committed_value=commit_value(h, salt))]
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        chain = FakeChain(commits)
+        res = run_v2_observer_epoch(
+            chain, 1, pool, Step("X"), {"kimi": Obs(), "qwen": Obs()}, tiers,
+            {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)},
+            Tournament(tiers, margin=0.03), RegistrationLedger(), {},
+            make_safe_runner=lambda cd: Step("X"),
+            signer=Ed25519Signer(seed=b"z" * 32), n_items=20,
+            corpus_spec="glaive_r1@rev=abc123|dedup=none|order=stream")
+
+        rec = res.outcome.record
+        assert rec is not None and rec.verify_signature(), "record unsigned or invalid"
+        m = rec.manifest
+        # the exam is pinned: which corpus, which ordering, which items, which observer
+        assert m["corpus_spec"] == "glaive_r1@rev=abc123|dedup=none|order=stream"
+        assert m["item_indices"] == res.outcome.item_indices and len(m["item_indices"]) == 20
+        assert m["observer"] in m["observer_pool"] and len(m["observer_pool"]) == 2
+        assert m["frozen_rollouts"] is True
+        assert "torch" in m["versions"] or "topk" in m["versions"], m["versions"]
+
+        # the NOISE the crown was gated on is inside the SIGNED body, and sets the tolerance
+        assert rec.noise and "max_kl" in rec.noise, rec.noise
+        assert rec.reproduction_tolerance <= 0.02, rec.reproduction_tolerance
+        assert "noise" in rec.canonical() and "manifest" in rec.canonical()
+
+        # every point carries the FROZEN parent step + continuation, so a re-run is a pure
+        # forward pass and never has to reproduce batched greedy generation
+        assert rec.points, rec.points
+        for p in rec.points:
+            assert p["parent_step"] and p["continuation"], p
+            assert len(p["prefix_sha256"]) == 64
+        # ...and tampering with the frozen text breaks the signature
+        rec.points[0]["continuation"] = "tampered"
+        assert not rec.verify_signature(), "frozen rollout text is not covered by the signature"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -2093,6 +2201,7 @@ def main() -> int:
              test_observer_kl_step_scoring, test_step_extraction, test_observer_round,
              test_determinism_gate, test_observer_epoch_end_to_end, test_artifact_manifest,
              test_miner_submit_and_chain_adapter,
+             test_nonce_selects_items_and_record_is_rerunnable,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
