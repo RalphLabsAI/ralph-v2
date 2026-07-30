@@ -62,6 +62,12 @@ class ChainIO(Protocol):
     def get_king(self, tier: str) -> object | None: ...
     def blacklist(self, hotkey: str, reason: str) -> None: ...
     def publish_record(self, record: RoundRecord) -> None: ...
+    # The anchor currently committed on chain. REQUIRED, and in the protocol rather than probed
+    # with getattr, because the first version of the publish gate read it with
+    # getattr(chain, "record_anchors", None): no adapter implemented it, the anchor comparison was
+    # skipped in silence, and the heartbeat degraded to comparing the operator's bytes against the
+    # operator's index. A missing method must be a type error, not a quietly weaker guarantee.
+    def head_anchor(self) -> str: ...
     # settle refundable anti-grind bonds. Without this the ledger computes refunds
     # and drops them, so the bond is never actually returned (or forfeited) on
     # chain and the anti-grind economics are theatre.
@@ -77,6 +83,8 @@ class EpochResult:
     # previous crown keeps earning until the operator fixes publishing.
     publish: object = None
     weights_set: bool = False
+    # set when the gate withheld payment. Kept OFF the signed record on purpose (see _write_back).
+    withheld: dict | None = None
 
 
 def run_v2_epoch(
@@ -255,9 +263,13 @@ def run_v2_observer_epoch(
                      revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value)
         for c in commits
     ]
+    # The anchor link goes INSIDE the signed body, so the previous head has to be known before the
+    # record is built and signed — it cannot be back-filled at publish time.
+    prev_anchor = publisher.head_anchor() if publisher is not None else ""
     outcome = run_observer_round(
         round_no, commit_root, round_nonce, committed, trajectory_pool, parent, observers,
         tiers, tier_budgets, tournament, ledger, registry, parent_id=parent_id,
+        prev_anchor=prev_anchor,
         signer=signer, max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens,
         noise_safety=noise_safety, canary=canary, n_items=n_items, corpus_spec=corpus_spec,
     )
@@ -279,7 +291,11 @@ def _write_back(chain: ChainIO, tiers, tournament, outcome, round_no,
 
     forced = _os.environ.get("RALPH_REQUIRE_PUBLISH", "").strip() not in ("", "0", "false")
     if require_publish is None:
-        require_publish = publisher is not None or forced
+        require_publish = publisher is not None
+    # The env var is a HARD floor, not a default. It used to only fill in when require_publish was
+    # None, so a single require_publish=False argument anywhere in the call path silently defeated
+    # the one switch an operator sets to guarantee the gate is on.
+    require_publish = require_publish or forced
     if require_publish and publisher is None:
         raise PublishError("RALPH_REQUIRE_PUBLISH is set but no publisher was configured — "
                            "refusing to run a round whose record nobody can fetch")
@@ -290,16 +306,26 @@ def _write_back(chain: ChainIO, tiers, tournament, outcome, round_no,
         # publish_and_gate, so a snapshot taken here would never contain it
         rep = publish_and_gate(publisher, outcome.record,
                                anchors=getattr(chain, "record_anchors", None),
-                               anchor_fn=getattr(chain, "publish_record", None))
+                               anchor_fn=getattr(chain, "publish_record", None),
+                               head_anchor_fn=getattr(chain, "head_anchor", None),
+                               allow_unanchored=not require_publish)
         res.publish = rep
         if not rep.ok and require_publish:
             # FAIL CLOSED. No crown written on chain, no weights set. Emission does not stop —
             # the previously set weights persist, so the last verifiably published crown keeps
             # earning. A hold, not a halt; see publish.py for why that residual is stated openly.
-            outcome.events.append({
+            # ROLL BACK THE CROWN. tournament.consider() already mutated tournament.kings during
+            # scoring, so returning here left the withheld round's king in memory — and the NEXT
+            # round's set_king wrote it on chain and paid it, which defeats the whole gate.
+            if getattr(outcome, "kings_before", None) is not None:
+                tournament.kings = dict(outcome.kings_before)
+            # Do NOT append to outcome.events: the record holds that list, is already signed and
+            # already published, so mutating it invalidates the signature of published bytes and
+            # makes the round permanently unrepublishable. The reason lives on the result instead.
+            res.withheld = {
                 "round": round_no, "action": "withhold_weights",
                 "reason": "; ".join(rep.reasons) or "record not verifiably published",
-                "stale_rounds": rep.stale_rounds})
+                "stale_rounds": rep.stale_rounds}
             return res
     elif outcome.record is not None:
         chain.publish_record(outcome.record)

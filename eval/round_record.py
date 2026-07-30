@@ -70,6 +70,12 @@ class RoundRecord:
     # The measured noise floor the crown was gated on. determinism.py promises "publish both
     # numbers either way"; keeping it OUT of the signed body made the gating number unverifiable.
     noise: dict = field(default_factory=dict)
+    # HASH-CHAIN LINK. The anchor for round n is H(prev_anchor ‖ sha256(record)), so the single
+    # on-chain commitment slot commits to the WHOLE history rather than only the latest round.
+    # Without this, "the anchor is the half the operator cannot rewrite" was not true: one slot
+    # holds one digest, so every past record was checkable only against an index the operator also
+    # owns, and deleting or swapping an old round broke nothing.
+    prev_anchor: str = ""
     # Tolerance is derived from the MEASURED floor, not assumed. The old 0.02 default was ~200x
     # looser than the measured forward-pass floor, i.e. it would certify a materially wrong
     # re-run. build_round_record() sets this from `noise` when one is supplied.
@@ -128,7 +134,8 @@ class RoundRecord:
 def build_round_record(round_no: int, commit_root: str, round_nonce: str, teacher: str,
                        judge: str, base: str, pile_id: str, points, scored: dict,
                        events: list, weights: dict, manifest: dict | None = None,
-                       noise: dict | None = None, safety: float = 3.0) -> RoundRecord:
+                       noise: dict | None = None, safety: float = 3.0,
+                       prev_anchor: str = "") -> RoundRecord:
     def _pt(p):
         if not isinstance(p, dict):
             return {"rollout_id": getattr(p, "rollout_idx", None), "k": getattr(p, "k", None),
@@ -154,8 +161,13 @@ def build_round_record(round_no: int, commit_root: str, round_nonce: str, teache
         role=getattr(s, "role", "challenger"))
         for mid, s in scored.items()]
     rec = RoundRecord(round_no, commit_root, round_nonce, teacher, judge, base, pile_id,
-                      pts, subs, events, weights,
-                      manifest=dict(manifest or {}), noise=dict(noise or {}))
+                      # COPY the events list. It used to be stored by reference, so a caller
+                      # appending one more event after signing silently invalidated the signature
+                      # of an already-published record — demonstrated, and it would have made that
+                      # round permanently unrepublishable.
+                      pts, subs, list(events), weights,
+                      manifest=dict(manifest or {}), noise=dict(noise or {}),
+                      prev_anchor=prev_anchor)
     if noise:
         # derive the acceptance band from the MEASURED floor instead of a fixed 0.02, which was
         # ~200x looser than measured and would certify a materially wrong re-run.

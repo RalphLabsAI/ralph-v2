@@ -123,6 +123,20 @@ class HFSink:
 INDEX = "index.json"
 
 
+def anchor_of(prev_anchor: str, record_digest: str) -> str:
+    """A_n = H(A_{n-1} ‖ digest_n). One on-chain slot then commits to the entire history.
+
+    This exists because the first version of this module was wrong in a way that mattered: it
+    compared each published record against a per-round anchor dict, and NO chain adapter in the
+    repo provided one — `getattr(chain, "record_anchors", None)` returned None in production, the
+    comparison was skipped in silence, and the heartbeat degraded to checking operator-owned bytes
+    against an operator-owned index. A commitment slot holds one value, so per-round anchors were
+    never implementable; chaining them is. Deleting, reordering or altering ANY past record now
+    changes the recomputed head, which the operator cannot retroactively fix because the old
+    commitment is in block history."""
+    return hashlib.sha256(f"{prev_anchor}|{record_digest}".encode()).hexdigest()
+
+
 def record_name(round_no: int, digest: str) -> str:
     """Content-addressed in the filename, so a record cannot be swapped for a different one at the
     same path without the name changing."""
@@ -136,6 +150,13 @@ class Published:
     uri: str
     name: str
     signer: str = ""
+    # the hash-chain link. `anchor` is what gets committed on chain for this round.
+    prev_anchor: str = ""
+    anchor: str = ""
+    # signature bytes are NOT covered by sha256() (canonical() excludes them), so attribution has
+    # to be pinned separately or a published record can be re-signed by any key afterwards with
+    # both the digest check and the anchor still matching.
+    signature: str = ""
 
 
 @dataclass
@@ -145,11 +166,18 @@ class PublishReport:
     stale_rounds: list = field(default_factory=list)   # in-window rounds that no longer verify
     checked_rounds: list = field(default_factory=list)
     anchors_checked: int = 0
+    # did the recomputed chain head match what the chain actually holds? Required for `ok` unless
+    # the caller explicitly opted out — a heartbeat that cannot reach the chain is comparing the
+    # operator's bytes to the operator's index and proves nothing.
+    anchor_verified: bool = False
     reasons: list = field(default_factory=list)
+    # things worth surfacing that do not by themselves withhold payment
+    notes: list = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return self.verified and not self.stale_rounds and not self.reasons
+        return (self.verified and self.anchor_verified
+                and not self.stale_rounds and not self.reasons)
 
 
 class PublishError(RuntimeError):
@@ -159,7 +187,17 @@ class PublishError(RuntimeError):
 class RecordPublisher:
     """Publishes records, maintains the append-only index, and re-verifies a trailing window."""
 
-    def __init__(self, sink: Sink, window: int = 8, state_path: str = ""):
+    def __init__(self, sink: Sink, window: int = 8, state_path: str = "",
+                 allow_no_state: bool = False):
+        if not state_path and not allow_no_state:
+            # The never-shrink guard was opt-in, which is the same as absent: constructing a
+            # publisher the ordinary way left `_hwm` at 0, so a cold start plus one transient index
+            # read reproduced v1's lineage bug with no malice required. Making the omission
+            # explicit means it can only happen on purpose.
+            raise PublishError(
+                "state_path is required: without it the never-shrink high-water mark is disabled "
+                "and a failed index read looks identical to an empty history. Pass "
+                "allow_no_state=True only for throwaway/dry-run publishers.")
         self.sink = sink
         self.window = window
         # LOCAL HIGH-WATER MARK, and it is load-bearing rather than an optimisation. `sink.get`
@@ -227,14 +265,39 @@ class RecordPublisher:
                 f"refusing to replace it with {entry['sha256'][:12]}…")
         by_round[entry["round"]] = entry
         merged = sorted(by_round.values(), key=lambda r: r["round"])
+        # CHAIN CONTINUITY over the whole index, so a deleted or reordered middle round shows up
+        # here rather than waiting for someone to run the history tool.
+        run = ""
+        for r in merged:
+            if r.get("anchor"):
+                want = anchor_of(run, r["sha256"])
+                if r["anchor"] != want:
+                    raise PublishError(f"anchor chain breaks at round {r['round']}: "
+                                       f"have {r['anchor'][:16]}… want {want[:16]}…")
+                run = r["anchor"]
         if len(merged) < len(idx["rounds"]):
             raise PublishError("merged index is shorter than the live one — refusing to shrink")
         return {"rounds": merged, "head": merged[-1]["round"]}
 
     # ---- publish -----------------------------------------------------------
 
+    def head_anchor(self) -> str:
+        """The anchor an outsider should find committed on chain. Empty before the first round."""
+        rounds = self.load_index().get("rounds", [])
+        return rounds[-1].get("anchor", "") if rounds else ""
+
     def publish(self, record) -> Published:
         digest = record.sha256()
+        idx0 = self.load_index()
+        rounds0 = idx0.get("rounds", [])
+        prev = rounds0[-1].get("anchor", "") if rounds0 else ""
+        if getattr(record, "prev_anchor", "") != prev:
+            # The link is inside the SIGNED body, so it cannot be back-filled after the fact. A
+            # mismatch means this record was built against a different history than the one live.
+            raise PublishError(
+                f"record {record.round} was signed with prev_anchor "
+                f"{(getattr(record, 'prev_anchor', '') or '(none)')[:16]}… but the live history "
+                f"head is {(prev or '(none)')[:16]}… — refusing to graft it onto a different chain")
         blob = json.dumps(asdict(record), sort_keys=True, separators=(",", ":")).encode()
         name = record_name(record.round, digest)
         uri = self.sink.put(name, blob)
@@ -248,12 +311,16 @@ class RecordPublisher:
             raise PublishError(f"{name} reads back different from what was written")
         # and the round-trip must still be a valid, signed record — a body that survives byte
         # comparison but fails its own signature means the record was already broken upstream
-        if not self._roundtrip_ok(back, digest):
-            raise PublishError(f"{name} does not round-trip to a signature-valid record")
+        if not self._roundtrip_ok(back, digest, expect_round=record.round,
+                                  expect_signature=getattr(record, "signature", "")):
+            raise PublishError(f"{name} does not round-trip to a signature-valid record "
+                               f"for round {record.round}")
 
         pub = Published(round=record.round, sha256=digest, uri=uri, name=name,
-                        signer=getattr(record, "signer", ""))
-        idx = self._merge(self.load_index(), asdict(pub))
+                        signer=getattr(record, "signer", ""), prev_anchor=prev,
+                        anchor=anchor_of(prev, digest),
+                        signature=getattr(record, "signature", ""))
+        idx = self._merge(idx0, asdict(pub))
         self.sink.put(INDEX, json.dumps(idx, sort_keys=True, indent=1).encode())
         back_idx = self.sink.get(INDEX)
         if back_idx is None:
@@ -264,7 +331,16 @@ class RecordPublisher:
         return pub
 
     @staticmethod
-    def _roundtrip_ok(blob: bytes, digest: str) -> bool:
+    def _roundtrip_ok(blob: bytes, digest: str, expect_round: int | None = None,
+                      expect_signature: str = "") -> bool:
+        """Digest + signature + ROUND NUMBER + signature bytes.
+
+        Checking only the digest let one round's blob be aliased into another round's index slot:
+        the entry says round 7, the bytes are round 3's record, the recorded sha matches those
+        bytes, and every check passed while round 7 was erased. And because canonical() excludes
+        the signature fields, a published record could be re-signed by any key (or stripped of
+        attribution) with both the digest and the anchor still matching — so the signature is
+        pinned in the index too."""
         from .round_record import RoundRecord, SubmissionRecord
         try:
             raw = json.loads(blob.decode())
@@ -273,6 +349,10 @@ class RecordPublisher:
         except Exception:
             return False
         if rec.sha256() != digest:
+            return False
+        if expect_round is not None and rec.round != expect_round:
+            return False
+        if expect_signature and rec.signature != expect_signature:
             return False
         return rec.verify_signature() if rec.signature else True
 
@@ -293,8 +373,10 @@ class RecordPublisher:
             if blob is None:
                 stale.append({"round": r["round"], "why": "no longer fetchable"})
                 continue
-            if not self._roundtrip_ok(blob, r["sha256"]):
-                stale.append({"round": r["round"], "why": "digest or signature no longer matches"})
+            if not self._roundtrip_ok(blob, r["sha256"], expect_round=r["round"],
+                                      expect_signature=r.get("signature", "")):
+                stale.append({"round": r["round"],
+                              "why": "digest, round number or signature no longer matches"})
                 continue
             if anchors is not None:
                 a = anchors.get(r["round"]) if hasattr(anchors, "get") else None
@@ -311,7 +393,8 @@ class RecordPublisher:
 
 
 def publish_and_gate(publisher: RecordPublisher, record, anchors=None, anchor_fn=None,
-                     require_signature: bool = True) -> PublishReport:
+                     require_signature: bool = True, head_anchor_fn=None,
+                     allow_unanchored: bool = False) -> PublishReport:
     """Publish, verify, re-check the window. `report.ok` is False -> DO NOT set weights.
 
     `anchors` may be a mapping OR a zero-arg callable returning one. Prefer the callable: the
@@ -344,6 +427,31 @@ def publish_and_gate(publisher: RecordPublisher, record, anchors=None, anchor_fn
     resolved = anchors() if callable(anchors) else anchors
     rep.stale_rounds, rep.checked_rounds, rep.anchors_checked = publisher.verify_window(
         record.round, resolved)
+
+    # THE CHAIN HEAD. This is the only check in the module the operator cannot satisfy by editing
+    # their own storage, so `ok` requires it. `allow_unanchored` exists for local dry-runs and is
+    # never the production path; when it is used, the reason is recorded rather than hidden, so a
+    # round that was never really anchored cannot later be described as verified.
+    want = publisher.head_anchor()
+    if head_anchor_fn is None:
+        if allow_unanchored:
+            rep.anchor_verified = True
+            rep.notes.append("NOT ANCHORED ON CHAIN — allow_unanchored was set, so this round's "
+                             "history is checkable only against storage the operator owns")
+        else:
+            rep.reasons.append("chain exposes no head_anchor(); the heartbeat would compare the "
+                               "operator's bytes against the operator's index and prove nothing")
+        return rep
+    try:
+        got = head_anchor_fn()
+    except Exception as e:
+        rep.reasons.append(f"could not read the on-chain anchor: {type(e).__name__}: {e}")
+        return rep
+    if got != want:
+        rep.reasons.append(f"on-chain anchor {(got or '(none)')[:16]}… does not match the "
+                           f"recomputed history head {(want or '(none)')[:16]}…")
+        return rep
+    rep.anchor_verified = True
     return rep
 
 
@@ -354,16 +462,23 @@ class HistoryReport:
     n_rounds: int = 0
     gaps: list = field(default_factory=list)        # round numbers claimed by no entry
     broken: list = field(default_factory=list)      # entries that no longer fetch/verify
-    unanchored: list = field(default_factory=list)  # published but not anchored on chain
+    unanchored: list = field(default_factory=list)  # entries carrying no chain link at all
     mismatched: list = field(default_factory=list)  # published != anchored
+    chain_breaks: list = field(default_factory=list)  # recomputed anchor != recorded anchor
+    head_anchor: str = ""
+    head_checked: bool = False
 
     @property
     def ok(self) -> bool:
-        return not (self.gaps or self.broken or self.mismatched)
+        # `unanchored` counts. It was excluded, which meant a trail with no chain links AT ALL
+        # reported COMPLETE — the single worst thing this report could say, because an unanchored
+        # trail is exactly the operator-vs-operator comparison the anchors exist to escape.
+        return not (self.gaps or self.broken or self.mismatched or self.chain_breaks
+                    or self.unanchored) and self.head_checked
 
 
-def verify_history(publisher: RecordPublisher, anchors=None, first_round: int | None = None
-                   ) -> HistoryReport:
+def verify_history(publisher: RecordPublisher, anchors=None, first_round: int | None = None,
+                   head_anchor_fn=None) -> HistoryReport:
     """Walk the WHOLE index, not just the trailing window.
 
     The window heartbeat is what the gate can afford every round; this is what an outsider runs
@@ -380,14 +495,30 @@ def verify_history(publisher: RecordPublisher, anchors=None, first_round: int | 
     lo = rounds[0]["round"] if first_round is None else first_round
     rep.gaps = [n for n in range(lo, rounds[-1]["round"] + 1) if n not in have]
     resolved = anchors() if callable(anchors) else anchors
+    run = ""
     for r in rounds:
         blob = publisher.sink.get(r["name"])
         if blob is None:
             rep.broken.append({"round": r["round"], "why": "not fetchable"})
             continue
-        if not publisher._roundtrip_ok(blob, r["sha256"]):
-            rep.broken.append({"round": r["round"], "why": "digest or signature mismatch"})
+        if not publisher._roundtrip_ok(blob, r["sha256"], expect_round=r["round"],
+                                       expect_signature=r.get("signature", "")):
+            rep.broken.append({"round": r["round"],
+                               "why": "digest, round number or signature mismatch"})
             continue
+        # walk the hash chain: a deletion or reorder anywhere changes every anchor after it
+        if not r.get("anchor"):
+            rep.unanchored.append(r["round"])
+        else:
+            want = anchor_of(run, r["sha256"])
+            if r["anchor"] != want:
+                rep.chain_breaks.append({"round": r["round"], "have": r["anchor"][:16],
+                                         "want": want[:16]})
+            # Carry the RECOMPUTED value forward, never the recorded one. Trusting the recorded
+            # anchor after a break re-synchronised the walk with the operator's index, so the final
+            # head still matched the chain and a deleted middle round reported head_checked=True —
+            # i.e. the chain confirmed a history it had never seen.
+            run = want
         if resolved is not None:
             a = resolved.get(r["round"])
             if a is None:
@@ -395,4 +526,13 @@ def verify_history(publisher: RecordPublisher, anchors=None, first_round: int | 
             elif a != r["sha256"]:
                 rep.mismatched.append({"round": r["round"], "anchor": a[:16],
                                        "published": r["sha256"][:16]})
+    rep.head_anchor = run
+    if head_anchor_fn is not None:
+        try:
+            rep.head_checked = head_anchor_fn() == run
+            if not rep.head_checked:
+                rep.chain_breaks.append({"round": "HEAD", "have": (head_anchor_fn() or "")[:16],
+                                         "want": run[:16]})
+        except Exception as e:
+            rep.chain_breaks.append({"round": "HEAD", "have": f"unreadable: {e}", "want": run[:16]})
     return rep

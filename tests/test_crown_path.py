@@ -2259,8 +2259,12 @@ def test_rerun_audits_and_catches_a_rigged_record():
             for t in pool:
                 fh.write(_json.dumps(asdict(t)) + "\n")
 
+        # a real auditor loads the model the manifest NAMES and re-runs with that. Passing the
+        # name is what lets L2 refuse to certify a round it re-ran with some other model.
+        obs_name = res.outcome.record.manifest["observer"]
+
         # ---- 1. the honest record reproduces at ALL THREE levels
-        a = audit(rec_path, pool_path, Obs())
+        a = audit(rec_path, pool_path, Obs(), observer_name=obs_name)
         assert a.exit_code == 0, [(c.level, c.name, c.status, c.detail) for c in a.checks
                                  if c.status != "PASS"]
         levels = {c.level for c in a.checks if c.status == "PASS"}
@@ -2288,7 +2292,7 @@ def test_rerun_audits_and_catches_a_rigged_record():
                 r2.signature = r2.signer = r2.sig_scheme = ""
                 r2.sign(Ed25519Signer(seed=b"z" * 32))
                 Path(p2).write_text(_json.dumps(asdict(r2)))
-            return audit(p2, pool_path, Obs())
+            return audit(p2, pool_path, Obs(), observer_name=obs_name)
 
         # ---- 3. FABRICATED AGGREGATE over honest measurements. Every published KL is real; only
         #         the headline score is inflated. This is the fraud a verdict-publishing subnet
@@ -2371,7 +2375,8 @@ def test_rerun_audits_and_catches_a_rigged_record():
 
         p2 = str(Path(dd) / "dethrone.json")
         Path(p2).write_text(_json.dumps(asdict(r2.outcome.record)))
-        a2 = audit(p2, pool_path, Obs())
+        a2 = audit(p2, pool_path, Obs(),
+                   observer_name=r2.outcome.record.manifest["observer"])
         assert a2.exit_code == 0, [(c.name, c.detail) for c in a2.checks if c.status != "PASS"]
         assert any(c.name.startswith("dethrone margin") and c.status == "PASS"
                    for c in a2.checks), [c.name for c in a2.checks]
@@ -2391,9 +2396,25 @@ def test_rerun_audits_and_catches_a_rigged_record():
         rr.signature = rr.signer = rr.sig_scheme = ""
         rr.sign(sig)
         Path(p3).write_text(_json.dumps(asdict(rr)))
-        a3 = audit(p3, pool_path, Obs())
+        a3 = audit(p3, pool_path, Obs(),
+                   observer_name=r2.outcome.record.manifest["observer"])
         assert any(c.name.startswith("dethrone margin") and c.status == "FAIL"
                    for c in a3.checks), [c.name for c in a3.failed]
+
+        # ---- 6b. AUDITING WITH THE WRONG MODEL. The auditor picks the observer on the command
+        #          line, and nothing used to check it against the round's. A green L2 then proved
+        #          only "some model reproduces these numbers", which is not the claim being made.
+        a_wrong = audit(rec_path, pool_path, Obs(), observer_name="some-other-model")
+        assert any(c.name.startswith("audited with the round's observer") and c.status == "FAIL"
+                   for c in a_wrong.checks)
+        assert a_wrong.exit_code == 1
+
+        # ---- 6c. THE OPERATOR PICKS THE GRADER. The observer is drawn from the nonce; a manifest
+        #          naming a different one out of the pool means the choice was made by hand.
+        other = [o for o in res.outcome.record.manifest["observer_pool"] if o != obs_name][0]
+        r_obs = rigged(lambda raw: raw["manifest"].update(observer=other))
+        assert any(c.name.startswith("observer derives from the nonce") and c.status == "FAIL"
+                   for c in r_obs.checks), [c.name for c in r_obs.checks if c.level == "L2"]
 
 
 def test_publisher_is_fail_closed():
@@ -2413,6 +2434,7 @@ def test_publisher_is_fail_closed():
     from eval.gates import TierBudget
     from eval.identity import commit_value, content_hash
     from eval.koth import Tier, Tournament
+    from dataclasses import asdict
     from eval.publish import (INDEX, LocalSink, PublishError, RecordPublisher, publish_and_gate,
                               record_name)
     from eval.shadow_axis_epoch import FakeChain
@@ -2440,16 +2462,23 @@ def test_publisher_is_fail_closed():
             return [self.tok] * len(prompts)
 
     class AnchoringChain(FakeChain):
-        """Records the digest per round the way a real chain commitment does — the half of the
-        trail an operator cannot rewrite after the fact."""
+        """ONE commitment slot, like the real thing. That constraint is the whole reason the anchor
+        is a hash chain: committing a bare per-round digest would anchor only the newest round and
+        leave every earlier one checkable against nothing but the operator's own index."""
 
         def __init__(self, commits):
             super().__init__(commits)
             self.anchors = {}
+            self.slot = ""          # the single on-chain value
             self.weight_calls = 0
 
         def publish_record(self, record):
+            from eval.publish import anchor_of
+            self.slot = anchor_of(getattr(record, "prev_anchor", ""), record.sha256())
             self.anchors[record.round] = record.sha256()
+
+        def head_anchor(self):
+            return self.slot
 
         def record_anchors(self):
             return dict(self.anchors)
@@ -2510,7 +2539,7 @@ def test_publisher_is_fail_closed():
                 return f"file://{name}"          # accepted, never stored
 
         try:
-            RecordPublisher(BlackHole(str(Path(dd) / "sink2"))).publish(r1.outcome.record)
+            RecordPublisher(BlackHole(str(Path(dd) / "sink2")), allow_no_state=True).publish(r1.outcome.record)
             raise AssertionError("a write that stored nothing was accepted")
         except PublishError as e:
             assert "cannot be fetched back" in str(e), e
@@ -2522,7 +2551,7 @@ def test_publisher_is_fail_closed():
                 return b[:-5] if b and name.startswith("rounds/") else b
 
         try:
-            RecordPublisher(Truncating(str(Path(dd) / "sink3"))).publish(r1.outcome.record)
+            RecordPublisher(Truncating(str(Path(dd) / "sink3")), allow_no_state=True).publish(r1.outcome.record)
             raise AssertionError("a truncated read-back was accepted")
         except PublishError as e:
             assert "reads back different" in str(e), e
@@ -2536,14 +2565,28 @@ def test_publisher_is_fail_closed():
         assert not r2.publish.ok, r2.publish
         assert [x["round"] for x in r2.publish.stale_rounds] == [1], r2.publish.stale_rounds
         assert not r2.weights_set and chain.weight_calls == before, "paid out on a deleted history"
-        assert any(e.get("action") == "withhold_weights" for e in r2.outcome.events)
-        # the crown was NOT written on chain either
-        assert 2 not in [k for k, v in chain.kings.items()] or chain.kings.get("t")
+        assert r2.withheld and r2.withheld["action"] == "withhold_weights", r2.withheld
+        # THE WITHHOLD MUST NOT TOUCH THE SIGNED RECORD. The reason used to be appended to
+        # outcome.events, which the record holds BY REFERENCE — so recording why we withheld
+        # invalidated the signature of bytes that were already published, and made that round
+        # permanently unrepublishable.
+        assert r2.outcome.record.verify_signature(), "withholding broke the published signature"
+        assert not any(e.get("action") == "withhold_weights"
+                       for e in r2.outcome.record.events)
+        # THE WITHHELD CROWN MUST NOT SURVIVE. tournament.consider() mutates kings in place during
+        # scoring, so a bare `return` left the withheld round's king in memory and the NEXT round
+        # wrote it on chain and paid it — the gate would withhold, then pay anyway.
+        assert tour.kings.get("t") is None or \
+            tour.kings["t"].model_id != content_hash(strong), "withheld crown survived rollback"
+        before_k = dict(chain.kings)
+        r3 = epoch(chain, 3, strong, pubr, tour, reg, led)
+        assert not r3.weights_set and chain.weight_calls == before, "paid out after a withhold"
+        assert chain.kings == before_k, "wrote the withheld crown on chain a round later"
 
         # ---- 5. ANCHOR MISMATCH. The chain is the authority; a published record that disagrees
         #         with what was anchored is a swap.
         root5 = str(Path(dd) / "sink5")
-        p5 = RecordPublisher(LocalSink(root5), window=8)
+        p5 = RecordPublisher(LocalSink(root5), window=8, allow_no_state=True)
         p5.publish(r1.outcome.record)
         stale, checked, n_anch = p5.verify_window(1, {1: "0" * 64})
         assert checked == [1] and stale and "anchor" in stale[0]["why"], (stale, checked)
@@ -2562,7 +2605,12 @@ def test_publisher_is_fail_closed():
             p5.publish(forged)
             raise AssertionError("a round was silently rewritten")
         except PublishError as e:
-            assert "refusing to replace" in str(e), e
+            # two independent guards catch this now: the signed prev_anchor no longer matches the
+            # live head, and the index refuses a changed sha for an existing round. Either is a
+            # correct refusal; asserting one exact message would make the test brittle about which
+            # fires first.
+            assert ("refusing to replace" in str(e)
+                    or "refusing to graft it onto a different chain" in str(e)), e
 
         # ---- 7. THE V1 LINEAGE BUG ITSELF. A transient index read failure must not be read as
         #         "no history yet" — that is how 50 entries became 6.
@@ -2598,7 +2646,8 @@ def test_publisher_is_fail_closed():
         #         accountability, so it is refused before it can be paid out.
         unsigned = _copy.deepcopy(r1.outcome.record)
         unsigned.signature = unsigned.signer = unsigned.sig_scheme = ""
-        rep = publish_and_gate(RecordPublisher(LocalSink(str(Path(dd) / "sink8"))), unsigned)
+        rep = publish_and_gate(RecordPublisher(LocalSink(str(Path(dd) / "sink8")), allow_no_state=True),
+                              unsigned)
         assert not rep.ok and "unsigned" in rep.reasons[0]
         assert rep.published is None
 
@@ -2614,13 +2663,111 @@ def test_publisher_is_fail_closed():
         finally:
             _os.environ.pop("RALPH_REQUIRE_PUBLISH", None)
 
+        # ---- 9b. THE ANCHOR IS THE ONLY CHECK THE OPERATOR CANNOT SATISFY ALONE, so a chain that
+        #          does not expose it must withhold rather than degrade quietly. The first version
+        #          read it with getattr(chain, "record_anchors", None); no adapter implemented it,
+        #          the comparison was skipped in silence, and the heartbeat compared the operator's
+        #          bytes to the operator's index.
+        p9 = RecordPublisher(LocalSink(str(Path(dd) / "sink9b")),
+                             state_path=str(Path(dd) / "hwm9b.json"))
+        rep9 = publish_and_gate(p9, r1.outcome.record, head_anchor_fn=None)
+        assert not rep9.ok and "no head_anchor" in rep9.reasons[0], rep9
+        # and a chain whose anchor disagrees with the recomputed head withholds too
+        rep9b = publish_and_gate(
+            RecordPublisher(LocalSink(str(Path(dd) / "sink9c")),
+                            state_path=str(Path(dd) / "hwm9c.json")),
+            r1.outcome.record, head_anchor_fn=lambda: "f" * 64)
+        assert not rep9b.ok and "does not match" in " ".join(rep9b.reasons), rep9b
+
+        # ---- 9c. HASH CHAIN. One commitment slot has to commit to the WHOLE history, or deleting
+        #          an old record breaks nothing. Deleting round 1's entry must change the head.
+        from eval.publish import anchor_of, verify_history
+        rootc = str(Path(dd) / "sinkc")
+        pc = RecordPublisher(LocalSink(rootc), state_path=str(Path(dd) / "hwmc.json"))
+        chc = AnchoringChain([])
+        tc, rc, lc = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        recs = [epoch(chc, n, strong if n > 1 else weak, pc, tc, rc, lc) for n in (1, 2, 3)]
+        assert all(e.publish.ok and e.weights_set for e in recs), [e.publish for e in recs]
+        h = verify_history(pc, chc.record_anchors, head_anchor_fn=chc.head_anchor)
+        assert h.ok and h.head_checked and not h.chain_breaks, h
+        # every record's prev_anchor is the previous round's anchor — the link is SIGNED, so it
+        # cannot be back-filled after the fact
+        idxc = _json.loads((Path(rootc) / INDEX).read_text())["rounds"]
+        for prev, cur in zip(idxc, idxc[1:]):
+            assert cur["prev_anchor"] == prev["anchor"]
+            assert cur["anchor"] == anchor_of(prev["anchor"], cur["sha256"])
+        # excise the middle round from the index -> the recomputed head no longer matches the chain
+        tampered = [e for e in idxc if e["round"] != 2]
+        (Path(rootc) / INDEX).write_text(_json.dumps({"rounds": tampered,
+                                                      "head": tampered[-1]["round"]}))
+        h2 = verify_history(RecordPublisher(LocalSink(rootc), allow_no_state=True),
+                            chc.record_anchors, head_anchor_fn=chc.head_anchor)
+        assert not h2.ok and (h2.chain_breaks or h2.gaps), h2
+        assert not h2.head_checked, "a truncated history still matched the on-chain head"
+
+        # ---- 9d. ROUND ALIASING. Checking only the digest let one round's blob be pointed at from
+        #          another round's index slot: the entry says round 7, the bytes are round 3's
+        #          record, the sha matches those bytes, every check passed, round 7 was erased.
+        rootd = str(Path(dd) / "sinkd")
+        pd = RecordPublisher(LocalSink(rootd), state_path=str(Path(dd) / "hwmd.json"))
+        chd = AnchoringChain([])
+        td, rd, ld = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        e1 = epoch(chd, 1, weak, pd, td, rd, ld)
+        e2 = epoch(chd, 2, strong, pd, td, rd, ld)
+        idxd = _json.loads((Path(rootd) / INDEX).read_text())
+        r2e = [e for e in idxd["rounds"] if e["round"] == 2][0]
+        r1e = [e for e in idxd["rounds"] if e["round"] == 1][0]
+        r2e.update(name=r1e["name"], sha256=r1e["sha256"], signature=r1e["signature"])
+        (Path(rootd) / INDEX).write_text(_json.dumps(idxd))
+        stale, checked, _ = RecordPublisher(LocalSink(rootd), allow_no_state=True).verify_window(2)
+        assert any(x["round"] == 2 for x in stale), (stale, checked)
+
+        # ---- 9e. RE-SIGNING A PUBLISHED RECORD. canonical() excludes the signature fields, so the
+        #          digest and the anchor both survive a change of signer — attribution has to be
+        #          pinned in the index or a record can be de-attributed after publication.
+        roote = str(Path(dd) / "sinke")
+        pe = RecordPublisher(LocalSink(roote), state_path=str(Path(dd) / "hwme.json"))
+        pe.publish(r1.outcome.record)
+        idxe = _json.loads((Path(roote) / INDEX).read_text())
+        nm = idxe["rounds"][0]["name"]
+        resigned = _copy.deepcopy(r1.outcome.record)
+        resigned.signature = resigned.signer = resigned.sig_scheme = ""
+        resigned.sign(Ed25519Signer(seed=b"q" * 32))          # a DIFFERENT key
+        assert resigned.sha256() == r1.outcome.record.sha256(), "digest should be signature-blind"
+        (Path(roote) / nm).write_text(_json.dumps(asdict(resigned)))
+        stale, _, _ = RecordPublisher(LocalSink(roote), allow_no_state=True).verify_window(1)
+        assert stale and "signature" in stale[0]["why"], stale
+
+        # ---- 9f. RALPH_REQUIRE_PUBLISH IS A FLOOR, NOT A DEFAULT. It used to only fill in when
+        #          require_publish was None, so one explicit require_publish=False anywhere in the
+        #          call path defeated the single switch an operator sets to force the gate on.
+        _os2 = __import__("os")
+        _os2.environ["RALPH_REQUIRE_PUBLISH"] = "1"
+        try:
+            epoch(AnchoringChain([]), 5, strong, None, Tournament(tiers, margin=0.03), {},
+                  RegistrationLedger(), require_publish=False)
+            raise AssertionError("require_publish=False defeated RALPH_REQUIRE_PUBLISH=1")
+        except PublishError:
+            pass
+        finally:
+            _os2.environ.pop("RALPH_REQUIRE_PUBLISH", None)
+
+        # ---- 9g. THE NEVER-SHRINK GUARD MUST NOT BE OPT-IN. state_path defaulted to "", so an
+        #          ordinary construction left the high-water mark at 0 and a cold start plus one
+        #          transient index read reproduced v1's lineage bug with no malice required.
+        try:
+            RecordPublisher(LocalSink(str(Path(dd) / "sinkf")))
+            raise AssertionError("built a publisher with the never-shrink guard silently disabled")
+        except PublishError as e:
+            assert "state_path is required" in str(e), e
+
         # ---- 10. GAPS IN THE TRAIL. A round that was scored, paid out and never published has
         #          no record to audit, so no per-record check can see it. Only walking the index
         #          finds it — and that is the shape v1 had: 57 crowns in the report repo against
         #          6 lineage entries, with nothing comparing the two.
         from eval.publish import verify_history
         root_g = str(Path(dd) / "sinkg")
-        pg = RecordPublisher(LocalSink(root_g))
+        pg = RecordPublisher(LocalSink(root_g), state_path=str(Path(dd) / "hwmg.json"))
         chg = AnchoringChain([])
         tg, rg, lg = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
         for rnd in (1, 2, 4):                       # round 3 never published
@@ -2635,7 +2782,7 @@ def test_publisher_is_fail_closed():
         # ---- 11. RECOVERY. Once publishing works again the round pays out normally — the gate
         #          holds emission, it does not brick the subnet.
         root10 = str(Path(dd) / "sink10")
-        p10 = RecordPublisher(LocalSink(root10), window=8)
+        p10 = RecordPublisher(LocalSink(root10), window=8, state_path=str(Path(dd) / "hwm10.json"))
         ch10 = AnchoringChain([])
         t10, r10, l10 = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
         e10 = epoch(ch10, 4, strong, p10, t10, r10, l10)

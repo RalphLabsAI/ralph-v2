@@ -48,6 +48,9 @@ class BittensorChainIO:
     reveals: dict = field(default_factory=dict)   # hotkey -> {"content_hash", "salt"}
     log: list = field(default_factory=list)
     skipped: list = field(default_factory=list)
+    # our own view of the last anchor we committed. Only a fallback: head_anchor() prefers what
+    # the CHAIN says, because the point of the anchor is to be a value the operator cannot edit.
+    _head: str = ""
 
     # ---- reads -------------------------------------------------------------------------
 
@@ -132,14 +135,36 @@ class BittensorChainIO:
         self.inner.blacklist(hotkey, reason)
 
     def publish_record(self, record) -> None:
-        """Anchor the round record's digest on-chain; the record itself is published off-chain
-        (HF/IPFS) because a commitment slot cannot hold it."""
-        import hashlib
-        digest = hashlib.sha256(record.canonical().encode()).hexdigest()
+        """Anchor the round's HASH-CHAIN LINK on chain; the record itself is published off-chain
+        (HF/IPFS) because a commitment slot cannot hold it.
+
+        What is committed is A_n = H(A_{n-1} ‖ sha256(record)), not the bare digest. A commitment
+        slot holds exactly one value, so committing the digest alone anchored only the newest round
+        and left every earlier one checkable against nothing but the operator's own index —
+        deleting or swapping an old record broke no check. Chaining makes the one slot commit to
+        the whole history, and the operator cannot retroactively repair it because the superseded
+        commitments are in block history."""
+        from .publish import anchor_of
+        anchor = anchor_of(getattr(record, "prev_anchor", ""), record.sha256())
+        self._head = anchor
         if self.read_only:
-            self.log.append(("publish_record", digest))
+            self.log.append(("publish_record", anchor))
             return
-        self.inner.commit_audit_root(digest)
+        self.inner.commit_audit_root(anchor)
+
+    def head_anchor(self) -> str:
+        """The anchor currently committed on chain. Read from the chain when we can, so an auditor
+        and the gate are both looking at the same authority rather than at our own memory."""
+        get = getattr(self.inner, "get_audit_root", None) or \
+            getattr(self.inner, "get_commitment", None)
+        if get is not None:
+            try:
+                v = get()
+                if v:
+                    return str(v)
+            except Exception:
+                pass
+        return self._head
 
     def settle_bonds(self, refunds: dict) -> None:
         # Bonds are an off-chain ledger rebuilt from commitments each epoch; there is no

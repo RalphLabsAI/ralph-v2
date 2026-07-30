@@ -33,6 +33,7 @@ running the cheap half.
     python -m eval.rerun record.json                          # L0 only -> exits 2, INCOMPLETE
     python -m eval.rerun record.json --pool items.jsonl       # L0+L1
     python -m eval.rerun record.json --pool items.jsonl --observer Qwen/Qwen2.5-0.5B-Instruct
+    python -m eval.rerun --history ./published --head <anchor committed on chain>
 """
 from __future__ import annotations
 
@@ -285,13 +286,31 @@ def audit_selection(rec, pool, a: Audit) -> list:
 
 # ---------------------------------------------------------------- L2: judgment
 
-def audit_judgment(rec, items, observer, a: Audit, sub_ids=None) -> None:
+def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: str = "") -> None:
     """Recompute the observer's distributions over the FROZEN text and re-derive (s, d_G, d_A).
 
     This is the level that makes a rigged SCORE detectable rather than merely a rigged sum. It is
     a pure forward pass — no sampling, no generation — because the record froze the parent step,
     the continuation and every miner step."""
     from .observer_kl import step_effect
+    # WHICH OBSERVER. The auditor supplies the model on the command line, and nothing checked it
+    # against the one the round actually used — so a green L2 proved only "some model reproduces
+    # these numbers", which is not the claim. The observer is drawn from the nonce, so it is also
+    # re-derivable: check both that the manifest names the model we were handed AND that the
+    # manifest's choice is the one the nonce implies.
+    want = (rec.manifest or {}).get("observer") or ""
+    pool = (rec.manifest or {}).get("observer_pool") or []
+    a.ok("L2", "audited with the round's observer", bool(want) and observer_name == want,
+         fail=f"re-running with {observer_name or '(unnamed)'} but the round used "
+              f"{want or '(unrecorded)'} — a match here would prove nothing about this round",
+         info=f"observer {want}")
+    if pool:
+        from .observer_round import pick_observer
+        drawn = pick_observer(rec.commit_root, rec.round_nonce, pool)
+        a.ok("L2", "observer derives from the nonce", drawn == want,
+             fail=f"nonce implies {drawn} but the record used {want} — the operator picked the "
+                  f"grader",
+             info=f"{drawn} drawn from commit_root‖nonce over {len(pool)} candidates")
     by_id = {t.id: t for t in items}
     tol = max(float(rec.reproduction_tolerance or 0.0), 1e-4)
     for s in rec.submissions:
@@ -325,7 +344,7 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None) -> None:
 
 # ---------------------------------------------------------------- driver
 
-def audit(record_path: str, pool_path: str = "", observer=None) -> Audit:
+def audit(record_path: str, pool_path: str = "", observer=None, observer_name: str = "") -> Audit:
     a = Audit()
     rec = load_record(record_path)
     audit_arithmetic(rec, a)
@@ -349,7 +368,7 @@ def audit(record_path: str, pool_path: str = "", observer=None) -> Audit:
     elif not items:
         a.add("L2", "recompute effects", SKIP, "needs L1 (the corpus) to reconstruct prefixes")
     else:
-        audit_judgment(rec, items, observer, a)
+        audit_judgment(rec, items, observer, a, observer_name=observer_name)
     return a
 
 
@@ -378,20 +397,32 @@ def report(a: Audit, out=sys.stdout) -> int:
     return a.exit_code
 
 
-def audit_history(sink_root: str, out=sys.stdout) -> int:
-    """`--history <dir>`: is the published TRAIL complete? Answers a different question from
-    auditing one record — a round that was paid out and never published has no record to audit,
-    so only walking the index can find it."""
+def audit_history(sink_root: str, head_anchor: str = "", out=sys.stdout) -> int:
+    """`--history <dir> [--head <on-chain anchor>]`: is the published TRAIL complete?
+
+    A different question from auditing one record: a round that was scored, paid out and never
+    published has no record to audit, so only walking the index finds it.
+
+    The on-chain head is what makes this more than a self-consistency check. Without it, the walk
+    compares the operator's records against the operator's index — so the first version of this
+    command, which passed no anchor at all, reported COMPLETE on a fully unanchored trail. Pass
+    --head with the anchor committed on chain (any block explorer shows it)."""
     from .publish import LocalSink, RecordPublisher, verify_history
-    h = verify_history(RecordPublisher(LocalSink(sink_root)))
+    pub = RecordPublisher(LocalSink(sink_root), allow_no_state=True)
+    h = verify_history(pub, head_anchor_fn=(lambda: head_anchor) if head_anchor else None)
     w = out.write
-    w(f"\n  published trail: {h.n_rounds} rounds, head={h.head}\n")
+    w(f"\n  published trail: {h.n_rounds} rounds, head round={h.head}\n")
+    w(f"  recomputed anchor head: {h.head_anchor or '(none)'}\n")
     for label, items in (("GAPS (scored but never published)", h.gaps),
                          ("BROKEN (no longer fetches or verifies)", h.broken),
+                         ("CHAIN BREAKS (history altered or reordered)", h.chain_breaks),
                          ("ANCHOR MISMATCH", h.mismatched),
-                         ("unanchored", h.unanchored)):
+                         ("UNANCHORED (no chain link at all)", h.unanchored)):
         if items:
             w(f"    {label}: {items}\n")
+    if not h.head_checked:
+        w("    NOT CHECKED AGAINST THE CHAIN: pass --head <on-chain anchor>. Without it this "
+          "compares the operator's records to the operator's index.\n")
     w(f"  {'COMPLETE' if h.ok else 'INCOMPLETE TRAIL'}\n\n")
     return 0 if h.ok else 1
 
@@ -401,7 +432,8 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 2
     if argv[0] == "--history":
-        return audit_history(argv[1])
+        head = argv[argv.index("--head") + 1] if "--head" in argv else ""
+        return audit_history(argv[1], head)
     path, pool, obs_name = argv[0], "", ""
     i = 1
     while i < len(argv):
@@ -415,7 +447,7 @@ def main(argv: list[str]) -> int:
     if obs_name:
         from .runners import HFRunner
         observer = HFRunner(obs_name)
-    return report(audit(path, pool, observer))
+    return report(audit(path, pool, observer, observer_name=obs_name))
 
 
 if __name__ == "__main__":

@@ -104,6 +104,10 @@ class ObserverRoundOutcome:
     noise: dict = field(default_factory=dict)
     item_indices: list = field(default_factory=list)
     corpus_spec: str = ""
+    # the tier->King map as it stood BEFORE this round scored anything. tournament.consider()
+    # mutates in place, so without a snapshot a withheld round's crown survives in memory and the
+    # next round writes it on chain — the gate would withhold payment and then pay anyway.
+    kings_before: dict = field(default_factory=dict)
     events: list = field(default_factory=list)
     scores: dict = field(default_factory=dict)
 
@@ -117,7 +121,7 @@ def run_observer_round(
     parent_id: str = "parent", signer=None,
     max_step_tokens: int = 256, max_cont_tokens: int = 128,
     noise_safety: float = 3.0, canary=None,
-    n_items: int = 64, corpus_spec: str = "",
+    n_items: int = 64, corpus_spec: str = "", prev_anchor: str = "",
 ) -> ObserverRoundOutcome:
     """`trajectory_pool` is a LARGE pool; which items are scored is drawn from the nonce.
 
@@ -130,6 +134,7 @@ def run_observer_round(
     only meaningful against a pinned ordering. `observers`: name -> model; the round's observer is
     also drawn from the nonce. `canary(sub, runner) -> (ok, info)` is the capability tripwire."""
     out = ObserverRoundOutcome()
+    out.kings_before = dict(tournament.kings)
 
     # 1. front door. Nothing untrusted is loaded until economics, safety, the bit budget, the
     #    pinned parent and commit-reveal have all passed.
@@ -272,7 +277,7 @@ def run_observer_round(
                                     f"observer:{obs_name}", "unconditioned",
                                     f"trajectories:{len(usable)}", pts, scored, out.events,
                                     out.weights, manifest=manifest, noise=out.noise,
-                                    safety=noise_safety)
+                                    safety=noise_safety, prev_anchor=prev_anchor)
     if signer is not None:
         out.record.sign(signer)
     return out
