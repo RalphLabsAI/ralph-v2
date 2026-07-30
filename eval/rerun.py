@@ -368,6 +368,30 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: 
     # these numbers", which is not the claim. The observer is drawn from the nonce, so it is also
     # re-derivable: check both that the manifest names the model we were handed AND that the
     # manifest's choice is the one the nonce implies.
+    # HARDWARE. Measured across three architectures on byte-identical items: within a box the
+    # round is exactly reproducible (0.0 spread), across boxes it moves ~0.03 retention on a genuine
+    # compression and ~0.17 on a foreign control. reproduction_tolerance comes from within-box
+    # noise, so an honest auditor on different hardware would report DIVERGED on a good record.
+    # Saying so up front is the difference between a useful audit and one people learn to ignore.
+    vers = (rec.manifest or {}).get("versions") or {}
+    rec_gpu = vers.get("gpu") or ""
+    my_gpu = ""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            my_gpu = torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    if rec_gpu and my_gpu:
+        a.ok("L2", "same GPU as the round", rec_gpu == my_gpu,
+             fail=f"round ran on {rec_gpu}, this audit is on {my_gpu} — expect score differences "
+                  f"of ~0.03 retention that are HARDWARE, not fraud. Re-run on matching hardware "
+                  f"before treating a divergence here as evidence.",
+             info=f"{my_gpu}")
+    elif not rec_gpu:
+        a.add("L2", "same GPU as the round", SKIP,
+              "record does not pin the GPU, so a divergence cannot be attributed", required=False)
+
     want = (rec.manifest or {}).get("observer") or ""
     pool = (rec.manifest or {}).get("observer_pool") or []
     a.ok("L2", "audited with the round's observer", bool(want) and observer_name == want,

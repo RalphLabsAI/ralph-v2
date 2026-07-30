@@ -57,12 +57,29 @@ def _effects(ms) -> list:
 
 
 def _versions() -> dict:
-    """Pin the stack a re-run must match. Logit arithmetic is not portable across these, so an
-    auditor comparing numbers needs to know which stack produced them."""
+    """Pin the stack a re-run must match — INCLUDING THE GPU.
+
+    Measured 2026-07-30 on three architectures scoring byte-identical items with identical code:
+
+        H100 PCIe   (cap 9.0)   4-bit student 0.6240   foreign control 0.5529
+        A100 SXM4   (cap 8.0)                 0.6407                   0.6240
+        L40S        (cap 8.9)                 0.6114                   0.4508
+
+    Within a single box the round is EXACTLY reproducible — 0.0 score spread over repeats, 0.0
+    per-sample delta, byte-identical generations. Across boxes it is not: ~0.03 retention on a
+    genuine compression and ~0.17 on the control. So `reproduction_tolerance`, derived from
+    within-box noise, is roughly two orders of magnitude tighter than the cross-hardware spread,
+    and an honest auditor on a different GPU would report DIVERGED on a perfectly good record.
+    Recording the device and compute capability is what lets them tell "this crown was rigged"
+    apart from "I am on Ada and you were on Hopper"."""
     out = {}
     try:
         import torch
         out["torch"] = torch.__version__
+        if torch.cuda.is_available():
+            out["gpu"] = torch.cuda.get_device_name(0)
+            out["gpu_capability"] = ".".join(str(x) for x in torch.cuda.get_device_capability(0))
+            out["cuda"] = torch.version.cuda
     except Exception:
         pass
     try:
