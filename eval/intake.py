@@ -65,6 +65,19 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
     #     container (PrismML ship exactly that as `-unpacked`) reads as 16.0 from headers. For a
     #     subnet whose product is "a runnable checkpoint at a stated bit budget", the budget has
     #     to bind on the bytes, so this is where it binds.
+    # LOUD ABOUT WHAT IS NOT ENFORCED. bit_tier and parent are optional, and when they are None
+    # the two gates that define this subnet — the measured bit budget and the pinned parent — are
+    # skipped without a word. A validator built from a bare TierBudget therefore runs four gates
+    # while believing it runs six. RALPH_STRICT_TIERS=1 refuses to accept anything in that state;
+    # otherwise the omission is at least recorded on the decision.
+    import os as _os
+    unenforced = [n for n in ("bit_tier", "parent") if getattr(tier, n, None) is None]
+    if unenforced and _os.environ.get("RALPH_STRICT_TIERS", "").strip() not in ("", "0", "false"):
+        return IntakeDecision(False, insp, reasons=[
+            f"tier {tier.name!r} does not configure {', '.join(unenforced)} — refusing to accept a "
+            f"submission whose bit budget or pinned parent would go unchecked "
+            f"(RALPH_STRICT_TIERS=1)"])
+
     if getattr(tier, "bit_tier", None) is not None:
         from .bitrate import bit_tier_gate, measure_checkpoint
         try:

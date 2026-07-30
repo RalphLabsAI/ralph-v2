@@ -1,4 +1,5 @@
-eval/runs/
-__pycache__/
 *.pyc
 .env
+__pycache__/
+eval/runs/
+runs/
