@@ -34,7 +34,8 @@ import time
 PARENT = os.environ.get("RALPH_PARENT", "Qwen/Qwen2.5-0.5B-Instruct")
 OBSERVER = os.environ.get("RALPH_OBSERVER", "Qwen/Qwen2.5-1.5B-Instruct")
 N_TRAJ = int(os.environ.get("RALPH_N_TRAJ", "24"))
-SIGMAS = [float(x) for x in os.environ.get("RALPH_SIGMAS", "0.01,0.03,0.10,0.30").split(",")]
+SIGMAS = [float(x) for x in
+          os.environ.get("RALPH_SIGMAS", "0.0,0.01,0.02,0.05,0.10,0.20,0.30").split(",")]
 TAG = os.environ.get("RALPH_TAG", "unknown-gpu")
 OUT = os.environ.get("RALPH_OUT", "runs/ladder.json")
 
@@ -86,13 +87,18 @@ def main() -> int:
     rep["usable"] = sum(1 for s in shared if s.usable)
     rep["parent_steps_sha"] = _sha(s.parent_step for s in shared)
 
-    curve = {}
+    curve, step_sha = {}, {}
 
     def run(name, runner):
         t0 = time.time()
+        # hash the generated steps too: it separates "the score moved because the model now says
+        # something different" from "the score moved but the text did not", which are different
+        # problems with different fixes
+        steps = runner.generate([s.prefix for s in shared if s.usable], 256)
+        step_sha[name] = _sha(steps)
         ms = score_submission(shared, runner, observer)
         curve[name] = round(ms.score, 6)
-        log(f"  {name:<16} {ms.score:.6f}  ({time.time() - t0:.0f}s)"
+        log(f"  {name:<16} {ms.score:.6f}  steps={step_sha[name]}  ({time.time() - t0:.0f}s)"
             + (f"  reasons={ms.reasons}" if ms.reasons else ""))
 
     run("fp16_parent", parent)
@@ -114,6 +120,14 @@ def main() -> int:
         del d
     rep["tensors_perturbed"] = touched
     rep["curve"] = curve
+    rep["step_sha"] = step_sha
+    # SIGMA=0 IS THE CONTROL. Same code path as every other rung — load, call damage(), score —
+    # but scaled by zero, so it must return exactly the fp16 parent's 1.0. If it does not, the
+    # damage path itself perturbs something and the whole curve is measuring the harness.
+    if 0.0 in SIGMAS:
+        rep["zero_control_ok"] = abs((curve.get("noise_0.0") or 0) - 1.0) < 1e-9
+        rep["zero_control_matches_parent"] = (
+            step_sha.get("noise_0.0") == step_sha.get("fp16_parent"))
 
     # ---- verdicts ------------------------------------------------------------------------
     v = {}
@@ -134,6 +148,9 @@ def main() -> int:
     json.dump(rep, open(OUT, "w"), indent=1)
     log("")
     log(f"curve  : {curve}")
+    log(f"steps  : {step_sha}")
+    log(f"zero control: ok={rep.get('zero_control_ok')} "
+        f"same_text={rep.get('zero_control_matches_parent')}")
     log(f"touched: {touched}")
     log(f"verdict: {v}")
     log(f"wrote {OUT}")
