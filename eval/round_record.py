@@ -44,6 +44,10 @@ class SubmissionRecord:
     effects: list = field(default_factory=list)
     # slice_key -> per-sample scores, i.e. the exact paired vectors the dethrone bootstrap ran on.
     slices: dict = field(default_factory=dict)
+    # Where the scored bytes live. Without a locator, "re-generate the steps yourself" is not an
+    # instruction anyone can follow, so the frozen steps are unfalsifiable by construction.
+    artifact_uri: str = ""
+    manifest_root: str = ""
     # "challenger" | "incumbent". The incumbent's re-score is the OTHER HALF of the paired
     # dethrone test; publishing only challengers left the comparison one-sided and the margin
     # unverifiable.
@@ -158,7 +162,9 @@ def build_round_record(round_no: int, commit_root: str, round_nonce: str, teache
         per_point=[round(x, 4) for x in s.per_point], gates_ok=s.gates_ok, reasons=s.reasons,
         steps=list(getattr(s, "steps", []) or []), effects=list(getattr(s, "effects", []) or []),
         slices={k: [round(x, 6) for x in v] for k, v in (s.per_axis or {}).items()},
-        role=getattr(s, "role", "challenger"))
+        role=getattr(s, "role", "challenger"),
+        artifact_uri=getattr(s, "artifact_uri", ""),
+        manifest_root=getattr(s, "manifest_root", ""))
         for mid, s in scored.items()]
     rec = RoundRecord(round_no, commit_root, round_nonce, teacher, judge, base, pile_id,
                       # COPY the events list. It used to be stored by reference, so a caller

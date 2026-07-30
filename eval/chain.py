@@ -260,7 +260,11 @@ def run_v2_observer_epoch(
         ObsCommitted(hotkey=c.hotkey, coldkey=c.coldkey, tier=c.tier, ckpt_dir=c.ckpt_dir,
                      declared_compute_h100h=c.declared_compute_h100h, bond_posted=c.bond_posted,
                      make_runner=(lambda cd=c.ckpt_dir: make_safe_runner(cd)),
-                     revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value)
+                     revealed_hash=c.revealed_hash, salt=c.salt, committed_value=c.committed_value,
+                     # the locator travels with the submission so the RECORD can name where the
+                     # scored bytes live; without it L3 has nothing to fetch and the frozen miner
+                     # steps are unfalsifiable
+                     artifact_uri=c.artifact_uri)
         for c in commits
     ]
     # The anchor link goes INSIDE the signed body, so the previous head has to be known before the

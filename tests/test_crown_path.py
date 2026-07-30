@@ -2244,7 +2244,8 @@ def test_rerun_audits_and_catches_a_rigged_record():
         spec = "glaive_r1@rev=abc123|dedup=none|order=stream"
         res = run_v2_observer_epoch(
             FakeChain([Commitment("hot0", "cold0", "t", dd, 1.0, revealed_hash=h, salt=salt,
-                                  committed_value=commit_value(h, salt))]),
+                                  committed_value=commit_value(h, salt),
+                                  artifact_uri=f"file://{dd}")]),
             1, pool, Step("X"), {"kimi": Obs(), "qwen": Obs()}, tiers,
             {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)},
             Tournament(tiers, margin=0.03), RegistrationLedger(), {},
@@ -2263,12 +2264,40 @@ def test_rerun_audits_and_catches_a_rigged_record():
         # name is what lets L2 refuse to certify a round it re-ran with some other model.
         obs_name = res.outcome.record.manifest["observer"]
 
-        # ---- 1. the honest record reproduces at ALL THREE levels
-        a = audit(rec_path, pool_path, Obs(), observer_name=obs_name)
+        # L3 loads the actual checkpoint. Honest case: the record's frozen steps ARE what the
+        # model emits, so re-generating reproduces them byte for byte.
+        honest_runner = lambda mid, uri: Step("X")
+
+        # ---- 1. the honest record reproduces at ALL FOUR levels
+        a = audit(rec_path, pool_path, Obs(), observer_name=obs_name,
+                  make_runner=honest_runner)
         assert a.exit_code == 0, [(c.level, c.name, c.status, c.detail) for c in a.checks
                                  if c.status != "PASS"]
         levels = {c.level for c in a.checks if c.status == "PASS"}
-        assert levels == {"L0", "L1", "L2"}, levels
+        assert levels == {"L0", "L1", "L2", "L3"}, levels
+
+        # ---- 1b. THE FORGED-STEPS ATTACK, which every level below L3 is blind to by construction.
+        #          The miner's steps are frozen into the record by the same operator who signs it,
+        #          so the operator can write ideal steps and L0/L1/L2 will faithfully confirm that
+        #          those strings produce those numbers. Only running the checkpoint binds the record
+        #          to the model.
+        forged_provenance = audit(rec_path, pool_path, Obs(), observer_name=obs_name,
+                                  make_runner=lambda mid, uri: Step("W"))   # the REAL model is worse
+        assert not any(c.status == "FAIL" and c.level in ("L0", "L1", "L2")
+                       for c in forged_provenance.checks), \
+            "L0-L2 should be blind to forged steps — that is precisely why L3 exists"
+        assert any(c.level == "L3" and c.status == "FAIL"
+                   for c in forged_provenance.checks), \
+            [(c.name, c.detail) for c in forged_provenance.checks if c.level == "L3"]
+        assert forged_provenance.exit_code == 1
+
+        # ---- 1c. AN ARTIFACT NOBODY CAN FETCH IS NOT A PASS. If the auditor cannot obtain the
+        #          bytes, that submission is unchecked, and the audit has to say INCOMPLETE rather
+        #          than green.
+        unavailable = audit(rec_path, pool_path, Obs(), observer_name=obs_name,
+                            make_runner=lambda mid, uri: None)
+        assert unavailable.exit_code == 2, unavailable.verdict
+        assert any(c.level == "L3" and c.status == "SKIP" for c in unavailable.checks)
 
         # ---- 2. running only the cheap half must NOT report success. v1's auditor exited 0 for
         #         weeks while diverging on 37 of 40 reports; "no contradiction found" is not
@@ -2292,7 +2321,8 @@ def test_rerun_audits_and_catches_a_rigged_record():
                 r2.signature = r2.signer = r2.sig_scheme = ""
                 r2.sign(Ed25519Signer(seed=b"z" * 32))
                 Path(p2).write_text(_json.dumps(asdict(r2)))
-            return audit(p2, pool_path, Obs(), observer_name=obs_name)
+            return audit(p2, pool_path, Obs(), observer_name=obs_name,
+                         make_runner=honest_runner)
 
         # ---- 3. FABRICATED AGGREGATE over honest measurements. Every published KL is real; only
         #         the headline score is inflated. This is the fraud a verdict-publishing subnet
@@ -2356,7 +2386,8 @@ def test_rerun_audits_and_catches_a_rigged_record():
         def commit(hot, cold, cd):
             hh, ss = content_hash(cd), "s" + hot
             return Commitment(hot, cold, "t", cd, 1.0, revealed_hash=hh, salt=ss,
-                              committed_value=commit_value(hh, ss))
+                              committed_value=commit_value(hh, ss),
+                              artifact_uri=f"file://{cd}")
 
         chain = FakeChain([commit("hot1", "cold1", weak)])
         r1 = run_v2_observer_epoch(chain, 1, pool, Step("X"), obs2, tiers, budgets, tour, ledger,
@@ -2376,7 +2407,9 @@ def test_rerun_audits_and_catches_a_rigged_record():
         p2 = str(Path(dd) / "dethrone.json")
         Path(p2).write_text(_json.dumps(asdict(r2.outcome.record)))
         a2 = audit(p2, pool_path, Obs(),
-                   observer_name=r2.outcome.record.manifest["observer"])
+                   observer_name=r2.outcome.record.manifest["observer"],
+                   make_runner=lambda mid, uri: Step("X") if mid == content_hash(strong)
+                   else Step("W"))
         assert a2.exit_code == 0, [(c.name, c.detail) for c in a2.checks if c.status != "PASS"]
         assert any(c.name.startswith("dethrone margin") and c.status == "PASS"
                    for c in a2.checks), [c.name for c in a2.checks]
@@ -2397,14 +2430,17 @@ def test_rerun_audits_and_catches_a_rigged_record():
         rr.sign(sig)
         Path(p3).write_text(_json.dumps(asdict(rr)))
         a3 = audit(p3, pool_path, Obs(),
-                   observer_name=r2.outcome.record.manifest["observer"])
+                   observer_name=r2.outcome.record.manifest["observer"],
+                   make_runner=lambda mid, uri: Step("X") if mid == content_hash(strong)
+                   else Step("W"))
         assert any(c.name.startswith("dethrone margin") and c.status == "FAIL"
                    for c in a3.checks), [c.name for c in a3.failed]
 
         # ---- 6b. AUDITING WITH THE WRONG MODEL. The auditor picks the observer on the command
         #          line, and nothing used to check it against the round's. A green L2 then proved
         #          only "some model reproduces these numbers", which is not the claim being made.
-        a_wrong = audit(rec_path, pool_path, Obs(), observer_name="some-other-model")
+        a_wrong = audit(rec_path, pool_path, Obs(), observer_name="some-other-model",
+                        make_runner=honest_runner)
         assert any(c.name.startswith("audited with the round's observer") and c.status == "FAIL"
                    for c in a_wrong.checks)
         assert a_wrong.exit_code == 1
@@ -2507,7 +2543,8 @@ def test_publisher_is_fail_closed():
         def cm(hot, cd):
             hh, ss = content_hash(cd), "s" + hot
             return Commitment(hot, "c" + hot, "t", cd, 1.0, revealed_hash=hh, salt=ss,
-                              committed_value=commit_value(hh, ss))
+                              committed_value=commit_value(hh, ss),
+                              artifact_uri=f"file://{cd}")
 
         def epoch(chain, rnd, cd, pub, tour, reg, led, **kw):
             chain._commits = [cm(f"hot{rnd}", cd)]

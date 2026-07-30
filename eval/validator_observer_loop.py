@@ -91,6 +91,7 @@ class CommittedSubmission:
     revealed_hash: str = ""
     salt: str = ""
     committed_value: str = ""
+    artifact_uri: str = ""
 
 
 @dataclass
@@ -139,6 +140,7 @@ def run_observer_round(
     # 1. front door. Nothing untrusted is loaded until economics, safety, the bit budget, the
     #    pinned parent and commit-reveal have all passed.
     subs = []
+    d_root: dict = {}
     for c in committed:
         d = intake(c.ckpt_dir, tier_budgets[c.tier], ledger, c.hotkey, c.coldkey,
                    c.bond_posted, revealed_hash=c.revealed_hash, salt=c.salt,
@@ -146,10 +148,11 @@ def run_observer_round(
         if not d.accepted:
             out.rejected.append((c.hotkey, d.reasons))
             continue
+        d_root[d.content_hash] = getattr(d, "manifest_root", "")
         sub = Submission(miner=c.hotkey, tier=c.tier, model_id=d.content_hash,
                          params=d.inspection.params, compute_h100h=c.declared_compute_h100h,
                          coldkey=c.coldkey)
-        subs.append((sub, c.make_runner()))
+        subs.append((sub, c.make_runner(), c.artifact_uri))
         out.accepted.append(c.hotkey)
 
     # 2. the observer is post-commit entropy, so it cannot be pre-fitted
@@ -183,7 +186,7 @@ def run_observer_round(
     # 5. score each submission: one generation + one observer pass per usable sample
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
-    for sub, runner in subs:
+    for sub, runner, art_uri in subs:
         registry[sub.model_id] = runner
         ms = score_submission(shared, runner, observer, max_step_tokens=max_step_tokens)
         ok, reasons = True, list(ms.reasons)
@@ -196,6 +199,8 @@ def run_observer_round(
                    per_point=[v for vs in ms.slice_samples.values() for v in vs],
                    gates_ok=ok and ms.score > 0 and not ms.reasons,
                    reasons=reasons, per_axis=dict(ms.slice_samples))
+        s.artifact_uri = art_uri
+        s.manifest_root = d_root.get(sub.model_id, "")
         s.steps = _freeze(runner, usable, max_step_tokens)
         s.effects = _effects(ms)
         scored[sub.model_id] = s
@@ -230,12 +235,25 @@ def run_observer_round(
                 # margin_lcb unrecomputable. Registered under a distinct key so it never collides
                 # with the same model submitted as a challenger.
                 king_scored.role = "incumbent"
+                # carry the crowned artifact's locator onto the re-score, or L3 cannot fetch the
+                # incumbent and the paired half of every dethrone stays unverifiable
+                king_scored.artifact_uri = getattr(king, "artifact_uri", "")
+                king_scored.manifest_root = getattr(king, "manifest_root", "")
                 king_scored.effects = _effects(kms)
                 # the incumbent's steps must be frozen too, or L2 can re-derive only one side of
                 # a paired comparison — and the dethrone margin is the number that moves emission
                 king_scored.steps = _freeze(kr, usable, max_step_tokens)
                 scored[f"{king.model_id}#incumbent"] = king_scored
         ev = tournament.consider(t.name, by_tier.get(t.name, []), king_scored)
+        # A crown has to remember WHERE ITS BYTES ARE. Tournament.consider() mints a King from the
+        # score alone, so the locator was dropped at exactly the moment it started mattering —
+        # leaving "every crown ships a downloadable model" with no path from king to bytes.
+        nk = tournament.kings.get(t.name)
+        if nk is not None and ev.get("action") in ("crown", "dethrone"):
+            src = scored.get(nk.model_id)
+            if src is not None:
+                nk.artifact_uri = getattr(src, "artifact_uri", "")
+                nk.manifest_root = getattr(src, "manifest_root", "")
         # NOISE GATE: a dethrone whose margin sits inside the measured floor is not a result.
         if ev.get("action") == "dethrone" and king_scored is not None:
             ok_margin, why = crownable(ev.get("margin_lcb", 0.0), noise, noise_safety)

@@ -23,6 +23,20 @@ So this tool audits in three levels, and it is explicit about which ones it actu
       over the frozen text and re-derives (s, d_G, d_A) from scratch. This is the level a
       judge-based subnet cannot have at all.
 
+      BUT NOTE EXACTLY WHAT IT PROVES, because the first version of this file overclaimed it. L2
+      verifies steps -> effects. It does NOT verify steps -> model. The miner's steps are FROZEN
+      into the record by the same operator who signs it, so an operator can write whatever steps
+      they like — ideal ones, or a competitor's — and L2 will faithfully confirm that those strings
+      produce the recorded numbers. A perfect forged score reproduces at L0, L1 and L2 together.
+      Freezing the steps removes generation nondeterminism from the audit; it does not bind the
+      steps to the checkpoint.
+
+  L3  PROVENANCE — needs the artifacts. Loads each scored checkpoint and RE-GENERATES its steps on
+      the recorded prefixes, comparing them to the frozen text. This is the level that binds the
+      record to the models, and it is the only one that makes a crown non-forgeable by the
+      operator. It is expensive (a checkpoint download and a generation pass per submission),
+      which is why the cheaper levels exist — not a reason to skip it and call the round verified.
+
 FAILING LOUDLY IS A FEATURE, not politeness. Ralph v1's CPU auditor ran for weeks reporting
 success while diverging from the validator on 37 of 40 reports, because it wrote through a logging
 handler that a library's init had already removed, and because it exited 0 regardless. So: this
@@ -33,6 +47,7 @@ running the cheap half.
     python -m eval.rerun record.json                          # L0 only -> exits 2, INCOMPLETE
     python -m eval.rerun record.json --pool items.jsonl       # L0+L1
     python -m eval.rerun record.json --pool items.jsonl --observer Qwen/Qwen2.5-0.5B-Instruct
+    python -m eval.rerun record.json --pool i.jsonl --observer <hf> --artifacts ./ckpts   # L0-L3
     python -m eval.rerun --history ./published --head <anchor committed on chain>
 """
 from __future__ import annotations
@@ -141,25 +156,41 @@ def audit_arithmetic(rec, a: Audit) -> None:
         if len(s.effects) != n_pts or (s.steps and len(s.steps) != n_pts):
             a.add("L0", f"alignment {tag}", FAIL,
                   f"effects={len(s.effects)} steps={len(s.steps)} vs points={n_pts}")
-        # THE ARITHMETIC CHECK. score = worst slice mean of sample_score(s, d_G, d_A). Recomputed
-        # from the published raw measurements, so a fabricated aggregate over honest KLs shows up.
-        by_slice: dict = {}
+        # THE ARITHMETIC CHECK: rebuild the samples and call THE PRODUCTION SCORER.
+        #
+        # This used to re-implement score_miner inline — group by slice, mean, take the min — and
+        # got it wrong in three ways at once. It read min_per_slice as score_miner.__defaults__[2],
+        # which is min_live_effect (0.02), so the per-slice sample floor became `len(v) >= 0.02` and
+        # was disabled entirely. It skipped the LIVENESS gate, so a model whose steps move the
+        # observer nowhere recomputed to a healthy score while production would have returned 0 and
+        # refused to crown it. And it skipped every other early-return, so any future guard added to
+        # score_miner would be silently absent from the audit.
+        #
+        # Reimplementing the scorer in the auditor is the mistake, not the details: two copies of a
+        # rule diverge, and the copy that decides "did this reproduce" is the one nobody runs in
+        # anger. So the audit now calls the same function the round did.
+        from .observer_kl import StepEffect, score_miner
+        samples = []
         for row in s.effects:
             key, sv, d_g, d_m = row[0], float(row[1]), float(row[2]), float(row[3])
-            eff = StepEffect(s=sv, d_teacher=d_g, d_miner=d_m, n_positions=1)
-            by_slice.setdefault(key, []).append(sample_score(eff))
-        # mirrors score_miner: slices below the sample floor are excluded, not averaged in
-        from .observer_kl import score_miner as _sm
-        min_per_slice = _sm.__defaults__[2]
-        kept = {k: v for k, v in by_slice.items() if len(v) >= min_per_slice}
-        if not kept:
-            a.add("L0", f"recompute score {tag}", SKIP,
-                  f"no slice reached {min_per_slice} samples")
-            continue
-        got = min(sum(v) / len(v) for v in kept.values())
+            samples.append((key, StepEffect(s=sv, d_teacher=d_g, d_miner=d_m, n_positions=1)))
+        ms = score_miner(samples)
         tol = max(float(rec.reproduction_tolerance or 0.0), 1e-6)
-        a.ok("L0", f"recompute score {tag}", abs(got - s.retention) <= tol,
-             info=f"recomputed {got:.6f} vs recorded {s.retention:.6f} (tol {tol:.2e})")
+        a.ok("L0", f"recompute score {tag}", abs(ms.score - s.retention) <= tol,
+             fail=f"recomputed {ms.score:.6f} vs recorded {s.retention:.6f} "
+                  f"(tol {tol:.2e}){'; ' + '; '.join(ms.reasons) if ms.reasons else ''}",
+             info=f"recomputed {ms.score:.6f} vs recorded {s.retention:.6f} (tol {tol:.2e})")
+        # retention_lb is the field MIN_CROWN_LB is read from, i.e. the crownability floor, and the
+        # audit never recomputed it at all — so a record could carry an honest `retention` and an
+        # inflated `retention_lb` and be crowned on a number nobody checked.
+        a.ok("L0", f"recompute crown floor {tag}", abs(ms.score - s.retention_lb) <= tol,
+             fail=f"retention_lb {s.retention_lb:.6f} does not follow from the measurements "
+                  f"({ms.score:.6f}) — this is the field the crown floor is read from")
+        kept = {k: v for k, v in ms.slice_samples.items()}
+        if not kept:
+            a.add("L0", f"paired vectors match effects {tag}", SKIP,
+                  "; ".join(ms.reasons) or "no slice reached the sample floor")
+            continue
         # the published paired vectors must be the ones the aggregate came from
         if s.slices:
             same = set(s.slices) == set(kept) and all(
@@ -265,6 +296,22 @@ def audit_selection(rec, pool, a: Audit) -> list:
          fail=f"re-derived {list(idx)[:6]}… but the record claims {claimed[:6]}… — "
               f"the operator, not the nonce, chose the exam",
          info=f"re-derived all {len(idx)} indices from commit_root‖nonce")
+
+    # NO PRUNING. Checking only that every scored point is IN the drawn selection is one-sided: the
+    # operator can simply drop the items their model did badly on and every remaining point still
+    # passes. So the selection must be fully COVERED by the points, not merely contain them. This is
+    # the same asymmetry the nonce exists to remove — drawing the exam fairly buys nothing if you
+    # can hand back a subset of it.
+    scored_ids = [p.get("rollout_id") for p in rec.points]
+    drawn_ids = [t.id for t in items]
+    missing = [i for i in drawn_ids if i not in set(scored_ids)]
+    a.ok("L1", "every drawn item was scored", not missing,
+         fail=f"{len(missing)} of {len(drawn_ids)} drawn items are absent from the record "
+              f"({missing[:5]}) — the exam was pruned after it was drawn",
+         info=f"all {len(drawn_ids)} drawn items appear in the record")
+    dupes = len(scored_ids) - len(set(scored_ids))
+    a.ok("L1", "no duplicated items", dupes == 0,
+         fail=f"{dupes} duplicated rollout_ids — repeating an easy item inflates its slice")
     # Bind the recorded text to the pinned corpus. Without this the frozen prefixes are just
     # strings the validator chose, and freezing them would launder rather than pin the exam.
     import hashlib
@@ -281,6 +328,29 @@ def audit_selection(rec, pool, a: Audit) -> list:
     a.ok("L1", "recorded prefixes match the pinned corpus", not mism,
          fail="; ".join(mism[:3]) + (f" (+{len(mism) - 3} more)" if len(mism) > 3 else ""),
          info=f"{len(rec.points)} prefix hashes checked")
+
+    # SLICE KEYS ARE DERIVED, NOT DECLARED. The worst-slice aggregate is a min over slices, so the
+    # slice assignment IS the score. The keys lived only inside `effects` and were bound to
+    # nothing, which let an operator pool every sample into one favourable slice (raising the min)
+    # or shard the samples so no slice reached the sample floor. The key is a pure function of the
+    # trajectory and the observer name, so it is recomputable — and now recomputed.
+    from .observer_round import _slice_key
+    obs = man.get("observer") or ""
+    if obs:
+        want = {}
+        for p in rec.points:
+            t = by_id.get(p.get("rollout_id"))
+            if t is not None:
+                want[p["rollout_id"]] = _slice_key(t, obs)
+        bad = []
+        for sub in rec.submissions:
+            for p, row in zip(rec.points, sub.effects or []):
+                exp = want.get(p.get("rollout_id"))
+                if exp is not None and row and row[0] != exp:
+                    bad.append(f"{p.get('rollout_id')}: {row[0]} != {exp}")
+        a.ok("L1", "slice keys derive from the items", not bad,
+             fail="; ".join(bad[:3]) + (f" (+{len(bad) - 3} more)" if len(bad) > 3 else ""),
+             info=f"{len(want)} slice keys recomputed from (trajectory, observer)")
     return items
 
 
@@ -342,9 +412,69 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: 
              info=f"worst |Δ| over {n} samples = {worst:.3e} (tol {tol:.2e})")
 
 
+# ---------------------------------------------------------------- L3: provenance
+
+def audit_provenance(rec, items, make_runner, a: Audit, max_items: int = 0) -> None:
+    """Re-generate each submission's steps FROM ITS CHECKPOINT and compare to the frozen text.
+
+    This is the level that stops the operator forging a crown. Everything below it takes the miner's
+    steps from the record, and the record is written and signed by the operator, so a score computed
+    honestly from fabricated steps reproduces perfectly at L0-L2. Only running the model closes it.
+
+    `make_runner(model_id, artifact_uri) -> Stepper | None`. Returning None means the bytes were not
+    available to this auditor, which is reported as a SKIP for that submission rather than a pass —
+    an artifact you could not fetch has not been checked.
+    """
+    by_id = {t.id: t for t in items}
+    budget = int((rec.manifest or {}).get("max_step_tokens") or 256)
+    for s in rec.submissions:
+        tag = f"{s.model_id[:12]}…/{s.role}"
+        if not s.steps:
+            a.add("L3", f"steps come from the model {tag}", SKIP, "no frozen steps recorded")
+            continue
+        if not s.artifact_uri:
+            a.ok("L3", f"artifact locator present {tag}", False,
+                 fail="record carries no artifact_uri, so nobody can fetch the bytes this score "
+                      "claims to describe — the frozen steps are unfalsifiable")
+            continue
+        try:
+            runner = make_runner(s.model_id, s.artifact_uri)
+        except Exception as e:
+            runner = None
+            a.add("L3", f"steps come from the model {tag}", SKIP,
+                  f"could not load the artifact: {type(e).__name__}: {e}")
+            continue
+        if runner is None:
+            a.add("L3", f"steps come from the model {tag}", SKIP,
+                  f"artifact not available to this auditor ({s.artifact_uri})")
+            continue
+        pts = list(zip(rec.points, s.steps))
+        if max_items:
+            pts = pts[:max_items]
+        prefixes, frozen = [], []
+        for p, step in pts:
+            t = by_id.get(p.get("rollout_id"))
+            if t is None:
+                continue
+            prefixes.append(t.prefix)
+            frozen.append(step)
+        if not prefixes:
+            a.add("L3", f"steps come from the model {tag}", SKIP, "no reconstructable prefixes")
+            continue
+        got = runner.generate(prefixes, budget)
+        diffs = [i for i, (g, f) in enumerate(zip(got, frozen)) if g != f]
+        a.ok("L3", f"steps come from the model {tag}", not diffs,
+             fail=f"{len(diffs)}/{len(prefixes)} regenerated steps differ from the frozen text "
+                  f"(first at item {diffs[0] if diffs else '-'}) — the record's steps are not what "
+                  f"this checkpoint produces",
+             info=f"{len(prefixes)} steps regenerated and byte-identical"
+                  + (f" (sampled {len(prefixes)} of {len(s.steps)})" if max_items else ""))
+
+
 # ---------------------------------------------------------------- driver
 
-def audit(record_path: str, pool_path: str = "", observer=None, observer_name: str = "") -> Audit:
+def audit(record_path: str, pool_path: str = "", observer=None, observer_name: str = "",
+          make_runner=None, max_l3_items: int = 0) -> Audit:
     a = Audit()
     rec = load_record(record_path)
     audit_arithmetic(rec, a)
@@ -369,6 +499,16 @@ def audit(record_path: str, pool_path: str = "", observer=None, observer_name: s
         a.add("L2", "recompute effects", SKIP, "needs L1 (the corpus) to reconstruct prefixes")
     else:
         audit_judgment(rec, items, observer, a, observer_name=observer_name)
+
+    if make_runner is None:
+        a.add("L3", "steps come from the model", SKIP,
+              "no --artifacts given; the miner steps in this record are taken on the operator's "
+              "word, so a forged score would reproduce at every level above")
+    elif not items:
+        a.add("L3", "steps come from the model", SKIP,
+              "needs L1 (the corpus) to reconstruct prefixes")
+    else:
+        audit_provenance(rec, items, make_runner, a, max_items=max_l3_items)
     return a
 
 
@@ -420,11 +560,16 @@ def audit_history(sink_root: str, head_anchor: str = "", out=sys.stdout) -> int:
                          ("UNANCHORED (no chain link at all)", h.unanchored)):
         if items:
             w(f"    {label}: {items}\n")
+    broke = bool(h.gaps or h.broken or h.chain_breaks or h.mismatched or h.unanchored)
     if not h.head_checked:
         w("    NOT CHECKED AGAINST THE CHAIN: pass --head <on-chain anchor>. Without it this "
           "compares the operator's records to the operator's index.\n")
-    w(f"  {'COMPLETE' if h.ok else 'INCOMPLETE TRAIL'}\n\n")
-    return 0 if h.ok else 1
+    w(f"  {'COMPLETE' if h.ok else ('TRAIL BROKEN' if broke else 'INCOMPLETE')}\n\n")
+    # Same convention as the record audit: 1 means the trail is DEMONSTRABLY broken, 2 means
+    # nothing contradicted it but the check that matters was not run. Returning 1 for a missing
+    # --head would read as "tampering detected" when it only means "you did not give me the chain
+    # head", and a CI that cannot tell those apart will learn to ignore both.
+    return 0 if h.ok else (1 if broke else 2)
 
 
 def main(argv: list[str]) -> int:
@@ -434,20 +579,40 @@ def main(argv: list[str]) -> int:
     if argv[0] == "--history":
         head = argv[argv.index("--head") + 1] if "--head" in argv else ""
         return audit_history(argv[1], head)
-    path, pool, obs_name = argv[0], "", ""
+    path, pool, obs_name, art, n_l3 = argv[0], "", "", "", 0
     i = 1
     while i < len(argv):
         if argv[i] == "--pool":
             pool = argv[i + 1]; i += 2
         elif argv[i] == "--observer":
             obs_name = argv[i + 1]; i += 2
+        elif argv[i] == "--artifacts":
+            art = argv[i + 1]; i += 2
+        elif argv[i] == "--l3-items":
+            n_l3 = int(argv[i + 1]); i += 2
         else:
             i += 1
     observer = None
     if obs_name:
         from .runners import HFRunner
         observer = HFRunner(obs_name)
-    return report(audit(path, pool, observer, observer_name=obs_name))
+
+    make_runner = None
+    if art:
+        import os
+
+        def make_runner(model_id, artifact_uri, _root=art):
+            """Checkpoints laid out as <root>/<model_id>/. Loaded through SafeStudentRunner, the
+            same locked-down loader the validator uses — an auditor should not need to trust a
+            miner's checkpoint any more than the validator does."""
+            d = os.path.join(_root, model_id)
+            if not os.path.isdir(d):
+                return None
+            from .runners import SafeStudentRunner
+            return SafeStudentRunner(d)
+
+    return report(audit(path, pool, observer, observer_name=obs_name,
+                        make_runner=make_runner, max_l3_items=n_l3))
 
 
 if __name__ == "__main__":

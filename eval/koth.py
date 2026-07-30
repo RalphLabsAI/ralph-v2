@@ -62,6 +62,8 @@ class Scored:
     steps: list = field(default_factory=list)
     effects: list = field(default_factory=list)
     role: str = "challenger"
+    artifact_uri: str = ""
+    manifest_root: str = ""
 
     @property
     def valid(self) -> bool:

@@ -93,20 +93,33 @@ crown here is built to be **recomputable**, not merely transparent:
   on. Every scored point carries the parent step and continuation as literal text, and both the
   challenger's and the **incumbent's** steps are frozen — so a re-run is a pure forward pass and
   never has to reproduce batched generation.
-* **Anyone re-runs it**, at three levels of cost:
+* **Anyone re-runs it**, at four levels of cost:
 
 ```bash
-python -m eval.rerun record.json                                    # L0 arithmetic, free, no GPU
-python -m eval.rerun record.json --pool items.jsonl                 # + L1: re-derive the exam
-python -m eval.rerun record.json --pool items.jsonl --observer <hf> # + L2: re-derive the grades
-python -m eval.rerun --history ./published                          # is the trail complete?
+python -m eval.rerun record.json                                     # L0 arithmetic, free, no GPU
+python -m eval.rerun record.json --pool items.jsonl                  # + L1 re-derive the exam
+python -m eval.rerun record.json --pool i.jsonl --observer <hf>      # + L2 re-derive the grades
+python -m eval.rerun record.json --pool i.jsonl --observer <hf> \
+                                --artifacts ./ckpts                  # + L3 bind to the models
+python -m eval.rerun --history ./published --head <on-chain anchor>   # is the trail complete?
 ```
 
-L0 recomputes the score, the paired dethrone margin and the emission weights from the published
-measurements with no models at all. L1 re-derives which items were scored from the nonce. L2
+**L0** recomputes the score, the crown floor, the paired dethrone margin and the emission weights
+from the published measurements with no models at all — by calling the *same* scorer the round
+ran, not a second copy of the rule. **L1** re-derives which items were scored from the nonce, and
+checks the exam was neither pruned nor padded and that slice keys follow from the items. **L2**
 recomputes the observer's distributions over the frozen text — the level a judge-based subnet
-cannot have. **Exit 0 REPRODUCED / 1 DIVERGED / 2 INCOMPLETE**: skipping the expensive checks
-exits 2, never 0, so nobody can call a round verified by running the cheap half.
+cannot have.
+
+**L3 is the one that makes a crown non-forgeable**, and it is worth being exact about why. The
+miner's steps are frozen into the record by the same operator who signs it, so an operator can
+write ideal steps and L0–L2 will faithfully confirm that those strings produce those numbers. A
+forged perfect score reproduces at every level below L3. Only loading the checkpoint and
+re-generating binds the record to the models.
+
+**Exit 0 REPRODUCED / 1 DIVERGED / 2 INCOMPLETE.** Skipping the expensive levels exits 2, never 0,
+so nobody can call a round verified by running the cheap half — and an artifact the auditor could
+not fetch is reported as unchecked, not as a pass.
 
 The adversary assumed throughout is the **operator holding the signing key**, so a valid signature
 is treated as attribution and never as evidence. The tests re-sign every rigged record and require
@@ -169,6 +182,10 @@ The mechanism is complete and tested end to end against a fake chain. What has *
   logit-derived metrics; if ours lands there, the crown may be unable to resolve honest
   differences and the aggregation needs retuning. **This single number decides whether the
   mechanism works.**
+- **The anchor chain has never been committed by a real chain.** `A_n = H(A_{n-1} ‖ digest)` makes
+  one commitment slot cover the whole history, and `BittensorChainIO` computes and reads it — but
+  against FakeChain only. Until a real `commit_audit_root` call lands, the strongest guarantee here
+  is untested on the network it is for.
 - **No round record has ever been published to a real sink.** The publisher, its fail-closed
   gate and the re-run tool are tested end to end against a local directory and a fake chain;
   `HFSink` has never uploaded anything. Until it has, "anyone can re-run a crown" is a property of
