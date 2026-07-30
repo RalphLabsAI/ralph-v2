@@ -22,13 +22,18 @@ class HFRunner:
 
     def __init__(self, model_id: str, device: str = "auto", dtype: str = "bfloat16",
                  revision: str | None = None, name: str | None = None,
-                 trust_remote_code: bool = False, batch_size: int = 8):
+                 trust_remote_code: bool = False, batch_size: int = 8,
+                 load_in_4bit: bool = False):
         self.model_id = model_id
         self.revision = revision
         self.name = name or model_id
         self._device, self._dtype = device, dtype
         self._trust = trust_remote_code   # OK for OUR pinned teacher/judge; never for miner output
         self._batch_size = batch_size
+        # Load the SAME checkpoint at a narrower storage width. Needed because the shakedown's
+        # student is a genuine compression of the pinned parent — same architecture, fewer bits —
+        # which is the actual task, and there was no way to construct one without it.
+        self._load_in_4bit = load_in_4bit
         self._model = None
         self._tok = None
 
@@ -47,6 +52,15 @@ class HFRunner:
         self._tok.padding_side = "left"
         if self._tok.pad_token_id is None:
             self._tok.pad_token = self._tok.eos_token
+        if self._load_in_4bit:
+            from transformers import BitsAndBytesConfig
+            kw["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=getattr(torch, self._dtype),
+                # no double quant: the point is a clean, reportable bit width, not the last
+                # fraction of a bit, and double quantisation makes the effective width harder
+                # to state honestly
+                bnb_4bit_use_double_quant=False)
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_id, dtype=getattr(torch, self._dtype), device_map=self._device, **kw
         )
