@@ -382,6 +382,26 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: 
             my_gpu = torch.cuda.get_device_name(0)
     except Exception:
         pass
+    # BATCH SIZE. Measured spread across batch_size {1,2,3,5,8} on fixed items: 0.050 / 0.178 /
+    # 0.051 on H100 / A100 / L40S, with the generated step text moving every time. An auditor at a
+    # different batch_size gets a materially different number through no fault of the record.
+    rec_bs = vers.get("batch_size")
+    if rec_bs is not None:
+        try:
+            from .runners import HFRunner
+            import inspect as _i
+            my_bs = _i.signature(HFRunner.__init__).parameters["batch_size"].default
+        except Exception:
+            my_bs = None
+        if my_bs is not None:
+            a.ok("L2", "same batch size as the round", int(rec_bs) == int(my_bs),
+                 fail=f"round scored at batch_size={rec_bs}, this audit uses {my_bs} — expect a "
+                      f"difference of up to ~0.18 retention that is BATCHING, not fraud",
+                 info=f"batch_size={rec_bs}")
+    else:
+        a.add("L2", "same batch size as the round", SKIP,
+              "record does not pin batch_size", required=False)
+
     if rec_gpu and my_gpu:
         a.ok("L2", "same GPU as the round", rec_gpu == my_gpu,
              fail=f"round ran on {rec_gpu}, this audit is on {my_gpu} — expect score differences "

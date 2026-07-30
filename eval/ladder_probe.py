@@ -43,7 +43,7 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
-def damage(runner, sigma: float) -> int:
+def damage(runner, sigma: float, seed: int = 0) -> int:
     """Perturb every 2-D floating-point weight by sigma x its own std. Returns tensors touched.
 
     On an fp16/bf16 model this really does hit every projection; the previous version ran against a
@@ -51,13 +51,19 @@ def damage(runner, sigma: float) -> int:
     'damaged' model that was essentially undamaged."""
     import torch
     runner._load()
+    # SEEDED. Without this each sigma drew a fresh unreproducible perturbation, so the points on
+    # the curve were not nested draws and a non-monotone result could not be distinguished from
+    # sampling luck. The first run reported monotone=False on two of three GPUs and that verdict
+    # was therefore uninterpretable.
+    g = torch.Generator(device="cpu").manual_seed(seed)
     n = 0
     with torch.no_grad():
         for _, prm in runner._model.named_parameters():
             if prm.dtype.is_floating_point and prm.dim() >= 2:
                 std = prm.detach().float().std()
                 if torch.isfinite(std) and std > 0:
-                    prm.add_((torch.randn_like(prm.float()) * (sigma * std)).to(prm.dtype))
+                    noise = torch.randn(prm.shape, generator=g, dtype=torch.float32)
+                    prm.add_((noise.to(prm.device) * (sigma * std)).to(prm.dtype))
                     n += 1
     return n
 
@@ -103,7 +109,7 @@ def main() -> int:
     touched = {}
     for sg in SIGMAS:
         d = HFRunner(PARENT)
-        touched[str(sg)] = damage(d, sg)
+        touched[str(sg)] = damage(d, sg, seed=1234)
         run(f"noise_{sg}", d)
         del d
     rep["tensors_perturbed"] = touched

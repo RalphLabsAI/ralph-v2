@@ -91,6 +91,25 @@ def _versions() -> dict:
         from .runners import HFRunner
         out["topk"] = HFRunner.TOPK
         out["prob_decimals"] = HFRunner.PROB_DECIMALS
+        out["attn_implementation"] = HFRunner.ATTN_IMPLEMENTATION
+        # BATCH SIZE CHANGES THE ANSWER, so it has to be pinned like the GPU. Measured across
+        # batch_size in {1,2,3,5,8} on fixed items: score spread 0.050 (H100), 0.178 (A100),
+        # 0.051 (L40S), and the generated STEP TEXT moved in every case. Left padding is the
+        # mechanism — a prompt gets a different number of pad tokens depending on its batch, which
+        # shifts accumulation order enough to flip greedy near-ties. That is inherent to batched
+        # inference and is NOT fixable by kernel selection.
+        #
+        # It is a REPRODUCIBILITY requirement, not a fairness one: `usable` is computed once per
+        # round and every miner is generated over the identical list at the identical batch_size,
+        # so no miner's score depends on how many others submitted. But an auditor who re-runs at
+        # a different batch_size gets a materially different number, which is exactly the false
+        # DIVERGED the audit tool must not produce.
+        # Read the default BY NAME. Indexing __defaults__ positionally is precisely the bug that
+        # silently disabled the audit's per-slice sample floor earlier (it read min_live_effect
+        # where it wanted min_per_slice), and it fails the same way here: silently, with a
+        # plausible number.
+        import inspect
+        out["batch_size"] = inspect.signature(HFRunner.__init__).parameters["batch_size"].default
     except Exception:
         pass
     return out
