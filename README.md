@@ -26,7 +26,9 @@ Each round:
 3. **Crown** — KOTH, incumbent re-scored *and re-gated* every round, dethrone on a paired
    bootstrap lower bound of the worst-slice difference — **and refused if the margin sits inside
    the validator's own measured noise floor.**
-4. **Publish** — a signed, reproducible round record.
+4. **Publish, then pay** — the signed round record is written, **read back and verified**, and
+   anchored on chain *before* any weight is set. If it cannot be published and verified, no
+   crown is written and no weights are set (see [Auditability](#auditability-one-validator-many-auditors)).
 
 ## The crown: semantic equivalence by downstream effect
 
@@ -73,6 +75,49 @@ The old capability axes remain as a cheap **canary**, not the crown, because obs
 structurally blind to exactly one failure: a student that moves the observer correctly while
 being unusable.
 
+## Auditability — one validator, many auditors
+
+v2 runs **one owner validator**, like several production subnets. The question that matters is not
+how many validators there are, but whether an outsider can *check* the one that exists.
+
+Publishing artifacts is not enough. A subnet can publish every prompt, every judge verdict and
+every score and still be unfalsifiable, because if the grade came from an unpinned LLM with no seed
+you can prove the operator added the numbers up wrong but never that they **graded** wrong. So the
+crown here is built to be **recomputable**, not merely transparent:
+
+* **The operator does not choose the exam.** Which trajectory items are scored, and which observer
+  scores them, are derived from `commit_root ‖ round_nonce` — a block hash drawn *after* the
+  commitment window closes. The chosen indices are in the signed record.
+* **The record is a re-run manifest.** Corpus + revision + ordering, item indices, observer and
+  observer pool, token budgets, stack versions, and the measured noise floor the crown was gated
+  on. Every scored point carries the parent step and continuation as literal text, and both the
+  challenger's and the **incumbent's** steps are frozen — so a re-run is a pure forward pass and
+  never has to reproduce batched generation.
+* **Anyone re-runs it**, at three levels of cost:
+
+```bash
+python -m eval.rerun record.json                                    # L0 arithmetic, free, no GPU
+python -m eval.rerun record.json --pool items.jsonl                 # + L1: re-derive the exam
+python -m eval.rerun record.json --pool items.jsonl --observer <hf> # + L2: re-derive the grades
+python -m eval.rerun --history ./published                          # is the trail complete?
+```
+
+L0 recomputes the score, the paired dethrone margin and the emission weights from the published
+measurements with no models at all. L1 re-derives which items were scored from the nonce. L2
+recomputes the observer's distributions over the frozen text — the level a judge-based subnet
+cannot have. **Exit 0 REPRODUCED / 1 DIVERGED / 2 INCOMPLETE**: skipping the expensive checks
+exits 2, never 0, so nobody can call a round verified by running the cheap half.
+
+The adversary assumed throughout is the **operator holding the signing key**, so a valid signature
+is treated as attribution and never as evidence. The tests re-sign every rigged record and require
+each rig to be caught by recomputation instead.
+
+**Fail-closed means hold, not halt** — stated plainly because overstating it would be its own
+dishonesty. Withholding `set_weights` does not stop emission; the previous weights persist, so the
+last verifiably published crown keeps earning until publishing is fixed. An operator who breaks
+publishing while their own model is king benefits from the freeze. That residual is why the gate
+re-verifies a *window* of past rounds every round rather than only the current one.
+
 ## Anti-gaming — economics, not detection
 
 The last team proved you **cannot detect** copying on a shared base. v2 makes gaming
@@ -115,13 +160,22 @@ The mechanism is complete and tested end to end against a fake chain. What has *
   *data*; parent + observer + a genuinely quantized student on a GPU has never been executed
   once. Four of the last five real bugs here only appeared against real inputs, so expect that
   first run to surface more.
-- **The noise floor is unmeasured.** `eval/determinism.py` gates crowns on it, but the number
-  itself needs a GPU run. SN97 measured 2-5 percentage points of run-to-run variance on
+- **The noise floor is still unmeasured, and it now sets the audit tolerance too.**
+  `eval/determinism.py` gates crowns on it and the record derives `reproduction_tolerance` from
+  it, so the same unmeasured number decides both whether a crown is real and whether a re-run
+  counts as reproducing. Worse, it is currently probed only on the single-sequence
+  `distributions` path — never over a whole round, and never across two GPU models — so the 0.0
+  it reports under stubs is an artefact, not a result. SN97 measured 2-5 percentage points of run-to-run variance on
   logit-derived metrics; if ours lands there, the crown may be unable to resolve honest
   differences and the aggregation needs retuning. **This single number decides whether the
   mechanism works.**
-- **No artifact locator.** A crown publishes a content hash with no `artifact_uri` and no
-  per-file manifest, so there is no path from "king" to bytes you can download.
+- **No round record has ever been published to a real sink.** The publisher, its fail-closed
+  gate and the re-run tool are tested end to end against a local directory and a fake chain;
+  `HFSink` has never uploaded anything. Until it has, "anyone can re-run a crown" is a property of
+  the code and not yet a fact about the network.
+- **`verify_history` is not run automatically.** Every round re-checks a trailing window; nothing
+  walks the full trail on a schedule, so a gap or a deletion outside the window waits for a human
+  to look.
 - **No miner has ever submitted anything.** The end-to-end submission flow is untested by a
   third party.
 - **Chain integration is FakeChain only**, and the validator box needs `bubblewrap` for the
@@ -133,7 +187,7 @@ The mechanism is complete and tested end to end against a fake chain. What has *
 
 ```bash
 pip install -r requirements.txt        # one dep for the tests: pynacl
-python -m tests.test_crown_path        # 41/41, CPU
+python -m tests.test_crown_path        # 46/46, CPU
 python -m eval.run_capability_axis     # the capability CANARY on real models (GPU)
 python -m eval.shadow_axis_epoch       # the full operator epoch end to end (fake chain)
 ```
