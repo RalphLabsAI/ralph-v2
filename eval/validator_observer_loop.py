@@ -38,6 +38,24 @@ def _sha(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()
 
 
+def _freeze(runner, usable, max_step_tokens: int) -> list:
+    """Re-emit this model's steps as literal text for the record, so an audit is a pure forward
+    pass over recorded strings instead of a reproduction of batched greedy generation — the
+    noisiest part of the round. The manifest's artifact_uri lets an auditor optionally re-generate
+    and spot-check that these strings are what the model really emits."""
+    try:
+        return list(runner.generate([x.prefix for x in usable], max_step_tokens))
+    except Exception:
+        return []
+
+
+def _effects(ms) -> list:
+    """[slice_key, s, d_parent, d_miner] per scored sample — the raw measurements the score is a
+    pure function of, so an auditor recomputes the aggregate with no GPU."""
+    return [[e_key, round(e.s, 6), round(e.d_teacher, 6), round(e.d_miner, 6)]
+            for e_key, e in getattr(ms, "keyed_effects", []) or []]
+
+
 def _versions() -> dict:
     """Pin the stack a re-run must match. Logit arithmetic is not portable across these, so an
     auditor comparing numbers needs to know which stack produced them."""
@@ -173,6 +191,8 @@ def run_observer_round(
                    per_point=[v for vs in ms.slice_samples.values() for v in vs],
                    gates_ok=ok and ms.score > 0 and not ms.reasons,
                    reasons=reasons, per_axis=dict(ms.slice_samples))
+        s.steps = _freeze(runner, usable, max_step_tokens)
+        s.effects = _effects(ms)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
         out.scores[sub.model_id] = ms.as_dict()
@@ -200,6 +220,16 @@ def run_observer_round(
                     retention=kms.score, retention_lb=kms.score,
                     per_point=[v for vs in kms.slice_samples.values() for v in vs],
                     gates_ok=True, per_axis=dict(kms.slice_samples))
+                # PUBLISH the incumbent's re-score. The dethrone margin is a PAIRED statistic; a
+                # record holding only challengers describes one side of a comparison and leaves
+                # margin_lcb unrecomputable. Registered under a distinct key so it never collides
+                # with the same model submitted as a challenger.
+                king_scored.role = "incumbent"
+                king_scored.effects = _effects(kms)
+                # the incumbent's steps must be frozen too, or L2 can re-derive only one side of
+                # a paired comparison — and the dethrone margin is the number that moves emission
+                king_scored.steps = _freeze(kr, usable, max_step_tokens)
+                scored[f"{king.model_id}#incumbent"] = king_scored
         ev = tournament.consider(t.name, by_tier.get(t.name, []), king_scored)
         # NOISE GATE: a dethrone whose margin sits inside the measured floor is not a result.
         if ev.get("action") == "dethrone" and king_scored is not None:

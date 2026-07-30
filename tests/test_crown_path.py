@@ -2181,6 +2181,221 @@ def test_nonce_selects_items_and_record_is_rerunnable():
         assert not rec.verify_signature(), "frozen rollout text is not covered by the signature"
 
 
+def test_rerun_audits_and_catches_a_rigged_record():
+    """A record that cannot be RE-RUN is a press release. This exercises all three audit levels
+    on a real round, then rigs the record four ways and requires each to be caught.
+
+    The specific bar: the single-validator subnet we studied publishes every prompt, verdict and
+    score, and is STILL unfalsifiable where it matters, because its verdicts come from an unpinned
+    LLM with allow_fallbacks and no seed. An outsider can prove they summed wrong; nobody can prove
+    they graded wrong. So L0 must catch a fabricated aggregate over honest measurements, and L2
+    must be able to re-derive the measurements themselves."""
+    import json as _json
+    import struct
+    import tempfile
+    from copy import deepcopy
+    from pathlib import Path
+    from eval.chain import Commitment, run_v2_observer_epoch
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.koth import Tier, Tournament
+    from eval.rerun import audit, load_record
+    from eval.shadow_axis_epoch import FakeChain
+    from eval.signing import Ed25519Signer
+    from eval.steps import Trajectory
+
+    pool = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"p{i}", step="s", index=0)
+            for i in range(400)]
+
+    def d3(x, y, z):
+        return {"a": x, "b": y, "c": z}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            # three response levels, so the round can contain a weak-but-LIVE challenger. A step
+            # that moves the observer nowhere is inert and fails the liveness floor outright, so
+            # an all-or-nothing stub cannot produce a dethrone to audit.
+            tail = prefix.rstrip()[-1:]
+            if tail == "X":
+                return [d3(0.8, 0.1, 0.1)] * 6        # what the parent does
+            if tail == "W":
+                return [d3(0.55, 0.25, 0.20)] * 6     # same direction, ~a third of the effect
+            return [d3(0.34, 0.33, 0.33)] * 6         # unconditioned
+
+    class Step:
+        def __init__(self, tok):
+            self.tok = tok
+
+        def generate(self, prompts, max_new_tokens=256):
+            return [self.tok] * len(prompts)
+
+    with tempfile.TemporaryDirectory() as dd:
+        hdr = {"w": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}
+        hb = _json.dumps(hdr).encode()
+        with open(Path(dd) / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(hb)) + hb + b"\0" * 16)
+        (Path(dd) / "config.json").write_text('{"hidden_size":8}')
+        h, salt = content_hash(dd), "s0"
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        spec = "glaive_r1@rev=abc123|dedup=none|order=stream"
+        res = run_v2_observer_epoch(
+            FakeChain([Commitment("hot0", "cold0", "t", dd, 1.0, revealed_hash=h, salt=salt,
+                                  committed_value=commit_value(h, salt))]),
+            1, pool, Step("X"), {"kimi": Obs(), "qwen": Obs()}, tiers,
+            {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)},
+            Tournament(tiers, margin=0.03), RegistrationLedger(), {},
+            make_safe_runner=lambda cd: Step("X"),
+            signer=Ed25519Signer(seed=b"z" * 32), n_items=20, corpus_spec=spec)
+
+        from dataclasses import asdict
+        rec_path = str(Path(dd) / "record.json")
+        pool_path = str(Path(dd) / "pool.jsonl")
+        Path(rec_path).write_text(_json.dumps(asdict(res.outcome.record)))
+        with open(pool_path, "w") as fh:
+            for t in pool:
+                fh.write(_json.dumps(asdict(t)) + "\n")
+
+        # ---- 1. the honest record reproduces at ALL THREE levels
+        a = audit(rec_path, pool_path, Obs())
+        assert a.exit_code == 0, [(c.level, c.name, c.status, c.detail) for c in a.checks
+                                 if c.status != "PASS"]
+        levels = {c.level for c in a.checks if c.status == "PASS"}
+        assert levels == {"L0", "L1", "L2"}, levels
+
+        # ---- 2. running only the cheap half must NOT report success. v1's auditor exited 0 for
+        #         weeks while diverging on 37 of 40 reports; "no contradiction found" is not
+        #         "verified", and the exit code has to say so.
+        cheap = audit(rec_path)
+        assert not cheap.failed, [c.name for c in cheap.failed]
+        assert cheap.exit_code == 2 and cheap.verdict == "INCOMPLETE", cheap.verdict
+        assert any(c.level == "L2" for c in cheap.skipped)
+
+        def rigged(mutate, resign=True):
+            """The adversary is the OPERATOR, who holds the signing key — so a rigged record is
+            re-signed and the signature check passes. Any audit that only verifies signatures is
+            therefore useless against the party it needs to constrain; that is the whole reason L0
+            recomputes and L2 re-derives."""
+            raw = _json.loads(Path(rec_path).read_text())
+            mutate(raw)
+            p2 = str(Path(dd) / "rigged.json")
+            Path(p2).write_text(_json.dumps(raw))
+            if resign:
+                r2 = load_record(p2)
+                r2.signature = r2.signer = r2.sig_scheme = ""
+                r2.sign(Ed25519Signer(seed=b"z" * 32))
+                Path(p2).write_text(_json.dumps(asdict(r2)))
+            return audit(p2, pool_path, Obs())
+
+        # ---- 3. FABRICATED AGGREGATE over honest measurements. Every published KL is real; only
+        #         the headline score is inflated. This is the fraud a verdict-publishing subnet
+        #         can catch — and the floor, not the ceiling, of what this record supports.
+        def inflate(raw):
+            raw["submissions"][0]["retention"] = 0.99
+            raw["submissions"][0]["retention_lb"] = 0.99
+        r = rigged(inflate)
+        assert not any(c.name.startswith("signature") and c.status == "FAIL" for c in r.checks), \
+            "the rigged record is validly signed — signatures cannot catch the operator"
+        assert any(c.name.startswith("recompute score") and c.status == "FAIL"
+                   for c in r.checks), [c.name for c in r.failed]
+        assert r.exit_code == 1 and r.verdict == "DIVERGED"
+
+        # ---- 4. RIGGED MEASUREMENTS. Now the arithmetic is self-consistent — the operator edited
+        #         the raw (s, d_G, d_A) AND the score that follows from them. L0 cannot see this;
+        #         only recomputing the observer's distributions from the frozen text can. This is
+        #         the level a judge-based subnet structurally cannot have.
+        def fake_effects(raw):
+            sub = raw["submissions"][0]
+            key = sub["effects"][0][0]
+            sub["effects"] = [[key, 0.0, 9.0, 9.0] for _ in sub["effects"]]
+            sub["slices"] = {key: [1.0] * len(sub["effects"])}
+            sub["retention"] = sub["retention_lb"] = 1.0
+        r = rigged(fake_effects)
+        assert not any(c.level == "L0" and c.status == "FAIL" for c in r.checks), \
+            "L0 should be blind here — that is why L2 exists"
+        assert any(c.level == "L2" and c.status == "FAIL" for c in r.checks), \
+            [c.name for c in r.checks if c.level == "L2"]
+
+        # ---- 5. THE OPERATOR CHOSE THE EXAM. Claim a different item set than the nonce implies.
+        def swap_items(raw):
+            raw["manifest"]["item_indices"] = list(range(20))
+        r = rigged(swap_items)
+        assert any(c.name.startswith("item selection") and c.status == "FAIL" for c in r.checks)
+
+        # ---- 6. UNSIGNED. An unsigned record is self-consistent and mintable by anyone.
+        r = rigged(lambda raw: raw.update(signature="", signer=""), resign=False)
+        assert any(c.name.startswith("signature") and c.status == "FAIL" for c in r.checks)
+
+        # ---- 7. A REAL DETHRONE, so the margin recompute is actually exercised rather than
+        #         skipped. The dethrone margin is the number that moves emission, and it is a
+        #         PAIRED statistic — recomputable only because the incumbent's re-score is
+        #         published too. An unexercised check is not a check.
+        def ck(name, n):
+            q = Path(dd) / name
+            q.mkdir()
+            hb2 = _json.dumps({"w": {"dtype": "F32", "shape": [n],
+                                     "data_offsets": [0, 4 * n]}}).encode()
+            (q / "model.safetensors").write_bytes(struct.pack("<Q", len(hb2)) + hb2 + b"\0" * 4 * n)
+            (q / "config.json").write_text('{"hidden_size":8}')
+            return str(q)
+
+        weak, strong = ck("weak", 4), ck("strong", 6)
+        runners = {weak: Step("W"), strong: Step("X")}   # W moves the observer partway, X matches
+        obs2 = {"kimi": Obs(), "qwen": Obs()}
+        tour, ledger, reg = Tournament(tiers, margin=0.03), RegistrationLedger(), {}
+        budgets = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
+        sig = Ed25519Signer(seed=b"z" * 32)
+
+        def commit(hot, cold, cd):
+            hh, ss = content_hash(cd), "s" + hot
+            return Commitment(hot, cold, "t", cd, 1.0, revealed_hash=hh, salt=ss,
+                              committed_value=commit_value(hh, ss))
+
+        chain = FakeChain([commit("hot1", "cold1", weak)])
+        r1 = run_v2_observer_epoch(chain, 1, pool, Step("X"), obs2, tiers, budgets, tour, ledger,
+                                   reg, make_safe_runner=lambda cd: runners[cd], signer=sig,
+                                   n_items=20, corpus_spec=spec)
+        assert any(e.get("action") == "crown" for e in r1.outcome.events), r1.outcome.events
+
+        chain._commits = [commit("hot2", "cold2", strong)]
+        r2 = run_v2_observer_epoch(chain, 2, pool, Step("X"), obs2, tiers, budgets, tour, ledger,
+                                   reg, make_safe_runner=lambda cd: runners[cd], signer=sig,
+                                   n_items=20, corpus_spec=spec)
+        dth = [e for e in r2.outcome.events if e.get("action") == "dethrone"]
+        assert dth, r2.outcome.events
+        roles = {sub.role for sub in r2.outcome.record.submissions}
+        assert roles == {"challenger", "incumbent"}, roles
+
+        p2 = str(Path(dd) / "dethrone.json")
+        Path(p2).write_text(_json.dumps(asdict(r2.outcome.record)))
+        a2 = audit(p2, pool_path, Obs())
+        assert a2.exit_code == 0, [(c.name, c.detail) for c in a2.checks if c.status != "PASS"]
+        assert any(c.name.startswith("dethrone margin") and c.status == "PASS"
+                   for c in a2.checks), [c.name for c in a2.checks]
+        assert any(c.name.startswith("margin clears noise floor") and c.status == "PASS"
+                   for c in a2.checks)
+
+        # a crown claimed on a margin the round never measured
+        def fake_margin(raw):
+            for e in raw["events"]:
+                if e.get("action") == "dethrone":
+                    e["margin_lcb"] = 0.99
+        raw2 = _json.loads(Path(p2).read_text())
+        fake_margin(raw2)
+        p3 = str(Path(dd) / "dethrone_rigged.json")
+        Path(p3).write_text(_json.dumps(raw2))
+        rr = load_record(p3)
+        rr.signature = rr.signer = rr.sig_scheme = ""
+        rr.sign(sig)
+        Path(p3).write_text(_json.dumps(asdict(rr)))
+        a3 = audit(p3, pool_path, Obs())
+        assert any(c.name.startswith("dethrone margin") and c.status == "FAIL"
+                   for c in a3.checks), [c.name for c in a3.failed]
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -2202,6 +2417,7 @@ def main() -> int:
              test_determinism_gate, test_observer_epoch_end_to_end, test_artifact_manifest,
              test_miner_submit_and_chain_adapter,
              test_nonce_selects_items_and_record_is_rerunnable,
+             test_rerun_audits_and_catches_a_rigged_record,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

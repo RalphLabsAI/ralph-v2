@@ -31,6 +31,23 @@ class SubmissionRecord:
     per_point: list          # aligned to points[]
     gates_ok: bool
     reasons: list = field(default_factory=list)
+    # FROZEN miner steps, aligned to points[]. With these plus the frozen parent step and
+    # continuation in points[], an auditor recomputes the observer's distributions itself — so
+    # the JUDGMENT layer is re-derived, not trusted. That is the difference from a subnet that
+    # publishes LLM verdicts: aggregating asserted judgments only catches arithmetic fraud,
+    # whereas recomputing a KL from text catches a rigged score.
+    steps: list = field(default_factory=list)
+    # per-sample [slice_key, s, d_parent, d_miner] as scored, aligned to points[]. Carrying the
+    # slice key makes the score ARITHMETICALLY recomputable with no models at all: regroup, mean
+    # per slice, take the worst. A validator that publishes honest KLs but a fabricated aggregate
+    # is caught for free.
+    effects: list = field(default_factory=list)
+    # slice_key -> per-sample scores, i.e. the exact paired vectors the dethrone bootstrap ran on.
+    slices: dict = field(default_factory=dict)
+    # "challenger" | "incumbent". The incumbent's re-score is the OTHER HALF of the paired
+    # dethrone test; publishing only challengers left the comparison one-sided and the margin
+    # unverifiable.
+    role: str = "challenger"
 
 
 @dataclass
@@ -124,10 +141,17 @@ def build_round_record(round_no: int, commit_root: str, round_nonce: str, teache
         return dict(p)
 
     pts = [_pt(p) for p in points]
+    # `scored` may key the re-scored incumbent as "<hash>#incumbent" so it cannot collide with the
+    # same model submitted as a challenger. The RECORD identifies it by content hash and `role`, so
+    # the suffix is stripped here — an auditor matching an event's `beaten` field against model_id
+    # must not have to know about an internal dict-key convention.
     subs = [SubmissionRecord(
-        model_id=mid, miner=s.sub.miner, tier=s.sub.tier,
+        model_id=mid.split("#", 1)[0], miner=s.sub.miner, tier=s.sub.tier,
         retention=round(s.retention, 6), retention_lb=round(s.retention_lb, 6),
-        per_point=[round(x, 4) for x in s.per_point], gates_ok=s.gates_ok, reasons=s.reasons)
+        per_point=[round(x, 4) for x in s.per_point], gates_ok=s.gates_ok, reasons=s.reasons,
+        steps=list(getattr(s, "steps", []) or []), effects=list(getattr(s, "effects", []) or []),
+        slices={k: [round(x, 6) for x in v] for k, v in (s.per_axis or {}).items()},
+        role=getattr(s, "role", "challenger"))
         for mid, s in scored.items()]
     rec = RoundRecord(round_no, commit_root, round_nonce, teacher, judge, base, pile_id,
                       pts, subs, events, weights,

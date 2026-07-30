@@ -151,6 +151,12 @@ class MinerScore:
     # vectors (koth.softmin_lcb_diff), exactly as it was over per-axis vectors — so the crown
     # machinery, the copy-guard and the noise margin all carry over unchanged.
     slice_samples: dict = field(default_factory=dict)
+    # per-sample StepEffect objects, in scoring order — the record freezes these so a divergence
+    # in a re-run localises to one sample instead of just to the aggregate.
+    effects: list = field(default_factory=list)
+    # (slice_key, StepEffect) in the same order. The key is what makes the aggregate recomputable
+    # from the raw measurements alone.
+    keyed_effects: list = field(default_factory=list)
     reasons: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -176,6 +182,8 @@ def score_miner(samples: list[tuple[str, StepEffect]], alpha: float = 1.0, beta:
             continue
         by_slice.setdefault(key, []).append(sample_score(eff, alpha, beta))
         live.append(eff.d_miner)
+        out.effects.append(eff)
+        out.keyed_effects.append((key, eff))
         out.n_scored += 1
     if not out.n_scored:
         out.reasons.append("no scorable samples")

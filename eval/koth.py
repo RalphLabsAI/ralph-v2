@@ -57,6 +57,11 @@ class Scored:
     per_axis: dict = field(default_factory=dict)
     # per-axis AxisScore objects (retention/n/live) for the record + diagnosis. Optional.
     axes: list = field(default_factory=list)
+    # frozen per-sample generations + effect triples, carried into the signed round record so an
+    # auditor can recompute the score without re-running generation.
+    steps: list = field(default_factory=list)
+    effects: list = field(default_factory=list)
+    role: str = "challenger"
 
     @property
     def valid(self) -> bool:
