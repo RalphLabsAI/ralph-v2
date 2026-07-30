@@ -1,12 +1,18 @@
 # SN40 v2 — The Model Compression Subnet
 
-**One line:** miners compress a pinned open model — starting with **GLM** — to a low bit budget
-with its architecture unchanged; the best compression per bit tier wears a crown, and every
-crown ships as a downloadable, runnable open model.
+**One line:** miners compress a pinned open model to a low bit budget with its architecture
+unchanged; the best compression per bit tier wears a crown, and every crown ships as a
+downloadable, runnable open model.
+
+**Pinned parent today: `Qwen/Qwen2.5-0.5B-Instruct`.** GLM is the intended target and has never
+been run — the mechanism was validated on a 0.5B parent deliberately, because "does it
+discriminate and does it reproduce" is answered as well by a small model as a large one, for a
+fraction of the rent. Scaling the parent is a config change (`eval/parent.py`); it is not a
+claim this repo has earned yet.
 
 **Reference point:** PrismML's Ternary Bonsai showed what one lab gets from aggressive
 compression (much smaller, faster, HF-trending). v2 makes that a standing market — a
-permissionless swarm doing it to GLM continuously — with an anti-gaming design built from
+permissionless swarm doing it continuously — with an anti-gaming design built from
 the public lessons of earlier distillation-KOTH attempts
 ([`docs/prior-art-and-lessons.md`](docs/prior-art-and-lessons.md)).
 
@@ -23,10 +29,16 @@ Each round:
    measured from the tensor data** → **pinned-parent shape check** → **content-hash +
    commit-reveal**. No untrusted weights load until all of it passes.
 2. **Score** — observer-KL over trajectory steps (below).
-3. **Crown** — KOTH, incumbent re-scored *and re-gated* every round, dethrone on a paired
+3. **Identity canary** — the pinned parent is scored *as if it were a submission* and must come
+   back at exactly **1.0**. Not a modelling assumption: when the submitted step IS the parent's
+   step, `s = 0` and `|d_A − d_G| = 0`, so any shortfall is the pipeline disagreeing with itself.
+   Measured on real hardware this caught an H100 returning **0.8754 while the noise probe
+   reported a clean floor** — batched generation there is nondeterministic above ~64 new tokens.
+   A validator that cannot reproduce the identity **aborts the round** instead of crowning.
+4. **Crown** — KOTH, incumbent re-scored *and re-gated* every round, dethrone on a paired
    bootstrap lower bound of the worst-slice difference — **and refused if the margin sits inside
    the validator's own measured noise floor.**
-4. **Publish, then pay** — the signed round record is written, **read back and verified**, and
+5. **Publish, then pay** — the signed round record is written, **read back and verified**, and
    anchored on chain *before* any weight is set. If it cannot be published and verified, no
    crown is written and no weights are set (see [Auditability](#auditability-one-validator-many-auditors)).
 
@@ -173,7 +185,14 @@ The mechanism is complete and tested end to end against a fake chain. What has *
   *data*; parent + observer + a genuinely quantized student on a GPU has never been executed
   once. Four of the last five real bugs here only appeared against real inputs, so expect that
   first run to surface more.
-- **The noise floor is still unmeasured, and it now sets the audit tolerance too.**
+- **Determinism is a property of the BOX, and two of the three knobs are now pinned in the
+  record.** Measured on H100 PCIe / A100 SXM4 / L40S with byte-identical items: within a fixed
+  configuration a round is bit-exact (0.0 spread, byte-identical generations), but the H100
+  returned four different outputs from four identical `generate()` calls until the attention
+  implementation was pinned. Across GPUs the boxes still generate different step text, so a score
+  is only meaningful against a recorded (gpu, batch_size, attn_implementation) — all three now
+  live in the signed manifest, and the audit reports a mismatch as hardware rather than fraud.
+- **The noise floor is still unmeasured in the old KL sense, and it sets the audit tolerance.**
   `eval/determinism.py` gates crowns on it and the record derives `reproduction_tolerance` from
   it, so the same unmeasured number decides both whether a crown is real and whether a re-run
   counts as reproducing. Worse, it is currently probed only on the single-sequence
@@ -204,9 +223,20 @@ The mechanism is complete and tested end to end against a fake chain. What has *
 
 ```bash
 pip install -r requirements.txt        # one dep for the tests: pynacl
-python -m tests.test_crown_path        # 46/46, CPU
-python -m eval.run_capability_axis     # the capability CANARY on real models (GPU)
-python -m eval.shadow_axis_epoch       # the full operator epoch end to end (fake chain)
+python -m tests.test_crown_path        # 47/47, CPU
+python -m eval.simulate_submission     # THE WHOLE CYCLE: miner -> validator -> auditor, seconds
+```
+
+`simulate_submission` is the fastest way to see what this actually is. It walks the six intake
+gates in order, draws the observer from the post-commit nonce, runs the identity canary, crowns,
+publishes fail-closed with an on-chain anchor, and then re-audits its own published record at all
+four levels. Stub models, but every gate, the crown logic, publishing, anchoring and the audit are
+real. Add `--real` for the pinned parent and a genuine 4-bit quantization on a GPU.
+
+```bash
+python -m eval.shakedown_round_noise   # whole-round noise floor, in retention units (GPU)
+python -m eval.ladder_probe            # does the metric ORDER compressions? (GPU)
+python -m eval.batch_invariance        # is the score a function of the artifact alone? (GPU)
 ```
 
 Miners: see [`miner/QUICKSTART.md`](miner/QUICKSTART.md).
