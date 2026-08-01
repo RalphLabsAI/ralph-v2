@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/ralph-banner.png" alt="Ralph Labs — open model compression" width="100%">
+</p>
+
 # SN40 v2 — The Model Compression Subnet
 
 **One line:** miners compress a pinned open model to a low bit budget with its architecture
