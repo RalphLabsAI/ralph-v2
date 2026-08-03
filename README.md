@@ -2,49 +2,112 @@
   <img src="docs/assets/ralph-banner.png" alt="Ralph Labs — open model compression" width="100%">
 </p>
 
-# SN40 v2 — The Model Compression Subnet
+# Ralph — open model compression on Bittensor SN40
 
-**One line:** miners compress a pinned open model to a low bit budget with its architecture
-unchanged; the best compression per bit tier wears a crown, and every crown ships as a
-downloadable, runnable open model.
+**Compress one pinned open model into fewer bits, without touching its architecture. Best
+compression per bit tier wears the crown, and every crown ships as downloadable weights.**
 
-**Pinned parent today: `Qwen/Qwen2.5-0.5B-Instruct`.** GLM is the intended target and has never
-been run — the mechanism was validated on a 0.5B parent deliberately, because "does it
-discriminate and does it reproduce" is answered as well by a small model as a large one, for a
-fraction of the rent. Scaling the parent is a config change (`eval/parent.py`); it is not a
-claim this repo has earned yet.
+`Qwen/Qwen3-8B` pinned · `16.38 GB` at bf16 → `1.75 GB` at ternary · [netuid 40](https://taostats.io/subnets/40)
 
-**Reference point:** PrismML's Ternary Bonsai showed what one lab gets from aggressive
-compression (much smaller, faster, HF-trending). v2 makes that a standing market — a
-permissionless swarm doing it continuously — with an anti-gaming design built from
-the public lessons of earlier distillation-KOTH attempts
-([`docs/prior-art-and-lessons.md`](docs/prior-art-and-lessons.md)).
+This is not a smaller model trained to imitate a bigger one. It is the model you already know,
+stored differently — smaller, not dumber. A submission whose shape does not match the parent is
+refused before any weights load.
 
-## How it works
+---
 
-The task is **PrismML/Bonsai's task**: take one **pinned parent** model, leave the architecture
-untouched, and re-store its weights at a low bit budget. Miners submit a compressed checkpoint
-(safetensors **or GGUF**) into a bit tier. The validator scores the artifact itself and never
-inspects or trusts the private training process.
+## For miners
 
-Each round:
+You compress privately, however you like. The subnet never inspects your method, only your artifact.
 
-1. **Front door** — economics → safety inspect (no pickles, no remote code) → **bit budget
-   measured from the tensor data** → **pinned-parent shape check** → **content-hash +
-   commit-reveal**. No untrusted weights load until all of it passes.
-2. **Score** — observer-KL over trajectory steps (below).
-3. **Identity canary** — the pinned parent is scored *as if it were a submission* and must come
-   back at exactly **1.0**. Not a modelling assumption: when the submitted step IS the parent's
-   step, `s = 0` and `|d_A − d_G| = 0`, so any shortfall is the pipeline disagreeing with itself.
-   Measured on real hardware this caught an H100 returning **0.8754 while the noise probe
-   reported a clean floor** — batched generation there is nondeterministic above ~64 new tokens.
-   A validator that cannot reproduce the identity **aborts the round** instead of crowning.
-4. **Crown** — KOTH, incumbent re-scored *and re-gated* every round, dethrone on a paired
-   bootstrap lower bound of the worst-slice difference — **and refused if the margin sits inside
-   the validator's own measured noise floor.**
-5. **Publish, then pay** — the signed round record is written, **read back and verified**, and
-   anchored on chain *before* any weight is set. If it cannot be published and verified, no
-   crown is written and no weights are set (see [Auditability](#auditability-one-validator-many-auditors)).
+```bash
+git clone https://github.com/RalphLabsAI/ralph-v2 && cd ralph-v2
+pip install -r requirements.txt
+
+# 1. compress Qwen/Qwen3-8B however you want — GPTQ, AWQ, bitsandbytes, your own scheme.
+#    safetensors or GGUF, architecture unchanged.
+
+# 2. COMMIT FIRST — this seals a hash of your exact bytes on chain before the round exists
+python -m miner.submit commit \
+    --ckpt ./my-compressed-qwen3 --tier ternary \
+    --uri hf://<you>/<repo>@<rev> \
+    --wallet <your-wallet> --hotkey <your-hotkey> --netuid 40
+#   add --dry-run first; it prints what would be committed without touching the chain
+
+# 3. reveal after the round opens
+python -m miner.submit reveal --ckpt ./my-compressed-qwen3 \
+    --wallet <your-wallet> --hotkey <your-hotkey> --netuid 40
+```
+
+Full walkthrough: [`miner/QUICKSTART.md`](miner/QUICKSTART.md).
+
+### What you have to clear
+
+Six gates, in order. Nothing loads your weights until all six pass.
+
+| # | gate | fails if |
+|---|---|---|
+| 1 | economics | not registered, or no bond outside your free evaluation |
+| 2 | safety | pickles, remote code, or files that are not weights |
+| 3 | tier fit | parameter count or dtype headers inconsistent |
+| 4 | **bit budget** | measured bits/weight over the tier cap — read from tensor DATA, not the dtype header |
+| 5 | **pinned parent** | architecture or weight-element count does not match `Qwen/Qwen3-8B` |
+| 6 | commit-reveal | bytes do not hash to what you committed before the nonce existed |
+
+### Bit tiers
+
+| tier | max bits/weight achieved | ≈ size at 8B |
+|---|---|---|
+| `binary` | 1.15 | 1.18 GB |
+| `ternary` | 1.75 | 1.79 GB |
+| `sub2` | 2.0 | 2.05 GB |
+| `sub4` | 4.0 | 4.10 GB |
+
+A 4-bit model shipped inside a 16-bit container is credited for the compression it achieved and
+rejected as an unshippable artifact — both budgets bind.
+
+### What wins
+
+Your model and the parent each continue the same reasoning trajectory. An independent observer
+model reads both, and your score is how closely you moved it to where the parent did. Scores
+aggregate **worst-slice across languages**, so a weak language cannot be bought with a strong one.
+
+Which trajectories get scored, and which observer grades them, are both drawn from a chain value
+that does not exist until your checkpoint is sealed. There is no fixed test set to fit and no
+grader you can name in advance.
+
+---
+
+## For anyone checking a crown
+
+Every round publishes what it scored, which items it drew and which observer graded them, so a
+result can be recomputed rather than believed.
+
+```bash
+python -m eval.rerun <record.json>                                    # arithmetic only, no GPU
+python -m eval.rerun <record.json> --pool <items.jsonl> \
+    --observer <hf-id> --artifacts <ckpt-dir>                         # full re-derivation
+python -m eval.rerun --history <dir> --head <on-chain anchor>         # is the trail complete?
+```
+
+Exit `0` reproduced · `1` diverged · `2` incomplete. Skipping the expensive levels exits 2, never
+0 — nobody can call a round verified by running the cheap half.
+
+The adversary assumed throughout is **the operator holding the signing key**, so a valid signature
+attributes a record and never validates it.
+
+---
+
+## Run it locally
+
+```bash
+python -m tests.test_crown_path        # 49/49, CPU, no GPU needed
+python -m eval.simulate_submission     # miner -> validator -> auditor in seconds
+```
+
+The second walks the six gates, draws the observer from the nonce, runs the identity check, crowns,
+publishes fail-closed with an on-chain anchor, then re-verifies its own round at all four levels.
+
+---
 
 ## The crown: semantic equivalence by downstream effect
 
@@ -168,19 +231,6 @@ The last team proved you **cannot detect** copying on a shared base. v2 makes ga
 - **Signed round records.** Every verdict is signed by the validator and independently
   re-runnable from the recorded seeds.
 
-## The honest claim
-
-The crown certifies that a submitted artifact, at a **measured bit budget**, adds
-**approximately the same information to a trajectory as the pinned parent does**, as judged by
-independent observer models on trajectories the miner did not choose.
-
-It does *not* certify lineage. The pinned-parent check is a shape/architecture ADMISSION gate,
-not a proof of descent — nothing behavioural can prove descent, since a different model of
-identical shape would pass the same checks. And observer-KL measures informational equivalence,
-not capability: a student could move the observer correctly and still be unusable. That is the
-one blind spot, it is why the capability canary is kept, and we claim exactly what the eval
-proves and no more.
-
 ## Not yet done — read this before running it anywhere real
 
 The mechanism is complete and tested end to end against a fake chain. What has **not** happened:
@@ -217,33 +267,15 @@ The mechanism is complete and tested end to end against a fake chain. What has *
   walks the full trail on a schedule, so a gap or a deletion outside the window waits for a human
   to look.
 - **No miner has ever submitted anything.** The end-to-end submission flow is untested by a
-  third party.
+  third party, and `fetch_dir_for` is unwired — the validator cannot yet resolve a committed URI
+  to bytes at all.
+- **Non-Latin coverage is Hindi and Chinese.** That is where the anti-clone axis binds today; the
+  published evidence for low-bit collapse is Persian and Cyrillic, so the pool does not yet test
+  where the proof is.
 - **Chain integration is FakeChain only**, and the validator box needs `bubblewrap` for the
   sandboxed code canary.
 - **`eval/budget.py`** (score-at-budget / convergence gate) is written and tested but not wired
   into the crown path.
-
-## Run it
-
-```bash
-pip install -r requirements.txt        # one dep for the tests: pynacl
-python -m tests.test_crown_path        # 47/47, CPU
-python -m eval.simulate_submission     # THE WHOLE CYCLE: miner -> validator -> auditor, seconds
-```
-
-`simulate_submission` is the fastest way to see what this actually is. It walks the six intake
-gates in order, draws the observer from the post-commit nonce, runs the identity canary, crowns,
-publishes fail-closed with an on-chain anchor, and then re-audits its own published record at all
-four levels. Stub models, but every gate, the crown logic, publishing, anchoring and the audit are
-real. Add `--real` for the pinned parent and a genuine 4-bit quantization on a GPU.
-
-```bash
-python -m eval.shakedown_round_noise   # whole-round noise floor, in retention units (GPU)
-python -m eval.ladder_probe            # does the metric ORDER compressions? (GPU)
-python -m eval.batch_invariance        # is the score a function of the artifact alone? (GPU)
-```
-
-Miners: see [`miner/QUICKSTART.md`](miner/QUICKSTART.md).
 
 ## Positioning vs the family
 

@@ -145,7 +145,8 @@ def main() -> int:
 
     c = sub.add_parser("commit", help="seal and publish a commitment (do this FIRST)")
     c.add_argument("--ckpt", required=True, help="checkpoint dir (safetensors or .gguf)")
-    c.add_argument("--tier", required=True, help="bit tier, e.g. ternary-4b")
+    c.add_argument("--tier", required=True,
+               help="bit tier: binary | ternary | sub2 | sub4 (see eval.bitrate.TIERS)")
     c.add_argument("--uri", default="", help="where the bytes live, e.g. hf://repo@rev")
     c.add_argument("--salt", default="", help="omit to generate one")
     c.add_argument("--compute-h100h", dest="compute_h100h", type=float, default=0.0)
