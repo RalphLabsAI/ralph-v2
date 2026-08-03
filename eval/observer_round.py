@@ -185,14 +185,39 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
     k = min(n, total)
     rng = _r.Random(derive_seed(commit_root, round_nonce, tag))
 
+    # Stratify by the FULL slice key the scorer uses, not just by language. score_miner drops any
+    # slice under its per-slice floor, and the key is (observer x language x DEPTH) — so balancing
+    # languages alone still leaves 3 languages x 2 depths = 6 slices from 24 items, ~4 each, every
+    # one of them dropped. That is not a subtle degradation: with every slice dropped the score is
+    # 0.0, the identity check fails, and the round ABORTS. It aborted the first real publish.
+    #
+    # The observer is constant within a round, so grouping on (language, depth) is the same
+    # partition the aggregation will see.
     by_lang: dict = {}
     for i, t in enumerate(pool):
         lang = (getattr(t, "meta", None) or {}).get("lang") or _lang_of(t.source)
-        by_lang.setdefault(lang, []).append(i)
+        depth = "deep" if getattr(t, "index", 0) >= 3 else "shallow"
+        by_lang.setdefault((lang, depth), []).append(i)
 
     if len(by_lang) < 2:
         idx = sorted(rng.sample(range(total), k))
         return [pool[i] for i in idx], idx
+
+    # ARITHMETIC PRECONDITION. With S slices and a per-slice floor F, a draw of fewer than S*F
+    # items cannot fill them however it is stratified — every slice lands under the floor, all of
+    # them are dropped, the score is 0.0 and the round aborts. It is worth failing here with the
+    # numbers rather than there: the identity check's own diagnosis is "nondeterministic
+    # generation, check attn_implementation", which would send an operator hunting a GPU bug that
+    # does not exist.
+    import inspect as _i
+    from .observer_kl import score_miner as _sm
+    floor = _i.signature(_sm).parameters["min_per_slice"].default
+    need = len(by_lang) * floor
+    if k < need:
+        raise ValueError(
+            f"n_items={k} cannot fill {len(by_lang)} scoring slices at {floor} samples each; "
+            f"need at least {need}. Slices are (language x depth) — raise n_items, or narrow the "
+            f"pool's language mix.")
 
     langs = sorted(by_lang)
     # floor first, capped by what the pool actually holds and by the total budget

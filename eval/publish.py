@@ -99,7 +99,16 @@ class HFSink:
 
     def __init__(self, repo_id: str, token: str = "", revision: str = "main"):
         self.repo_id, self.revision = repo_id, revision
-        self._token = token or os.environ.get("RALPH_HF_TOKEN", "")
+        # HF_TOKEN is the name huggingface_hub itself reads and the one already in the operator
+        # environment. RALPH_HF_TOKEN was a name nothing set, so the sink silently fell back to an
+        # anonymous client and would have failed its first write with a 401 — after the round had
+        # already scored.
+        self._token = (token or os.environ.get("HF_TOKEN")
+                       or os.environ.get("RALPH_HF_TOKEN") or "")
+        if not self._token:
+            raise PublishError(
+                "no HF token: set HF_TOKEN (or pass token=). Refusing to construct a publisher "
+                "that cannot write, because the failure would surface after a round is scored.")
 
     def put(self, name: str, blob: bytes) -> str:
         from huggingface_hub import HfApi

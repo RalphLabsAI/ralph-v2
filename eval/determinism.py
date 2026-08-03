@@ -131,8 +131,14 @@ def identity_check(shared, parent, observer, max_step_tokens: int = 256) -> tupl
             "shortfall": round(1.0 - ms.score, 6)}
     ok = abs(ms.score - 1.0) <= IDENTITY_TOLERANCE and not ms.reasons
     if not ok:
+        thin = any("slice" in r for r in ms.reasons)
         info["verdict"] = (
             f"parent scored {ms.score:.6f} against itself, not 1.0 — the pipeline disagrees with "
-            f"itself by {1.0 - ms.score:.4f}. Almost always nondeterministic generation: check "
-            f"attn_implementation and try a shorter max_step_tokens.")
+            f"itself by {1.0 - ms.score:.4f}. "
+            + ("EVERY SCORING SLICE WAS DROPPED for having too few samples, so this is a round "
+               "SIZE problem, not a hardware one: raise n_items until each (language x depth) "
+               "slice clears the per-slice floor."
+               if thin else
+               "Almost always nondeterministic generation: check attn_implementation and try a "
+               "shorter max_step_tokens."))
     return ok, info

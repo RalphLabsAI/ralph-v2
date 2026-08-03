@@ -2990,7 +2990,20 @@ def test_pool_is_language_balanced_or_the_round_refuses():
     # THE DRAW, not a prefix. build_pool concatenates by source, so any prefix of the pool is
     # single-language — the round never takes a prefix, it takes a nonce-derived sample.
     from eval.observer_round import select_trajectories
-    drawn, idx = select_trajectories(pool, "root", "nonce-A", 24)
+
+    # ARITHMETIC FIRST. Slices are (language x depth), so a 3-language pool has 6 of them, and a
+    # draw smaller than 6 x the per-slice floor cannot fill them however it is stratified. That is
+    # not a degradation — every slice is dropped, the score is 0.0, the identity check fails and
+    # the round ABORTS. It aborted the first real publish to HF, and the identity check's own
+    # diagnosis blamed nondeterministic generation, which would have sent an operator hunting a
+    # GPU bug that did not exist. So the draw refuses, with the numbers.
+    try:
+        select_trajectories(pool, "root", "nonce-A", 24)
+        raise AssertionError("a draw too small to fill its slices was accepted")
+    except ValueError as e:
+        assert "cannot fill 6 scoring slices" in str(e) and "at least 48" in str(e), e
+
+    drawn, idx = select_trajectories(pool, "root", "nonce-A", 48)
     shared = build_shared(drawn, Step(), Obs(), "obs")
     slices = {s.slice_key for s in shared if s.usable}
     langs_in_play = {k.split("lang=")[1].split("|")[0] for k in slices}
@@ -3003,13 +3016,17 @@ def test_pool_is_language_balanced_or_the_round_refuses():
     import inspect
     from eval.observer_kl import score_miner
     floor = inspect.signature(score_miner).parameters["min_per_slice"].default
-    drawn_bal = language_balance(drawn)
-    assert all(v >= floor for v in drawn_bal.values()), (drawn_bal, floor)
+    # count by the FULL slice key the scorer uses — balancing languages alone left 6 thin slices
+    from collections import Counter
+    from eval.observer_round import _slice_key
+    per_slice = Counter(_slice_key(t, "obs") for t in drawn)
+    assert all(v >= floor for v in per_slice.values()), (dict(per_slice), floor)
+    assert len(per_slice) == 6, dict(per_slice)
 
     # stratification must not cost the properties the nonce draw exists for
-    a, _ = select_trajectories(pool, "root", "nonce-A", 24)
-    b, _ = select_trajectories(pool, "root", "nonce-A", 24)
-    c, _ = select_trajectories(pool, "root", "nonce-B", 24)
+    a, _ = select_trajectories(pool, "root", "nonce-A", 48)
+    b, _ = select_trajectories(pool, "root", "nonce-A", 48)
+    c, _ = select_trajectories(pool, "root", "nonce-B", 48)
     assert [t.id for t in a] == [t.id for t in b], "draw is not reproducible"
     assert [t.id for t in a] != [t.id for t in c], "draw does not move with the nonce"
     assert idx == sorted(idx) and len(idx) == len(set(idx))
