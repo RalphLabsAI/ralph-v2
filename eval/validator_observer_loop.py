@@ -178,6 +178,7 @@ def run_observer_round(
     #    pinned parent and commit-reveal have all passed.
     subs = []
     d_root: dict = {}
+    d_bits: dict = {}
     for c in committed:
         d = intake(c.ckpt_dir, tier_budgets[c.tier], ledger, c.hotkey, c.coldkey,
                    c.bond_posted, revealed_hash=c.revealed_hash, salt=c.salt,
@@ -186,6 +187,10 @@ def run_observer_round(
             out.rejected.append((c.hotkey, d.reasons))
             continue
         d_root[d.content_hash] = getattr(d, "manifest_root", "")
+        # carry the MEASURED bit budget forward so intelligence density is derivable from the
+        # published record. d.bits is None when the tier declares no bit_tier — in which case the
+        # density is genuinely unknown and must read as 0 rather than be guessed from the header.
+        d_bits[d.content_hash] = d.bits
         sub = Submission(miner=c.hotkey, tier=c.tier, model_id=d.content_hash,
                          params=d.inspection.params, compute_h100h=c.declared_compute_h100h,
                          coldkey=c.coldkey)
@@ -252,6 +257,9 @@ def run_observer_round(
                    reasons=reasons, per_axis=dict(ms.slice_samples))
         s.artifact_uri = art_uri
         s.manifest_root = d_root.get(sub.model_id, "")
+        _b = d_bits.get(sub.model_id)
+        s.code_bits = float(getattr(_b, "code_bits", 0.0) or 0.0)
+        s.container_bits = float(getattr(_b, "container_bits", 0.0) or 0.0)
         s.steps = _freeze(runner, usable, max_step_tokens)
         s.effects = _effects(ms)
         scored[sub.model_id] = s

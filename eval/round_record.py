@@ -48,6 +48,13 @@ class SubmissionRecord:
     # instruction anyone can follow, so the frozen steps are unfalsifiable by construction.
     artifact_uri: str = ""
     manifest_root: str = ""
+    # INPUTS to intelligence density, published so the number is recomputable rather than asserted.
+    # `params` and the two bit figures come from intake's measurement of the actual tensor data;
+    # retention is already above. eval/density.py divides them. Publishing the inputs rather than
+    # the ratio is the same rule the rest of this record follows.
+    params: int = 0
+    code_bits: float = 0.0
+    container_bits: float = 0.0
     # "challenger" | "incumbent". The incumbent's re-score is the OTHER HALF of the paired
     # dethrone test; publishing only challengers left the comparison one-sided and the margin
     # unverifiable.
@@ -164,7 +171,10 @@ def build_round_record(round_no: int, commit_root: str, round_nonce: str, teache
         slices={k: [round(x, 6) for x in v] for k, v in (s.per_axis or {}).items()},
         role=getattr(s, "role", "challenger"),
         artifact_uri=getattr(s, "artifact_uri", ""),
-        manifest_root=getattr(s, "manifest_root", ""))
+        manifest_root=getattr(s, "manifest_root", ""),
+        params=getattr(s.sub, "params", 0) or 0,
+        code_bits=round(getattr(s, "code_bits", 0.0) or 0.0, 4),
+        container_bits=round(getattr(s, "container_bits", 0.0) or 0.0, 4))
         for mid, s in scored.items()]
     rec = RoundRecord(round_no, commit_root, round_nonce, teacher, judge, base, pile_id,
                       # COPY the events list. It used to be stored by reference, so a caller

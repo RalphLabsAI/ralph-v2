@@ -3015,6 +3015,77 @@ def test_pool_is_language_balanced_or_the_round_refuses():
     assert idx == sorted(idx) and len(idx) == len(set(idx))
 
 
+def test_density_and_model_card_are_derived_not_asserted():
+    """Intelligence density is the unit this market competes on, so it must be RECOMPUTABLE.
+
+    PrismML publish a density number from a private method. The whole difference here is that both
+    halves are measured on every submission — retention from observer-KL, true bits per weight from
+    the tensor data — so the record publishes the INPUTS and anyone divides them. A card that
+    asserted the ratio could disagree with the round that produced it; one generated from the record
+    cannot."""
+    from eval.density import Density, compression_ratio, from_record, rank, size_gb
+    from eval.model_card import render
+    from eval.round_record import SubmissionRecord
+
+    P = 8_190_735_360   # the pinned Qwen3-8B
+
+    # ternary, the Bonsai operating point
+    d = Density(params=P, code_bits=1.71, container_bits=2.125, retention=0.94)
+    assert abs(size_gb(P, 16) - 16.38) < 0.02, size_gb(P, 16)
+    assert abs(d.download_gb - 2.176) < 0.01, d.download_gb
+    assert abs(d.shrink - 16 / 2.125) < 0.01
+    # the unit: retention POINTS per GB downloaded, using the shipped size not the achieved one —
+    # density is a claim about what you get per byte you actually store
+    assert abs(d.retention_per_gb - (94.0 / d.download_gb)) < 1e-6
+
+    # a 1-bit model in a 16-bit container is a real compression and an undeployable file: the
+    # achievement and the download must not be the same number
+    unpacked = Density(params=P, code_bits=1.125, container_bits=16.0, retention=0.94)
+    assert unpacked.code_bits < unpacked.container_bits
+    assert unpacked.retention_per_gb < d.retention_per_gb, "shipping fat must cost density"
+
+    # derived from a published record, never stored as a ratio
+    sub = SubmissionRecord(model_id="abc", miner="hot1", tier="ternary", retention=0.94,
+                           retention_lb=0.94, per_point=[], gates_ok=True,
+                           params=P, code_bits=1.71, container_bits=2.125)
+    d2 = from_record(sub)
+    assert abs(d2.retention_per_gb - d.retention_per_gb) < 1e-9
+    assert "retention_per_gb" in d2.as_dict() and "params" in d2.as_dict()
+
+    # the leaderboard PrismML cannot publish, because they have one entry
+    worse = SubmissionRecord(model_id="def", miner="hot2", tier="ternary", retention=0.94,
+                             retention_lb=0.94, per_point=[], gates_ok=True,
+                             params=P, code_bits=4.0, container_bits=4.25)
+    order = rank([worse, sub])
+    assert order[0][0].model_id == "abc", "denser artifact must rank first"
+
+    # ---- the card ----
+    card = render(model_id="RalphLabsAI/Qwen3-8B-ternary", parent="Qwen/Qwen3-8B",
+                  parent_params=P, tier="ternary", density=d, miner="hot1", round_no=7,
+                  observer="qwen1.5b", languages={"en": 30, "hi": 12, "zh": 12},
+                  record_url="https://example/record.json")
+
+    # their structure, adopted deliberately: functional headline, three ratios, quickstart BEFORE
+    # benchmarks, density section, stated limitations
+    for section in ("## Quickstart", "## Model overview", "## Intelligence density",
+                    "## Benchmarks", "## How this was scored", "## Limitations"):
+        assert section in card, section
+    assert card.index("## Quickstart") < card.index("## Benchmarks"), \
+        "quickstart must precede benchmarks — you can run it before you argue about it"
+    assert "architecture unchanged" in card
+    assert "not a smaller model trained to imitate" in card
+
+    # the honesty rules that must survive contact with a marketing surface
+    assert "have not been run" in card, "an unmeasured benchmark table must say so out loud"
+    assert "saturates on badly damaged models" in card, "the known limitation must ship with it"
+    # assert the word, not the formatting — the card renders it as *not* interchangeable and a
+    # literal match on the phrase breaks the moment someone adjusts the emphasis
+    assert "interchangeable" in card, "retention must not be passed off as absolute capability"
+    assert "Retention says nothing about how good the parent was" in card
+    assert "worst-slice" in card and "hi 12" in card
+    assert "python -m eval.rerun" in card, "the card must tell you how to check it"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -3040,6 +3111,7 @@ def main() -> int:
              test_publisher_is_fail_closed,
              test_identity_canary_catches_a_nondeterministic_box,
              test_pool_is_language_balanced_or_the_round_refuses,
+             test_density_and_model_card_are_derived_not_asserted,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:

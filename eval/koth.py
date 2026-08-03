@@ -64,6 +64,8 @@ class Scored:
     role: str = "challenger"
     artifact_uri: str = ""
     manifest_root: str = ""
+    code_bits: float = 0.0
+    container_bits: float = 0.0
 
     @property
     def valid(self) -> bool:
@@ -87,6 +89,8 @@ class King:
     # resolvable locator for the crowned bytes + the manifest root that pins the file set
     artifact_uri: str = ""
     manifest_root: str = ""
+    code_bits: float = 0.0
+    container_bits: float = 0.0
 
 
 def bootstrap_lcb_diff(a: list[float], b: list[float], z_reps: int = 2000,
