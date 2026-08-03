@@ -52,6 +52,23 @@ class ParentSpec:
 # "qwen2". Add a parent only after reading its real header — a guessed number rejects every
 # honest submission to that tier and is indistinguishable from the tier being broken.
 PARENTS: dict[str, ParentSpec] = {
+    # PINNED PARENT for the compression market.
+    #
+    # Chosen because it is the model PrismML themselves compress. Their Bonsai family is built from
+    # Qwen3-class parents, so a crown here is directly comparable to a published artifact rather
+    # than to a number we picked. It is also dense (no MoE expert routing, which is batch-dependent
+    # by construction and would break the identity check), it fits on one card for the validator to
+    # run as the parent every round, and at ternary it lands at 1.75 GB — genuinely phone-runnable,
+    # which is the claim the subnet makes.
+    #
+    # MEASURED 2026-08-03, not guessed: ranged reads of all five safetensors headers on the real
+    # HF checkpoint, summing shape products exactly as gates.inspect_checkpoint does.
+    #   5 shards, 8,190,735,360 elements, all BF16 -> 16.38 GB
+    #   ternary (1.71 bpw) = 1.75 GB   binary (1.125) = 1.15 GB   4-bit = 4.10 GB
+    "qwen3-8b": ParentSpec(
+        name="Qwen/Qwen3-8B", arch="qwen3",
+        weight_params=8_190_735_360, hidden_size=4096, num_layers=36, vocab_size=151936,
+    ),
     "qwen2.5-0.5b-instruct": ParentSpec(
         name="Qwen/Qwen2.5-0.5B-Instruct", arch="qwen2",
         weight_params=630_095_872, hidden_size=896, vocab_size=151936,

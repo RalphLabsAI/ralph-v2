@@ -149,22 +149,34 @@ def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: O
 
 
 def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
-                        tag: str = "observer-items"):
-    """Draw WHICH trajectories are scored from POST-COMMIT entropy, and record the choice.
+                        tag: str = "observer-items", min_per_lang: int = 10):
+    """Draw WHICH trajectories are scored from POST-COMMIT entropy, STRATIFIED BY LANGUAGE.
 
-    This closes the largest hole in the crown path. `run_observer_round` used to accept a
-    trajectory LIST from its caller, which meant the operator chose the exam — the same trust
-    the single-validator subnets have, except invisible, because no record showed it. With the
-    selection derived from `commit_root ‖ round_nonce`:
+    This closes the largest hole in the crown path. `run_observer_round` used to accept a trajectory
+    LIST from its caller, which meant the operator chose the exam — the same trust the
+    single-validator subnets have, except invisible, because no record showed it. With the selection
+    derived from `commit_root ‖ round_nonce`:
 
       * the operator cannot pick favourable items (the nonce comes from a block drawn after the
         commitment window closed);
       * an auditor re-derives the identical selection and re-runs the round;
-      * the chosen indices go in the signed record, so the claim is checkable rather than
-        asserted.
+      * the chosen indices go in the signed record, so the claim is checkable rather than asserted.
 
-    Returns (selected, indices). Indices are into the pool AS PASSED, so the record must also
-    pin the corpus spec that produced the pool — an index is only meaningful against a known,
+    STRATIFICATION IS NOT COSMETIC — a uniform draw silently disarms the anti-clone axis. Scores
+    aggregate worst-slice over (observer x language x depth), and `score_miner` DROPS any slice with
+    fewer than its per-slice floor of samples. On a pool that is 67% English, a uniform draw of 24
+    items yields ~4 Hindi and ~5 Chinese: both under the floor, both dropped, and the crown is
+    decided on English alone. That is precisely where a cloned artifact is strong, so the one axis
+    that separates honest work from `git clone` stops binding — invisibly, with the record still
+    showing a multilingual pool.
+
+    So each language present gets at least `min_per_lang` slots before the remainder is shared out
+    in proportion. Still one RNG seeded from the same post-commit value, so the draw is exactly as
+    unpredictable and exactly as re-derivable as before; `eval/rerun.py` re-runs this same function,
+    so the auditor and the round cannot disagree about what stratification means.
+
+    Returns (selected, indices). Indices are into the pool AS PASSED, so the record must also pin
+    the corpus spec that produced the pool — an index is only meaningful against a known,
     revision-pinned ordering."""
     import random as _r
     total = len(pool)
@@ -172,7 +184,36 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
         return [], []
     k = min(n, total)
     rng = _r.Random(derive_seed(commit_root, round_nonce, tag))
-    idx = sorted(rng.sample(range(total), k))
+
+    by_lang: dict = {}
+    for i, t in enumerate(pool):
+        lang = (getattr(t, "meta", None) or {}).get("lang") or _lang_of(t.source)
+        by_lang.setdefault(lang, []).append(i)
+
+    if len(by_lang) < 2:
+        idx = sorted(rng.sample(range(total), k))
+        return [pool[i] for i in idx], idx
+
+    langs = sorted(by_lang)
+    # floor first, capped by what the pool actually holds and by the total budget
+    alloc = {}
+    for lang in langs:
+        alloc[lang] = min(min_per_lang, len(by_lang[lang]), max(1, k // len(langs)))
+    # then share the remainder in proportion to availability, never exceeding a stratum's size
+    remaining = k - sum(alloc.values())
+    while remaining > 0:
+        room = [l for l in langs if alloc[l] < len(by_lang[l])]
+        if not room:
+            break
+        weights = [len(by_lang[l]) for l in room]
+        pick = rng.choices(room, weights=weights, k=1)[0]
+        alloc[pick] += 1
+        remaining -= 1
+
+    idx: list = []
+    for lang in langs:
+        idx.extend(rng.sample(by_lang[lang], alloc[lang]))
+    idx = sorted(idx)
     return [pool[i] for i in idx], idx
 
 

@@ -2917,6 +2917,104 @@ def test_identity_canary_catches_a_nondeterministic_box():
         assert not out.weights, "crowned on a box that cannot reproduce the identity"
 
 
+def test_pool_is_language_balanced_or_the_round_refuses():
+    """The anti-clone axis has to actually be in the pool.
+
+    Pinning Qwen3-8B pins the same parent PrismML compress, so the cheapest attack is concrete:
+    download their Bonsai-8B, submit it, and it passes every gate — same architecture, genuinely
+    ~1.71 bpw measured from the bytes, shipped as GGUF which intake accepts. No gate can catch that,
+    because it IS a real low-bit compression of the real parent.
+
+    What separates it from honest work is where it is weak. A cloned artifact arrives already broken
+    on non-Latin text (measured elsewhere: Persian 79.8% -> 45.2% at 1-bit while English held
+    97-100%), and worst-slice aggregation over (observer x language x depth) is what turns that into
+    a losing score. But every harness built its pool from glaive_r1 alone — English — so the language
+    slice existed with exactly one value in it and the aggregation was a no-op."""
+    from eval.pool import DEFAULT_MIX, build_pool, check_balance, language_balance
+    from eval.observer_round import _lang_of
+    from eval.steps import Trajectory
+
+    # the source->language table and the scorer's own derivation must not disagree, or the pool
+    # thinks it is balanced while the crown is scored on different slices
+    from eval.pool import LANG_OF_SOURCE
+    for src, lang in LANG_OF_SOURCE.items():
+        assert _lang_of(src) == lang, f"{src}: pool says {lang}, scorer says {_lang_of(src)}"
+
+    def fake_loader(name, want, max_steps):
+        return [Trajectory(id=f"{name}-{i}", source=name, prefix=f"{name} prefix {i}",
+                           step="s", index=i % 4) for i in range(want)]
+
+    pool, spec = build_pool(240, loader=fake_loader)
+    bal = language_balance(pool)
+    assert set(bal) == {"en", "hi", "zh"}, bal
+    # non-Latin is a third of the pool, not a garnish — worst-slice means the smallest LIVE slice
+    # decides the crown, and a token presence would be dropped by the per-slice floor
+    non_latin = bal["hi"] + bal["zh"]
+    assert non_latin / len(pool) > 0.30, f"non-Latin share {non_latin/len(pool):.2f} too thin"
+    ok, reasons = check_balance(pool)
+    assert ok, reasons
+
+    # the corpus spec records the mix, the revision and the realised balance — an index into a pool
+    # is meaningless without the ordering that produced it
+    cs = spec.as_corpus_spec()
+    for token in ("samvaad_hi", "zh_reasoning", "rev=main", "langs=", "n=240"):
+        assert token in cs, cs
+
+    # ---- the two failures this must refuse ----
+    english_only = [t for t in pool if _lang_of(t.source) == "en"]
+    ok2, why2 = check_balance(english_only)
+    assert not ok2 and any("single-language" in r for r in why2), why2
+
+    # a language present but too thin to survive the scorer's per-slice floor is worse than absent,
+    # because the pool looks balanced and the slice is silently dropped
+    thin = english_only + [t for t in pool if _lang_of(t.source) == "hi"][:3]
+    ok3, why3 = check_balance(thin)
+    assert not ok3 and any("below the" in r for r in why3), why3
+
+    # ---- and it must actually produce multiple slices in a real round ----
+    from eval.observer_round import build_shared
+    d3 = lambda x, y, z: {"a": x, "b": y, "c": z}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            return [d3(0.8, 0.1, 0.1)] * 6 if prefix.rstrip().endswith("X") \
+                else [d3(0.34, 0.33, 0.33)] * 6
+
+    class Step:
+        def generate(self, prompts, max_new_tokens=256):
+            return ["X"] * len(prompts)
+
+    # THE DRAW, not a prefix. build_pool concatenates by source, so any prefix of the pool is
+    # single-language — the round never takes a prefix, it takes a nonce-derived sample.
+    from eval.observer_round import select_trajectories
+    drawn, idx = select_trajectories(pool, "root", "nonce-A", 24)
+    shared = build_shared(drawn, Step(), Obs(), "obs")
+    slices = {s.slice_key for s in shared if s.usable}
+    langs_in_play = {k.split("lang=")[1].split("|")[0] for k in slices}
+    assert langs_in_play == {"en", "hi", "zh"}, langs_in_play
+
+    # AND every language must clear the scorer's per-slice floor, or it is dropped and the axis
+    # stops binding. A uniform draw of 24 from a 67%-English pool gives ~4 Hindi and ~5 Chinese —
+    # both under the floor, both silently discarded, crown decided on English alone. That is
+    # exactly where a cloned artifact is strong.
+    import inspect
+    from eval.observer_kl import score_miner
+    floor = inspect.signature(score_miner).parameters["min_per_slice"].default
+    drawn_bal = language_balance(drawn)
+    assert all(v >= floor for v in drawn_bal.values()), (drawn_bal, floor)
+
+    # stratification must not cost the properties the nonce draw exists for
+    a, _ = select_trajectories(pool, "root", "nonce-A", 24)
+    b, _ = select_trajectories(pool, "root", "nonce-A", 24)
+    c, _ = select_trajectories(pool, "root", "nonce-B", 24)
+    assert [t.id for t in a] == [t.id for t in b], "draw is not reproducible"
+    assert [t.id for t in a] != [t.id for t in c], "draw does not move with the nonce"
+    assert idx == sorted(idx) and len(idx) == len(set(idx))
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -2941,6 +3039,7 @@ def main() -> int:
              test_rerun_audits_and_catches_a_rigged_record,
              test_publisher_is_fail_closed,
              test_identity_canary_catches_a_nondeterministic_box,
+             test_pool_is_language_balanced_or_the_round_refuses,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
