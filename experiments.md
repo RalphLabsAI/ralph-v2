@@ -90,14 +90,27 @@ language list.
 
 ## Where it isn't ready
 
-Nothing has been published to a real sink and no anchor has been committed by a real chain — both
-work end to end against a local directory and a fake chain, nothing more. No miner has submitted.
-The parent is Qwen, not GLM; scaling it is a config line, but it has not been run.
+**A round record has now been published to a real sink** — HuggingFace, read back, verified and
+anchored, with the trail confirmed against the chain head. It is private until launch.
+
+What has still not happened:
+
+- **No anchor has been committed by a real chain.** The hash chain that makes one commitment slot
+  cover the whole history is computed and verified, but only against a fake chain so far.
+- **No miner has submitted.** The path is wired end to end now — including the fetcher, which was
+  the piece that made a submission impossible to score at all — but no third party has used it.
+- **Weights have never been set by this validator.** It runs read-only by default, and will keep
+  doing so until there is something worth crowning; a second signer on a live hotkey fights the
+  first.
+- **Non-Latin coverage is Hindi and Chinese.** That is where the anti-clone axis binds today. The
+  published evidence for low-bit collapse is Persian and Cyrillic, so the pool does not yet test
+  where the proof is.
+- **The saturation limitation above is unchanged.** Nothing measured since has moved it.
 
 ## To poke at it
 
 ```bash
-python -m tests.test_crown_path        # 47/47, CPU
+python -m tests.test_crown_path        # 50/50, CPU
 python -m eval.simulate_submission     # miner -> validator -> auditor, seconds
 ```
 
