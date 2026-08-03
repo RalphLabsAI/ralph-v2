@@ -59,6 +59,35 @@ itself** while the noise probe reported clean. It now runs every round and abort
 crowning, and the GPU, batch size and attention implementation are pinned so a re-run on other
 hardware reads as hardware rather than fraud.
 
+## The pinned parent, on production hardware
+
+Everything above was measured on a 0.5B. The parent is now `Qwen/Qwen3-8B`, and an 8B is a
+different memory and kernel regime, so the identity check had to be re-run against it before any
+crown could mean anything.
+
+| | |
+|---|---|
+| Parent | `Qwen/Qwen3-8B` — 8,190,735,360 weight params, 16.4 GB bf16 |
+| Observer | `HuggingFaceTB/SmolLM2-1.7B-Instruct` — deliberately not Qwen |
+| Box | H100 PCIe, torch 2.11+cu128 |
+| Items | 72, drawn from a language-balanced pool of 300 real trajectories |
+| **Identity** | **1.000000** — exact, shortfall 0.0, all 72 samples scored |
+| Generation | deterministic across three identical calls (`575ee1fe4b3f5548` ×3) |
+
+This is the same H100 PCIe model that returned **0.8754** before the attention implementation was
+pinned, so the fix holds at 8B as well as at 0.5B.
+
+The observer is from a different family on purpose. The metric asks whether a submission moved an
+*independent* model to where the parent moved it; an observer sharing the parent's tokenizer and
+training mixture shares its blind spots, and would under-detect exactly the failures that family
+has — silently, since the scores would still look reasonable.
+
+One thing the real corpus showed that synthetic pools did not: the draw produced **five** scoring
+slices, not six. The Chinese source yielded no deep-step trajectories, so `zh|deep` does not exist.
+The stratifier allocates across the slices that are actually present (all ≥11, clear of the floor
+of 8) rather than the ones arithmetic predicts — slice count is a property of the data, not of the
+language list.
+
 ## Where it isn't ready
 
 Nothing has been published to a real sink and no anchor has been committed by a real chain — both
