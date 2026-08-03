@@ -3086,6 +3086,99 @@ def test_density_and_model_card_are_derived_not_asserted():
     assert "python -m eval.rerun" in card, "the card must tell you how to check it"
 
 
+def test_fetch_refuses_hostile_artifacts_before_downloading():
+    """fetch_dir_for is the ONLY place untrusted input enters the validator.
+
+    A miner controls the URI, the repo behind it, the file names, the count and the total size.
+    None of it has been checked upstream: the on-chain commitment binds the CONTENT HASH, and a
+    hash cannot be verified until after the bytes are already on the disk of a box that also holds
+    a signing key. So the limits have to bind BEFORE the download, which is what plan() is for."""
+    import json, os, struct, tempfile
+    from pathlib import Path
+    from eval.fetch import (ALLOWED_SUFFIXES, FetchRefused, MAX_FILES, MAX_TOTAL_BYTES,
+                            fetch, parse_uri, plan, resolver)
+
+    def refuses(uri, files=None, why=""):
+        lister = (lambda r, v: files) if files is not None else None
+        try:
+            plan(uri, lister=lister)
+        except FetchRefused as e:
+            assert why in str(e), f"refused for the wrong reason: {e}"
+            return
+        raise AssertionError(f"should have refused: {uri} {files}")
+
+    ok = [("model.safetensors", 1000), ("config.json", 40)]
+
+    # scheme allowlist — file:// would read the validator's own disk
+    refuses("file:///etc/passwd", ok, "scheme not allowed")
+    refuses("ftp://x/y", ok, "scheme not allowed")
+    refuses("https://evil.example/repo", ok, "not allowlisted")
+    refuses("", ok, "no artifact URI")
+    assert parse_uri("hf://org/model@abc123") == ("hf", "org/model", "abc123")
+    assert parse_uri("hf://org/model")[2] == "main", "missing revision must default, not crash"
+
+    # path escape is REFUSED, not sanitised — sanitising invites a bypass
+    refuses("hf://a/b", [("../../etc/cron.d/x.json", 10)], "path escape")
+    refuses("hf://a/b", [("/abs/path.json", 10)], "path escape")
+    refuses("hf://a/b", [("we!rd;name.json", 10)], "unsafe characters")
+    refuses("hf://a/b", [(("x" * 200) + ".json", 10)], "longer than")
+
+    # size ceiling from advertised metadata
+    refuses("hf://a/b", [("model.safetensors", MAX_TOTAL_BYTES + 1)], "exceeds the")
+    refuses("hf://a/b", [(f"m{i}.safetensors", 1) for i in range(MAX_FILES + 1)], "exceeds the")
+    refuses("hf://a/b", [("README.md", 10)], "no weight files")
+
+    # non-weight files are skipped quietly — repos legitimately carry READMEs and .gitattributes
+    kept = plan("hf://a/b", lister=lambda r, v: ok + [("README.md", 5), (".gitattributes", 1)])
+    assert [n for n, _ in kept] == ["model.safetensors", "config.json"], kept
+
+    # ---- the advertised size is a HINT, not a promise ----
+    with tempfile.TemporaryDirectory() as dd:
+        def liar(repo, rev):
+            return [("model.safetensors", 10)]          # claims 10 bytes
+
+        def floods(repo, rev, name, out):               # actually writes far more
+            with open(out, "wb") as f:
+                f.write(b"\0" * (4 * 1024 * 1024))
+
+        try:
+            # small ceiling, real behaviour: the guard is injectable precisely so it can be
+            # exercised without writing 60 GB to prove a 60 GB limit
+            fetch("hf://a/b", dd, lister=liar, downloader=floods, max_bytes=1024 * 1024)
+            raise AssertionError("a repo that lied about its size was accepted")
+        except FetchRefused as e:
+            assert "stream exceeded" in str(e) or "ceiling" in str(e), e
+        assert not os.listdir(dd) or all(not os.listdir(os.path.join(dd, d))
+                                         for d in os.listdir(dd)), "partial download left on disk"
+
+    # ---- hash mismatch is caught AT THE DOOR, not only at intake ----
+    with tempfile.TemporaryDirectory() as dd:
+        hb = json.dumps({"w": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}).encode()
+
+        def good(repo, rev):
+            return [("model.safetensors", 100), ("config.json", 20)]
+
+        def writes(repo, rev, name, out):
+            if name.endswith(".safetensors"):
+                Path(out).write_bytes(struct.pack("<Q", len(hb)) + hb + b"\0" * 16)
+            else:
+                Path(out).write_text('{"hidden_size":8}')
+
+        r = fetch("hf://a/b", dd, lister=good, downloader=writes)
+        assert r.files == 2 and len(r.content_hash) == 64
+        try:
+            fetch("hf://a/b", dd, expect_hash="f" * 64, lister=good, downloader=writes)
+            raise AssertionError("bytes that do not match the commitment were accepted")
+        except FetchRefused as e:
+            assert "does not match the revealed" in str(e), e
+
+        # a refusal must skip ONE miner, not take the round down
+        log = []
+        res = resolver(dd, reveals={"hot1": {"content_hash": "f" * 64}}, log=log)
+        assert res("hot1", "file:///etc/passwd") == "", "refusal must return empty, not raise"
+        assert log and log[-1][1] == "refused"
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -3112,6 +3205,7 @@ def main() -> int:
              test_identity_canary_catches_a_nondeterministic_box,
              test_pool_is_language_balanced_or_the_round_refuses,
              test_density_and_model_card_are_derived_not_asserted,
+             test_fetch_refuses_hostile_artifacts_before_downloading,
              test_saturation_guard_retires_flat_axes]
     failed = 0
     for t in tests:
