@@ -118,6 +118,15 @@ def load_record(path: str):
         return record_from_blob(fh.read())
 
 
+def _obs_key(name: str) -> str:
+    """`HuggingFaceTB/SmolLM2-1.7B-Instruct` and `SmolLM2-1.7B-Instruct` are the same observer.
+
+    The round's registry may be keyed either way; an auditor must name the full repo id to download
+    it. Comparing the raw strings made the check fail for every third party and pass only for the
+    operator whose registry produced the manifest."""
+    return (name or "").strip().split("/")[-1].lower()
+
+
 # ---------------------------------------------------------------- L0: arithmetic
 
 def audit_arithmetic(rec, a: Audit) -> None:
@@ -247,25 +256,118 @@ def audit_arithmetic(rec, a: Audit) -> None:
            and s.retention_lb <= MIN_CROWN_LB]
     a.ok("L0", "crowns above MIN_CROWN_LB", not bad, fail=f"below floor: {bad}")
 
-    # WEIGHTS. Emission is the only thing that actually moves value, so the record's weights must
-    # follow from the record's own crown decisions rather than being asserted alongside them.
-    kings = {}
+    audit_emission(rec, a)
+
+
+def audit_emission(rec, a: Audit) -> None:
+    """WEIGHTS. Emission is the only thing that actually moves value, and it was barely checked.
+
+    THE HOLE THIS CLOSES, because it is the one that mattered most. The old version keyed the king
+    map off crown/dethrone events only, then guarded the whole block with `if rec.weights and
+    kings:` — so in a HOLD round, which is the steady state of a working subnet, `kings` was empty
+    and the entire check degraded to a non-required SKIP. The operator could name any hotkey in
+    `weights`, in any amount, and every level of the audit passed: L1, L2 and L3 never look at
+    `weights` or `events` at all, so running the expensive levels added nothing. Verified against
+    the real code with three signed synthetic records — a hold round paying an arbitrary hotkey, a
+    crown naming a model that was never submitted, and a round with no events and arbitrary
+    weights — all three reported zero failures and zero required skips.
+
+    That is worse than an unchecked field. Auditors that copy `weights` after an ACCEPT would have
+    been signing verdicts attesting to a number nobody verified.
+
+    So this runs UNCONDITIONALLY and every part of it is required. The king map is rebuilt from
+    every event that names a king (a hold event carries the reigning king's model_id, which is what
+    made the carried-over case recoverable at all), the kings are bound to miners through the
+    record's own submissions rather than through a field the operator writes beside them, and the
+    weight vector must name exactly that set — in both directions, so dropping a legitimate king is
+    caught as well as inventing one."""
+    from .koth import MIN_CROWN_LB
+
+    # 1. WHO IS KING. Every event carries `king` (Tournament.consider seeds it with the reigning
+    #    king's model_id before it decides anything), so holds carry the incumbent forward and only
+    #    `vacate` removes a throne.
+    kings: dict = {}
     for e in rec.events:
-        if e.get("action") in ("crown", "dethrone") and e.get("miner"):
-            kings[e["tier"]] = e["miner"]
-        elif e.get("action") == "vacate":
-            kings.pop(e.get("tier"), None)
-    if rec.weights and kings:
-        claimed_miners = {m for m, w in rec.weights.items() if w > 0}
-        a.ok("L0", "weights follow the crowns", claimed_miners <= set(kings.values()),
-             fail=f"weighted {sorted(claimed_miners)} but the kings are "
-                  f"{sorted(set(kings.values()))}")
-        tot = sum(rec.weights.values())
-        a.ok("L0", "weights normalised", abs(tot - 1.0) <= 1e-6 or tot == 0.0,
-             fail=f"sum={tot:.6f}, not 1.0")
+        tier = e.get("tier")
+        if e.get("action") == "vacate":
+            kings.pop(tier, None)
+        elif e.get("king"):
+            kings[tier] = e["king"]
+
+    # 2. BIND MODEL -> MINER THROUGH THE SCORED SUBMISSIONS, not through the event's own `miner`
+    #    field. The event is written by the operator next to the weights; using it to validate the
+    #    weights is circular. A submission is bound to bytes by content hash and to a hotkey by
+    #    commit-reveal, so it is the thing an auditor can actually stand on.
+    by_model: dict = {}
+    for s in rec.submissions:
+        by_model.setdefault(s.model_id, s)
+    king_miner, unbound = {}, []
+    for tier, mid in kings.items():
+        s = by_model.get(mid)
+        if s is None:
+            unbound.append(f"{tier}:{str(mid)[:12]}…")
+        else:
+            king_miner[tier] = s.miner
+
+    # 3. A CROWN MUST BE A SCORED CHALLENGER, AND THE BEST ONE. koth.Tournament.consider picks
+    #    `max(valid, key=retention)` over challengers that cleared the gates and the floor, so the
+    #    winner is recomputable from the record — and an operator crowning a model that never
+    #    competed, or the second-best one, is now a failure rather than an assertion.
+    crowned = [e for e in rec.events if e.get("action") in ("crown", "dethrone")]
+    for e in crowned:
+        tier, mid = e.get("tier"), e.get("king")
+        s = by_model.get(mid)
+        tag = f"{str(mid)[:12]}…"
+        if s is None or s.role != "challenger":
+            a.ok("L0", f"crowned model was scored this round {tag}", False,
+                 fail=f"tier {tier} crowned {tag} but no challenger with that model_id appears in "
+                      f"the record — the crown names bytes nobody scored")
+            continue
+        field_ok = e.get("miner") in (None, s.miner)
+        a.ok("L0", f"crown event agrees with the submission {tag}", field_ok,
+             fail=f"event credits {str(e.get('miner'))[:12]}… but the scored submission belongs "
+                  f"to {str(s.miner)[:12]}… — emission would go to the wrong hotkey")
+        rivals = [x for x in rec.submissions
+                  if x.role == "challenger" and x.tier == tier
+                  and x.gates_ok and x.retention_lb > MIN_CROWN_LB]
+        if rivals:
+            best = max(rivals, key=lambda x: x.retention)
+            a.ok("L0", f"crown went to the best valid challenger {tag}",
+                 abs(best.retention - s.retention) <= 1e-9,
+                 fail=f"tier {tier} crowned {tag} at {s.retention:.4f} but "
+                      f"{best.model_id[:12]}… scored {best.retention:.4f} — the crown is not the "
+                      f"argmax the tournament claims to compute",
+                 info=f"{s.retention:.4f}, best of {len(rivals)} valid challengers")
+    for e in (x for x in rec.events if x.get("action") == "dethrone"):
+        inc = [s for s in rec.submissions if s.role == "incumbent" and s.tier == e.get("tier")]
+        a.ok("L0", f"dethrone names the re-scored incumbent {str(e.get('king'))[:12]}…",
+             bool(inc) and e.get("beaten") == inc[0].model_id,
+             fail=f"claims to have beaten {str(e.get('beaten'))[:12]}… but the record's incumbent "
+                  f"for tier {e.get('tier')} is "
+                  f"{(inc[0].model_id[:12] + '…') if inc else '(absent)'}")
+
+    # 4. THE VECTOR ITSELF. Unconditional and required — this is the number that moves TAO.
+    tot = sum(rec.weights.values()) if rec.weights else 0.0
+    a.ok("L0", "weights normalised", abs(tot - 1.0) <= 1e-6 or tot == 0.0,
+         fail=f"sum={tot:.6f}, which is neither 1.0 nor 0.0",
+         info=f"sum={tot:.6f} over {len(rec.weights or {})} miner(s)")
+    a.ok("L0", "weights are non-negative", all(w >= 0 for w in (rec.weights or {}).values()),
+         fail="a negative weight is not representable on chain and means the vector was not "
+              "produced by Tournament.weights()")
+    if unbound:
+        # An absence of evidence, reported as one. A tier whose king was not re-scored this round
+        # (koth's "king unavailable" hold) leaves the operator's own weights unverifiable from this
+        # record alone — it would take walking the anchor chain back to the crowning round.
+        a.add("L0", "every king is bound to a miner by the record", SKIP,
+              f"kings with no scored submission here: {unbound} — their share of emission cannot "
+              f"be checked against this record alone", required=True)
     else:
-        a.add("L0", "weights follow the crowns", SKIP, "no weights or no crowns this round",
-              required=False)
+        want = set(king_miner.values())
+        got = {m for m, w in (rec.weights or {}).items() if w > 0}
+        a.ok("L0", "weights name exactly the kings", got == want,
+             fail=f"weighted {sorted(got)} but the record's own kings are {sorted(want)} "
+                  f"(extra: {sorted(got - want)}, missing: {sorted(want - got)})",
+             info=f"{len(want)} king(s) across {len(kings)} tier(s)")
 
 
 # ---------------------------------------------------------------- L1: selection
@@ -392,6 +494,7 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: 
     # 0.051 on H100 / A100 / L40S, with the generated step text moving every time. An auditor at a
     # different batch_size gets a materially different number through no fault of the record.
     rec_bs = vers.get("batch_size")
+    bs_match = True
     if rec_bs is not None:
         try:
             from .runners import HFRunner
@@ -400,27 +503,49 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: 
         except Exception:
             my_bs = None
         if my_bs is not None:
-            a.ok("L2", "same batch size as the round", int(rec_bs) == int(my_bs),
-                 fail=f"round scored at batch_size={rec_bs}, this audit uses {my_bs} — expect a "
-                      f"difference of up to ~0.18 retention that is BATCHING, not fraud",
-                 info=f"batch_size={rec_bs}")
+            bs_match = int(rec_bs) == int(my_bs)
+            a.add("L2", "same batch size as the round", PASS if bs_match else SKIP,
+                  f"batch_size={rec_bs}" if bs_match else
+                  f"round scored at batch_size={rec_bs}, this audit uses {my_bs} — measured spread "
+                  f"up to ~0.18 retention. The numbers below cannot be compared.")
     else:
         a.add("L2", "same batch size as the round", SKIP,
               "record does not pin batch_size", required=False)
 
-    if rec_gpu and my_gpu:
-        a.ok("L2", "same GPU as the round", rec_gpu == my_gpu,
-             fail=f"round ran on {rec_gpu}, this audit is on {my_gpu} — expect score differences "
-                  f"of ~0.03 retention that are HARDWARE, not fraud. Re-run on matching hardware "
-                  f"before treating a divergence here as evidence.",
-             info=f"{my_gpu}")
-    elif not rec_gpu:
+    # HARDWARE MISMATCH IS NOT EVIDENCE OF ANYTHING, so it must not be reported as a failure.
+    #
+    # This check used to be a FAIL whose own message said "expect differences that are HARDWARE,
+    # not fraud" — i.e. it told the reader the result was inadmissible and then recorded it as a
+    # divergence anyway. For a lone human running `eval.rerun` that is merely confusing. For the
+    # auditor daemon it is much worse: any FAIL becomes a REJECT, so an honest third party on an
+    # A100 would publish a signed verdict accusing an honest operator on an H100, and hold its
+    # weights against them. The README recommends running L2 on "a laptop", which is precisely the
+    # configuration that would have fired.
+    #
+    # The correct verdict on non-matching hardware is INCOMPLETE — the check did not run — so the
+    # mismatch is a REQUIRED SKIP and the numeric comparison below is skipped with it.
+    hw_match = bool(rec_gpu) and bool(my_gpu) and rec_gpu == my_gpu
+    if not rec_gpu:
         a.add("L2", "same GPU as the round", SKIP,
               "record does not pin the GPU, so a divergence cannot be attributed", required=False)
+    elif hw_match:
+        a.add("L2", "same GPU as the round", PASS, my_gpu)
+    else:
+        a.add("L2", "same GPU as the round", SKIP,
+              f"round ran on {rec_gpu}, this audit is on {my_gpu or 'CPU'} — measured cross-box "
+              f"spread is ~0.03 retention on a genuine compression and ~0.17 on a control, well "
+              f"above reproduction_tolerance. Re-run on matching hardware; a difference here is "
+              f"NOT evidence of fraud.")
+    comparable = (rec_gpu == "" or hw_match) and bs_match
 
     want = (rec.manifest or {}).get("observer") or ""
     pool = (rec.manifest or {}).get("observer_pool") or []
-    a.ok("L2", "audited with the round's observer", bool(want) and observer_name == want,
+    # Compare on the bare model name. The round registers its observers by whatever key the
+    # operator built the registry with, and an auditor has to name a full HuggingFace repo id to
+    # download the thing — so a literal string comparison made this check fail for every honest
+    # third party while passing for the operator, which is the wrong way round.
+    same_obs = bool(want) and _obs_key(observer_name) == _obs_key(want)
+    a.ok("L2", "audited with the round's observer", same_obs,
          fail=f"re-running with {observer_name or '(unnamed)'} but the round used "
               f"{want or '(unrecorded)'} — a match here would prove nothing about this round",
          info=f"observer {want}")
@@ -455,6 +580,14 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: 
             n += 1
         if not n:
             a.add("L2", f"recompute effects {tag}", SKIP, "no reconstructable samples")
+            continue
+        if not comparable:
+            # Measured, not assumed: the numbers below are real, they just cannot be attributed.
+            # Reporting them as a divergence would make every honest auditor on other hardware an
+            # accuser, so the observed delta is recorded and the check reads as not-run.
+            a.add("L2", f"recompute effects {tag}", SKIP,
+                  f"worst |Δ| over {n} samples = {worst:.3e}, but this box does not match the "
+                  f"round's (gpu/batch_size) — the difference is not attributable to the record")
             continue
         a.ok("L2", f"recompute effects {tag}", worst <= tol,
              fail=f"worst |Δ| over {n} samples = {worst:.3e} EXCEEDS tol {tol:.2e} — the "

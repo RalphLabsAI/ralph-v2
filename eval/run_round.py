@@ -232,7 +232,10 @@ def run(cfg: Config, round_no: int = 1) -> int:
 
     print(f"  loading parent {spec.name}…")
     parent = HFRunner(spec.name)
-    observers = {o.split("/")[-1]: HFRunner(o) for o in cfg.observers}
+    # KEYED BY FULL REPO ID. The manifest records this key as the round's observer, and an
+    # auditor has to name a downloadable repo to re-derive the grades — a bare model name is
+    # not one. The nonce draw is over sorted(keys) either way.
+    observers = {o: HFRunner(o) for o in cfg.observers}
     print(f"  observers: {list(observers)}")
 
     budgets = build_budgets(cfg)
@@ -240,7 +243,8 @@ def run(cfg: Config, round_no: int = 1) -> int:
              for n in cfg.tiers]
 
     fetch_log: list = []
-    chain = BittensorChainIO(inner=_subtensor(cfg), netuid=cfg.netuid, read_only=not cfg.live)
+    chain = BittensorChainIO(inner=_chain_inner(cfg), netuid=cfg.netuid,
+                             read_only=not cfg.live)
     chain.fetch_dir_for = resolver(os.path.join(cfg.work_dir, "artifacts"),
                                    reveals=chain.reveals, log=fetch_log)
 
@@ -271,9 +275,21 @@ def run(cfg: Config, round_no: int = 1) -> int:
     return 0
 
 
-def _subtensor(cfg: Config):
-    import bittensor as bt
-    return bt.subtensor(network=cfg.network)
+def _chain_inner(cfg: Config):
+    """The v1 `BittensorChain`, which is what `BittensorChainIO.inner` is documented to be.
+
+    THIS USED TO PASS A RAW `bt.subtensor`, and the consequences were silent and total. A Subtensor
+    has no `commit_audit_root`, so the on-chain anchor was never written; `head_anchor()` then fell
+    through to `_head` — the value WE computed this process — so `publish_and_gate` compared the
+    operator's bytes to the operator's memory and reported `anchor_verified=True` with nothing on
+    chain. And `_hotkeys()` reads `inner.metagraph.hotkeys`, but `Subtensor.metagraph` is a method,
+    so it returned `[]` and every round read zero commitments and scored nobody.
+
+    An auditor reading the real commitment slot would find it empty and report TRAIL BROKEN — i.e.
+    the first thing a third party did would be to correctly accuse the subnet of not anchoring."""
+    from karpa.chain_layer.bittensor_chain import BittensorChain  # type: ignore
+    return BittensorChain(network=cfg.network, netuid=cfg.netuid,
+                          wallet_name=cfg.wallet, wallet_hotkey=cfg.hotkey)
 
 
 def _signer(cfg: Config):

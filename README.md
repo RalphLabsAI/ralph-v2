@@ -101,7 +101,7 @@ attributes a record and never validates it.
 ## Run it locally
 
 ```bash
-python -m tests.test_crown_path        # 53/53, CPU, no GPU needed
+python -m tests.test_crown_path        # 55/55, CPU, no GPU needed
 python -m eval.simulate_submission     # miner -> validator -> auditor in seconds
 ```
 
@@ -220,13 +220,29 @@ published trail, re-runs each new round, and writes a **signed verdict**.
 python -m eval.auditor --once  --require L0     --signer <validator record key>   # free, no models
 python -m eval.auditor --follow --require L0,L1 --signer <key> --interval 600     # + the exam
 python -m eval.auditor --follow --require L0,L1,L2 --signer <key> \
-    --observer HuggingFaceTB/SmolLM2-1.7B-Instruct                                # + the grades
-python -m eval.auditor --once --require L0,L1 --signer <key> --set-weights        # act on it
+    --observer HuggingFaceTB/SmolLM2-1.7B-Instruct,google/gemma-2-2b-it           # + the grades
+python -m eval.auditor --follow --signer <key> \
+    --validator-hotkey <ss58> --set-weights                                       # act on it
 ```
 
 L1 needs no corpus file: the record pins the pool's digest inside its signed body, so the auditor
-fetches the pool from the trail and re-digests it. L2 needs a 3.4 GB observer — a laptop, not a
-datacentre.
+fetches the pool from the trail and re-digests it.
+
+**L2 takes the whole observer pool, not one model.** The grader rotates per round out of the nonce,
+so a daemon pinned to a single observer is re-deriving the grades with the wrong one about half the
+time — and since any failure rejects, it would publish a signed accusation each time. Pass the same
+pool the operator declares and it loads whichever one that round drew. A round whose observer is
+not in your pool is a skip, not a fault.
+
+**L2 only compares numbers on matching hardware.** Measured cross-box spread is ~0.03 retention on
+a genuine compression and ~0.17 on a control, far above `reproduction_tolerance` — so on a
+different GPU the effects comparison is reported as *not run*, never as a divergence. Hardware is
+not evidence.
+
+**Two identities, and they are not the same string.** `--signer` is the key the operator signs
+records with; `--validator-hotkey` is the ss58 whose on-chain commitment holds the anchor. Weight
+setting needs both, and preflight refuses to start without them rather than letting a
+misconfigured daemon look identical to a quiet subnet.
 
 **The verdict is the product, not the weight.** Yuma consensus penalises divergence from the
 stake-weighted median, so an auditor who correctly catches the operator cheating and diverges
@@ -252,8 +268,18 @@ direction the operator's own publish gate fails. An auditor that pays the disput
 weight-copier, which manufactures the appearance of independent agreement while adding no safety.
 That is the distinction the whole role turns on, and it is what the tests assert.
 
+With **nothing yet verified**, it burns to uid 0 rather than setting nothing. "Hold" is sound for the
+incumbent operator — its previous weights persist on chain — but a fresh auditor has none to persist,
+and a validator that writes no weights contributes nothing to consensus and eventually crosses
+`activity_cutoff` into inactive while believing it is validating.
+
 Verdicts chain (`prev` = the previous verdict's hash, inside the signed body) so an auditor cannot
 quietly drop the one it later regrets.
+
+**A missing record is not an accusation until it persists.** A deleted record and a 429 from
+HuggingFace are byte-for-byte the same observation; only recurrence distinguishes them. So an
+unfetchable record reads INCOMPLETE for three passes, is re-audited rather than written off, and
+only then escalates to a broken trail.
 
 ## Anti-gaming — economics, not detection
 

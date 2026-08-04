@@ -347,7 +347,7 @@ def main(argv) -> int:
     log(f"    python -m eval.rerun {rec_path} --pool {pool_path} \\")
     log(f"        --observer <the observer named in the manifest> --artifacts <dir of ckpts>")
     log(f"    python -m eval.rerun --history {sink_root} --head {chain.slot[:16]}…")
-    log(f"    python -m eval.auditor --once --require L0,L1 --signer {o.record.signer[:16]}…")
+    log(f"    python -m eval.auditor --once --require L0,L1 --signer {o.record.signer}")
     return 0 if code == 0 else 0
 
 

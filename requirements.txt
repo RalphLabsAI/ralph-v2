@@ -1,10 +1,20 @@
 # Crown-path test suite (python -m tests.test_crown_path) — the only hard dependency:
 pynacl                 # ed25519 signing of round records (eval/signing.py)
 
-# Real model runs (eval.run_capability_axis / eval.shadow_axis_epoch, GPU) additionally need:
+# AUDITOR (python -m eval.auditor, CPU, no models at L0/L1). huggingface_hub is a REAL
+# requirement here, not an optional extra: the auditor's first action fetches index.json through
+# HFReadSink, whose import sits outside the try, so without it `--once` dies with a traceback and
+# `--follow` spins forever printing the same ImportError.
+huggingface_hub        # fetch the published trail (eval/publish.py)
+
+# ...and to VOTE (--set-weights) an auditor additionally needs a Bittensor wallet plus the v1
+# chain layer that carries set_weights / set_burn_weights:
+#   bittensor
+#   karpa               # github.com/RalphLabsAI/ralph — not on PyPI, install alongside
+
+# Real model runs (the validator, and auditors at L2/L3, GPU) additionally need:
 #   torch
 #   transformers
 #   safetensors
-#   huggingface_hub
-#   datasets            # only for the live genre-overfit corpus (eval/corpus_hf.py)
+#   datasets            # only for the live trajectory pool (eval/pool.py, eval/corpus_hf.py)
 # and, for the code-axis grader sandbox in production, the system package `bubblewrap` (bwrap).

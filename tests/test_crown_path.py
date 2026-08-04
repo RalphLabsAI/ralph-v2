@@ -3278,6 +3278,99 @@ def _auditor_fixture(dd):
     return root, chain, sig, idx
 
 
+def test_audit_binds_emission_to_the_crowns():
+    """THE WEIGHT VECTOR IS THE ONLY THING THAT MOVES TAO, and it used to be the least-checked
+    field in the record.
+
+    The old check keyed the king map off crown/dethrone events and then guarded the whole block
+    with `if rec.weights and kings:`. A HOLD round — the steady state of a working subnet — has no
+    crown event, so `kings` was empty, the block degraded to a non-required SKIP, and the operator
+    could pay an arbitrary hotkey with every level of the audit passing. L1, L2 and L3 never look
+    at `weights` or `events`, so running the expensive levels bought nothing either.
+
+    That mattered most for AUDITORS: a validator following the trail and copying `weights` after an
+    ACCEPT would have been signing a verdict attesting to a number nobody checked. So each rig
+    below has to be caught at L0 — free, no corpus, no models — and the honest record has to keep
+    passing."""
+    import json as _json
+    import tempfile
+    from copy import deepcopy
+    from dataclasses import asdict
+    from pathlib import Path
+    from eval.publish import LocalSink
+    from eval.rerun import audit, record_from_blob
+
+    ATTACKER = "5AttackerHotkeyNotInThisRoundAtAll"
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        sink = LocalSink(root)
+        e2 = [r for r in idx["rounds"] if r["round"] == 2][0]
+        base = _json.loads(sink.get(e2["name"]).decode())
+        incumbent = [s for s in base["submissions"] if s["role"] == "incumbent"]
+        challenger = [s for s in base["submissions"] if s["role"] == "challenger"][0]
+        assert incumbent, "fixture must re-score an incumbent, or the hold case cannot be built"
+
+        def rigged(mutate):
+            """Re-signed by the operator's own key, as always: the adversary here holds it."""
+            raw = deepcopy(base)
+            mutate(raw)
+            rec = record_from_blob(_json.dumps(raw).encode())
+            rec.signature = rec.signer = rec.sig_scheme = ""
+            rec.sign(sig)
+            p = Path(dd) / "rigged-weights.json"
+            p.write_text(_json.dumps(asdict(rec)))
+            return audit(str(p))          # L0 ONLY — the cheap level has to be the one that binds
+
+        def names(a):
+            return [c.name for c in a.failed]
+
+        # ---- the honest record still passes, or every assertion below is meaningless
+        hp = Path(dd) / "honest.json"
+        hp.write_text(_json.dumps(base))
+        honest = audit(str(hp))
+        assert not honest.failed, [(c.name, c.detail) for c in honest.failed]
+
+        # ---- 1. HOLD ROUND PAYING A STRANGER. No crown event at all, so the old code checked
+        #         nothing whatsoever. This is the steady state, which is what made it serious.
+        a = rigged(lambda r: (r.update(
+            events=[{"tier": "t", "round": 2, "action": "hold",
+                     "king": incumbent[0]["model_id"]}],
+            weights={ATTACKER: 1.0})))
+        assert any("weights name exactly the kings" in n for n in names(a)), names(a)
+
+        # ---- 2. NO EVENTS AT ALL, arbitrary weights. The `if rec.weights and kings` guard made
+        #         this the quietest possible way to redirect emission.
+        a = rigged(lambda r: r.update(events=[], weights={ATTACKER: 1.0}))
+        assert any("weights name exactly the kings" in n for n in names(a)), names(a)
+
+        # ---- 3. CROWNING BYTES NOBODY SCORED. The crown names a model_id that appears in no
+        #         submission, so there is nothing binding the paid hotkey to anything measured.
+        a = rigged(lambda r: r.update(
+            events=[{"tier": "t", "round": 2, "action": "crown", "king": "de" * 32,
+                     "miner": ATTACKER}],
+            weights={ATTACKER: 1.0}))
+        assert any("crowned model was scored" in n for n in names(a)), names(a)
+
+        # ---- 4. RIGHT MODEL, WRONG PAYEE. The event's `miner` field is written by the operator
+        #         beside the weights, so validating the weights against it would be circular — the
+        #         payee is bound through the SUBMISSION, which commit-reveal ties to a hotkey.
+        a = rigged(lambda r: (
+            [e.update(miner=ATTACKER) for e in r["events"] if e.get("action") == "dethrone"],
+            r.update(weights={ATTACKER: 1.0})))
+        assert any("crown event agrees with the submission" in n for n in names(a)), names(a)
+
+        # ---- 5. DROPPING A LEGITIMATE KING is caught too — the old subset test only looked for
+        #         extra payees, so zeroing a rival's emission passed cleanly.
+        a = rigged(lambda r: r.update(weights={}))
+        assert any("weights" in n for n in names(a)), names(a)
+
+        # ---- 6. AND THE ARITHMETIC: a vector that does not sum to 1 is not a normalised vector,
+        #         which used to be checked only when a crown happened to occur.
+        a = rigged(lambda r: r.update(weights={challenger["miner"]: 0.4}))
+        assert any("weights normalised" in n for n in names(a)), names(a)
+
+
 def test_auditor_verifies_then_diverges():
     """THE POINT OF AN AUDITOR. "Other validators set weights aligned with the owner validator" is
     one word away from weight-copying with extra steps: a copier sets identical weights whether the
@@ -3293,7 +3386,7 @@ def test_auditor_verifies_then_diverges():
     import tempfile
     from dataclasses import asdict
     from pathlib import Path
-    from eval.auditor import ACCEPT, REJECT, Auditor, AuditorConfig
+    from eval.auditor import ACCEPT, INCOMPLETE, REJECT, Auditor, AuditorConfig
     from eval.publish import INDEX, LocalSink, anchor_of, record_name
     from eval.rerun import record_from_blob
     from eval.signing import Ed25519Signer
@@ -3360,14 +3453,27 @@ def test_auditor_verifies_then_diverges():
         assert vs[1].weights == round1_weights, (vs[1].weights, round1_weights)
         assert vs[1].weights != round2_weights, "an auditor that pays the disputed crown is a copier"
 
-        # ---- 3. A BROKEN TRAIL REJECTS EVEN A ROUND THAT REPRODUCES. Deleting a published record
-        #         is the cheapest tamper there is, and per-record checks cannot see it: there is no
-        #         record left to check.
+        # ---- 3. A MISSING RECORD IS NOT AN ACCUSATION UNTIL IT PERSISTS. Deleting a published
+        #         record is the cheapest tamper there is and per-record checks cannot see it —
+        #         there is no record left to check. But a 429 from HuggingFace is byte-for-byte the
+        #         same observation, and an auditor that signs a public accusation over a timeout is
+        #         one nobody listens to. The distinguishing signal is that it keeps happening.
         Path(root, [r for r in idx["rounds"] if r["round"] == 1][0]["name"]).unlink()
         c = make("audit-gap")
         vs = c.once()
-        assert all(v.verdict == REJECT for v in vs), [(v.round, v.verdict, v.trail) for v in vs]
-        assert vs[-1].trail == "TRAIL BROKEN", vs[-1].trail
+        assert vs[0].verdict == INCOMPLETE and vs[0].retry, (vs[0].verdict, vs[0].retry)
+        assert vs[0].trail == "INCOMPLETE", vs[0].trail
+        # and it must NOT be written off: the watermark stops at the provisional round, so the
+        # next pass re-audits it rather than stepping over it forever
+        assert c.state["last_round"] < 1, c.state["last_round"]
+
+        for _ in range(c.cfg.unfetchable_passes):
+            vs = c.once()
+        assert vs[0].trail == "TRAIL BROKEN", vs[0].trail
+        assert any("stays gone" in b.get("why", "") for b in vs[0].trail_detail.get("broken", [])), \
+            vs[0].trail_detail
+        # once the trail IS broken, even a round whose own record reproduces is rejected
+        assert all(v.verdict == REJECT for v in vs), [(v.round, v.verdict) for v in vs]
 
 
 def test_auditor_verdict_states_what_it_did_not_check():
@@ -3424,6 +3530,63 @@ def test_auditor_verdict_states_what_it_did_not_check():
         vs = run("wrongkey", expected_signer=Ed25519Signer(seed=b"q" * 32).public_id(),
                  require=("L0",), pool_from_trail=False)
         assert all(v.verdict == REJECT for v in vs), [(v.round, v.verdict) for v in vs]
+
+
+def test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent():
+    """Two ways an auditor validator quietly stops being one.
+
+    ONE EXTRINSIC PER ROUND. Weight-setting used to sit inside the per-round commit, so a cold
+    start — where `todo` is the entire published history — fired one set_weights per historical
+    round in a tight loop. `weights_rate_limit` rejects everything after the first, and the daemon
+    discarded the False return because state had already been written. An auditor starting at round
+    80 would land round 1's weights and keep them, and two auditors starting on different days
+    would hold different vectors from identical honest input.
+
+    AND NEVER SETTING ANYTHING AT ALL. "Hold" is sound advice for the incumbent operator — its
+    previous weights persist on chain — but a third-party auditor that has never set any has
+    nothing to persist. Silence there is not conservatism, it is an absent validator: no
+    contribution to consensus, no dividends, and eventually `activity_cutoff`."""
+    import io
+    import tempfile
+    from pathlib import Path
+    from eval.auditor import ACCEPT, Auditor, AuditorConfig
+    from eval.publish import LocalSink
+    from eval.signing import Ed25519Signer
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        wrote, burned = [], []
+
+        def build(work, **kw):
+            cfg = AuditorConfig(expected_signer=kw.pop("signer", sig.public_id()),
+                                require=kw.pop("require", ("L0",)), pool_from_trail=False,
+                                set_weights=True, work_dir=str(Path(dd) / work), **kw)
+            return Auditor(cfg, sink=LocalSink(root), signer=Ed25519Signer(seed=b"a" * 32),
+                           head_anchor_fn=lambda: chain.head_anchor(),
+                           set_weights_fn=lambda w: (wrote.append(dict(w)), True)[1],
+                           set_burn_fn=lambda: (burned.append(1), True)[1],
+                           out=io.StringIO())
+
+        # ---- a two-round backlog is ONE write, from the newest verified round, not two
+        a = build("once-per-pass")
+        vs = a.once()
+        assert len(vs) == 2 and all(v.verdict == ACCEPT for v in vs)
+        assert len(wrote) == 1, f"{len(wrote)} extrinsics for a 2-round backlog"
+        assert wrote[0] == vs[1].weights, (wrote[0], vs[1].weights)
+        assert not burned
+
+        # ...and a pass with nothing new still writes, or the validator drifts into inactive
+        wrote.clear()
+        a.once()
+        assert len(wrote) == 1 and not burned, (wrote, burned)
+
+        # ---- nothing verified yet -> BURN, not silence. Pinning a signer nobody signed with
+        #      makes every round REJECT, which is the cold-start-into-a-bad-round case.
+        b = build("cold-reject", signer=Ed25519Signer(seed=b"q" * 32).public_id())
+        wrote.clear()
+        b.once()
+        assert not wrote, "must not pay a crown it rejected"
+        assert len(burned) == 1, f"expected exactly one burn, got {len(burned)}"
 
 
 def test_auditor_treats_silence_as_a_finding():
@@ -3493,8 +3656,10 @@ def main() -> int:
              test_density_and_model_card_are_derived_not_asserted,
              test_fetch_refuses_hostile_artifacts_before_downloading,
              test_saturation_guard_retires_flat_axes,
+             test_audit_binds_emission_to_the_crowns,
              test_auditor_verifies_then_diverges,
              test_auditor_verdict_states_what_it_did_not_check,
+             test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent,
              test_auditor_treats_silence_as_a_finding]
     failed = 0
     for t in tests:

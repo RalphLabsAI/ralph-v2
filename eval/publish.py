@@ -594,13 +594,16 @@ def verify_history(publisher: RecordPublisher, anchors=None, first_round: int | 
         blob = publisher.sink.get(r["name"])
         if blob is None:
             rep.broken.append({"round": r["round"], "why": "not fetchable"})
-            continue
-        if not publisher._roundtrip_ok(blob, r["sha256"], expect_round=r["round"],
-                                       expect_signature=r.get("signature", "")):
+        elif not publisher._roundtrip_ok(blob, r["sha256"], expect_round=r["round"],
+                                         expect_signature=r.get("signature", "")):
             rep.broken.append({"round": r["round"],
                                "why": "digest, round number or signature mismatch"})
-            continue
-        # walk the hash chain: a deletion or reorder anywhere changes every anchor after it
+        # WALK THE CHAIN EVEN FOR A ROUND WE COULD NOT READ. The chain is computed over the
+        # RECORDED digests, so one unreadable blob does not make the history inconsistent — but
+        # `continue`ing here left `run` un-advanced, and every subsequent round then reported a
+        # chain break. That turned a single 429 into "the operator rewrote history", which is the
+        # difference between an auditor worth listening to and one that cries wolf. The unreadable
+        # round is already reported in `broken`; the chain question is separate and still answerable.
         if not r.get("anchor"):
             rep.unanchored.append(r["round"])
         else:
