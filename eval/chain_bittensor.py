@@ -104,7 +104,7 @@ class BittensorChainIO:
     def block_hash(self, block: int) -> str:
         return str(self.st().get_block_hash(block))
 
-    def read_commitments(self, min_block: int, max_block: int) -> list:
+    def read_commitments(self, min_block: int, max_block: int, require_local: bool = True) -> list:
         """Every registered hotkey's current v2 commitment, resolved to a local dir.
 
         Bittensor exposes one slot per hotkey with no block filtering, so the window is advisory
@@ -127,7 +127,11 @@ class BittensorChainIO:
                 except Exception as e:
                     self.skipped.append((hotkey, f"fetch failed: {type(e).__name__}: {e}"))
                     continue
-            if not ckpt:
+            # `require_local=False` is the CPU-ORCHESTRATOR path: the artifacts belong on the
+            # rented GPU's disk, not on the box that holds the signing key, so the orchestrator
+            # reads the envelopes and ships them onward rather than downloading 60 GB it will
+            # never open.
+            if not ckpt and require_local:
                 self.skipped.append((hotkey, "no local artifact (reveal/fetch pending)"))
                 continue
             out.append(Commitment(
