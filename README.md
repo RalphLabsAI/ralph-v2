@@ -101,7 +101,7 @@ attributes a record and never validates it.
 ## Run it locally
 
 ```bash
-python -m tests.test_crown_path        # 56/56, CPU, no GPU needed
+python -m tests.test_crown_path        # 57/57, CPU, no GPU needed
 python -m eval.simulate_submission     # miner -> validator -> auditor in seconds
 ```
 

@@ -3592,6 +3592,121 @@ def test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent():
         assert len(burned) == 1, f"expected exactly one burn, got {len(burned)}"
 
 
+def test_orchestrator_audits_its_own_scorer_before_signing():
+    """The validator is split so the SIGNING KEY never reaches the rented GPU. That only helps if
+    the orchestrator refuses to rubber-stamp what comes back.
+
+    A signature applied to whatever the box returned would launder it: a compromised or merely
+    buggy rental could hand back a record for a different round, a pruned exam, an invented crown,
+    or numbers from the wrong hardware — and our key would make any of it authoritative. So the
+    orchestrator runs the SAME L0+L1 an outsider runs, against its own scorer, and checks that the
+    round's identity is the one it issued rather than one the box chose."""
+    import io
+    import json as _json
+    import tempfile
+    from pathlib import Path
+    from eval.orchestrator import (GpuSpec, Instance, RoundPlan, RemoteRoundError,
+                                   run_remote_round, verify_returned_record)
+    from eval.publish import LocalSink
+    from eval.rerun import load_pool, record_from_blob
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        sink = LocalSink(root)
+        e2 = [r for r in idx["rounds"] if r["round"] == 2][0]
+        honest = _json.loads(sink.get(e2["name"]).decode())
+        pool_sha = honest["manifest"]["pool_sha256"]
+        pool_blob = sink.get(f"pool/{pool_sha}.jsonl")
+        pool_path = Path(dd) / "pool.jsonl"
+        pool_path.write_bytes(pool_blob)
+        pool = load_pool(str(pool_path))
+
+        GPU = "NVIDIA H100 PCIe"
+        honest["manifest"].setdefault("versions", {})["gpu"] = GPU
+        # what the rented box actually returns: UNSIGNED. The key never went there.
+        honest["signature"] = honest["signer"] = honest["sig_scheme"] = ""
+        plan = RoundPlan(round=honest["round"], commit_root=honest["commit_root"],
+                         round_nonce=honest["round_nonce"],
+                         prev_anchor=honest.get("prev_anchor", ""))
+        spec = GpuSpec(require_gpu=GPU)
+
+        def check(mutate=None):
+            raw = _json.loads(_json.dumps(honest))
+            if mutate:
+                mutate(raw)
+            rec = record_from_blob(_json.dumps(raw).encode())
+            return verify_returned_record(rec, plan, pool, spec, {"gpu": GPU})
+
+        # the honest return signs
+        assert check() == [], check()
+        # ...and a SIGNED return is itself a finding: the key is supposed to live only here
+        bad = check(lambda r: r.update({"signature": "de" * 32, "signer": "ab" * 32,
+                                        "sig_scheme": "ed25519"}))
+        assert any("key leaked" in b for b in bad), bad
+
+        # ---- 1. A RECORD FOR A DIFFERENT ROUND. The box does not get to choose the nonce; a
+        #         box that could would be able to grind it.
+        for f, v in (("round", 999), ("commit_root", "ff" * 32), ("round_nonce", "ab" * 32),
+                     ("prev_anchor", "cd" * 32)):
+            bad = check(lambda r, f=f, v=v: r.update({f: v}))
+            assert any(f in b for b in bad), (f, bad)
+
+        # ---- 2. THE WRONG HARDWARE. Cross-box spread is ~0.03 retention against a 0.05 dethrone
+        #         margin, so "whatever GPU was cheapest" silently makes the crown a function of
+        #         the spot market.
+        bad = check(lambda r: r["manifest"]["versions"].update({"gpu": "NVIDIA L40S"}))
+        assert any("not comparable" in b for b in bad), bad
+
+        # ---- 3. A NONDETERMINISTIC BOX. The parent scored against itself is 1.000 by
+        #         construction; anything else means every number from that box is suspect.
+        bad = check(lambda r: r["manifest"]["identity"].update({"score": 0.8754}))
+        assert any("deterministic" in b for b in bad), bad
+
+        # ---- 4. AND A RIGGED SCORE still has to clear L0 — the audit runs against our OWN scorer,
+        #         not only against strangers.
+        bad = check(lambda r: r["submissions"][0].update({"retention": 0.99,
+                                                          "retention_lb": 0.99}))
+        assert any("recompute score" in b for b in bad), bad
+
+        # ---- 5. THE INSTANCE IS DESTROYED EVEN WHEN THE ROUND FAILS. A leaked GPU bills until
+        #         somebody notices, and the run that leaked it is the one that already went wrong.
+        events = []
+
+        class _Provider:
+            def rent(self, spec, name):
+                events.append("rent")
+                return Instance(id="i-1", ip="10.0.0.1", price_per_hour=2.0)
+
+            def wait_ready(self, inst, timeout_s=900):
+                events.append("ready")
+                return inst
+
+            def destroy(self, inst):
+                events.append("destroy")
+
+        def _boom(*a, **k):
+            raise RemoteRoundError("scoring blew up")
+
+        try:
+            run_remote_round(plan, _Provider(), spec, str(Path(dd) / "w"),
+                             runner=_boom, out=io.StringIO())
+            raise AssertionError("a failed round must not return quietly")
+        except RemoteRoundError:
+            pass
+        assert events == ["rent", "ready", "destroy"], events
+
+        # ---- 6. AND NO SECRET EVER REACHES THE JOB SPEC, asserted rather than assumed: the spec
+        #         is written to disk and copied to somebody else's machine.
+        leaky = RoundPlan(round=1, commit_root="a", round_nonce="b", prev_anchor="",
+                          committed=[{"hotkey": "h", "RALPH_RECORD_SEED": "de" * 32}])
+        try:
+            run_remote_round(leaky, _Provider(), spec, str(Path(dd) / "w2"),
+                             runner=_boom, out=io.StringIO())
+            raise AssertionError("a job spec carrying a seed must be refused")
+        except RemoteRoundError as e:
+            assert "refusing to ship" in str(e), e
+
+
 def test_auditor_publishes_its_verdicts_or_stops_voting():
     """"The verdict is the product" is a claim about PUBLISHING, and until this existed it was
     false: rulings went to a local directory, so nobody could read them, the `prev` chain protected
@@ -3755,6 +3870,7 @@ def main() -> int:
              test_auditor_verifies_then_diverges,
              test_auditor_verdict_states_what_it_did_not_check,
              test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent,
+             test_orchestrator_audits_its_own_scorer_before_signing,
              test_auditor_publishes_its_verdicts_or_stops_voting,
              test_auditor_treats_silence_as_a_finding]
     failed = 0
