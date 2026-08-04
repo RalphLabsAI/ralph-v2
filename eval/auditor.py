@@ -538,7 +538,13 @@ class Auditor:
         """One pass: check the trail, rule on every round we have not ruled on, act."""
         w = self.out.write
         trail, detail, head = self.check_trail()
-        idx = self.pub.load_index()
+        try:
+            idx = self.pub.load_index()
+        except Exception as e:
+            # An unreadable index is NOT an empty subnet. Reporting it as one is how a stranger
+            # pointed at a trail they cannot see gets told there is nothing to audit.
+            w(f"  ERROR cannot read the trail: {e}\n")
+            raise
         rounds = sorted(idx.get("rounds", []), key=lambda r: r["round"])
         self.pub.note_seen(len(rounds))
 

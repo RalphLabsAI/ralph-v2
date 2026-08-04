@@ -145,12 +145,24 @@ class HFReadSink:
         # A token is OPTIONAL here and only exists so the trail can be audited before launch while
         # the repo is still private. Public repos need nothing.
         self._token = token or os.environ.get("HF_TOKEN") or ""
+        self._repo_ok = False
 
     def put(self, name: str, blob: bytes) -> str:
         raise PublishError(f"HFReadSink is fetch-only; refusing to write {name}")
 
     def get(self, name: str) -> bytes | None:
+        """None means THE FILE IS NOT THERE. "I am not allowed to look" raises instead.
+
+        Those are different facts and collapsing them was dangerous in one specific direction: a
+        401 on a private repo returned None, `load_index` turned that into an empty history (the
+        high-water mark is 0 on a first run, so the never-shrink guard cannot fire either), and the
+        auditor printed "up to date at round -1" and exited 0. A stranger pointing at a trail they
+        cannot see would have been told the subnet has no rounds.
+
+        Repo-level failures are never transient, so they raise. A missing FILE, or a network blip,
+        still returns None — the caller counts those across passes and escalates on persistence."""
         from huggingface_hub import hf_hub_download
+        self._require_repo()
         try:
             p = hf_hub_download(self.repo_id, name, repo_type="dataset",
                                 token=self._token or None, revision=self.revision,
@@ -159,6 +171,31 @@ class HFReadSink:
                 return fh.read()
         except Exception:
             return None
+
+    def _require_repo(self) -> None:
+        """Ask about the REPO, not the file.
+
+        `hf_hub_download(force_download=True)` re-raises whatever went wrong as a bare ValueError
+        ("Force download failed due to the above error"), so the typed RepositoryNotFoundError is
+        gone by the time it reaches us — classifying at the download call silently did nothing.
+        `repo_info` keeps the type. Cached, so this costs one API call per process, not per file."""
+        if self._repo_ok:
+            return
+        from huggingface_hub import HfApi
+        try:
+            from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+        except Exception:                                   # older hub layout
+            from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+        try:
+            HfApi().repo_info(self.repo_id, repo_type="dataset", token=self._token or None)
+        except (RepositoryNotFoundError, GatedRepoError) as e:
+            raise PublishError(
+                f"cannot read {self.repo_id}: {type(e).__name__}. Either the repo does not exist "
+                f"or it is private — for an auditor those are the same dead end, and neither means "
+                f"'the subnet published nothing'. Set HF_TOKEN if you have access.") from e
+        except Exception:
+            return                                          # transient: let the fetch decide
+        self._repo_ok = True
 
 
 INDEX = "index.json"
