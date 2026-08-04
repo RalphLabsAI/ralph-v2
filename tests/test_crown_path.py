@@ -2066,7 +2066,10 @@ def test_miner_submit_and_chain_adapter():
         # WRITES ARE OFF BY DEFAULT — nothing may touch a live signer by accident
         assert io.set_weights({"hkA": 1.0}) is False
         io.set_king("ternary-4b", "hkA", "mid")
-        assert [e[0] for e in io.log] == ["set_weights", "set_king"], io.log
+        # the map query degrades to the per-uid path against a stub with no `substrate`, and says
+        # so in `log` rather than in `skipped` — skipped is the miner-facing column
+        assert [e[0] for e in io.log if e[0] != "commitments_map"] == \
+            ["set_weights", "set_king"], io.log
         assert io.current_block() == 1234 and io.block_hash(7) == "0x7"
         # v2 has no on-chain king store on purpose: the crown lives in the signed record, so a
         # second source of truth that could disagree with it is not created

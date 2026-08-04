@@ -104,6 +104,34 @@ class BittensorChainIO:
     def block_hash(self, block: int) -> str:
         return str(self.st().get_block_hash(block))
 
+    def commitments_map(self) -> dict:
+        """`{hotkey: raw commitment}` in ONE query instead of one per uid.
+
+        The per-uid path is `get_commitment(netuid, uid)`, which on a 256-slot subnet means 256
+        sequential RPC round-trips AND an SDK error log for each of the ~110 slots that hold
+        nothing — minutes of wall clock and a screenful of empty ERROR lines before a round can even
+        start. The storage map answers the same question in one call, and an empty slot is simply
+        an absent key rather than an exception.
+
+        Falls back to the per-uid path when the map is unavailable, because a chain-layout change
+        must degrade to slow rather than to broken."""
+        out: dict = {}
+        try:
+            res = self.st().substrate.query_map(
+                module="Commitments", storage_function="CommitmentOf", params=[self.netuid])
+        except Exception as e:
+            # `log`, not `skipped`: skipped is the list of SUBMISSIONS we refused and it is read
+            # by operators looking for why a miner was not scored. Our own RPC path degrading is
+            # not a miner's problem and must not appear in their column.
+            self.log.append(("commitments_map", f"query_map unavailable "
+                                                f"({type(e).__name__}) — falling back to per-uid"))
+            return out
+        for k, v in res:
+            raw = _decode_commitment(getattr(v, "value", v))
+            if raw:
+                out[str(k)] = raw
+        return out
+
     def read_commitments(self, min_block: int, max_block: int, require_local: bool = True) -> list:
         """Every registered hotkey's current v2 commitment, resolved to a local dir.
 
@@ -112,8 +140,9 @@ class BittensorChainIO:
         from a block after the window closes, so the commit-then-generate ordering that makes the
         score un-pre-fittable is unaffected."""
         out: list[Commitment] = []
+        cmap = self.commitments_map()
         for uid, hotkey in enumerate(self._hotkeys()):
-            raw = self._commitment_of(uid, hotkey)
+            raw = cmap.get(hotkey) if cmap else self._commitment_of(uid, hotkey)
             if not raw:
                 continue
             env = self._parse(hotkey, raw)
@@ -304,6 +333,34 @@ class BittensorChainIO:
             self.skipped.append((hotkey, "v2 commitment missing cv/tier"))
             return None
         return env
+
+
+def _decode_commitment(val) -> str:
+    """`{"info": {"fields": [{"Raw64": "0x…"}]}}` -> the string a miner wrote.
+
+    Field variants are RawN for assorted N and can arrive nested, so this walks rather than
+    indexes: an unexpected shape returns "" and the commitment is skipped with a reason, which is
+    the fail-closed direction."""
+    parts: list = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                walk(v)
+        elif isinstance(x, str):
+            if x.startswith("0x"):
+                try:
+                    parts.append(bytes.fromhex(x[2:]).decode("utf-8", "ignore"))
+                except Exception:
+                    pass
+            else:
+                parts.append(x)
+
+    walk(((val or {}).get("info") or {}).get("fields") or [])
+    return "".join(parts)
 
 
 def build_commitment_envelope(tier: str, commit_value: str, artifact_uri: str,
