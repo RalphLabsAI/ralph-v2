@@ -855,7 +855,18 @@ def main(argv: list) -> int:
     cfg = AuditorConfig.from_env()
 
     def opt(flag, cast=str, default=None):
-        return cast(argv[argv.index(flag) + 1]) if flag in argv else default
+        """A flag whose value is missing is an OPERATOR ERROR with a name, not an IndexError.
+
+        `--signer $UNSET_VAR` expands to a bare `--signer` at the end of argv, which is exactly how
+        a shell hands you this mistake, and a traceback is a poor way to say "you forgot the value"
+        to somebody running this for the first time."""
+        if flag not in argv:
+            return default
+        i = argv.index(flag) + 1
+        if i >= len(argv) or argv[i].startswith("--"):
+            raise SystemExit(f"  {flag} needs a value (got nothing) — check for an unset shell "
+                             f"variable on that argument")
+        return cast(argv[i])
 
     cfg.require = tuple(x.strip() for x in (opt("--require") or ",".join(cfg.require)).split(",")
                         if x.strip())
