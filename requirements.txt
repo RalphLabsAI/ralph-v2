@@ -7,10 +7,14 @@ pynacl                 # ed25519 signing of round records (eval/signing.py)
 # `--follow` spins forever printing the same ImportError.
 huggingface_hub        # fetch the published trail (eval/publish.py)
 
-# ...and to VOTE (--set-weights) an auditor additionally needs a Bittensor wallet plus the v1
-# chain layer that carries set_weights / set_burn_weights:
-#   bittensor
-#   karpa               # github.com/RalphLabsAI/ralph — not on PyPI, install alongside
+# ...and to VOTE (--set-weights) an auditor additionally needs a Bittensor wallet:
+#   bittensor>=10.5,<11
+#
+# THE UPPER BOUND IS LOAD-BEARING. eval/chain_bittensor.py is written against the 10.x SDK:
+# `bt.Subtensor` (the lowercase `bt.subtensor` alias is gone), `Subtensor.metagraph(netuid)`,
+# `get_commitment(netuid, uid)`, `set_commitment(wallet, netuid, data)`. Bittensor 11.x is a
+# ground-up rewrite with none of those — its Metagraph is a dataclass carrying `commitments` and
+# the Subtensor exposes namespaces instead of methods. That needs a new adapter, not a bump.
 
 # Real model runs (the validator, and auditors at L2/L3, GPU) additionally need:
 #   torch

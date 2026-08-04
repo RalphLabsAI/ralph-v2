@@ -12,7 +12,7 @@ shadow launch touches, by driving `run_v2_epoch`:
 
 Shadow = no emission, no real chain: FakeChain records the writes so we can assert the
 validator DECIDED correctly on real inference. Flip to the real chain (chain.ChainIO) by
-swapping FakeChain for the karpa validator once the box is up.
+swapping FakeChain for eval.chain_bittensor.BittensorChainIO once the box is up.
 
     python -m eval.shadow_epoch 2>&1 | tee shadow_epoch.log
 

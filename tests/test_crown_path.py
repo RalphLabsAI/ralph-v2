@@ -2029,21 +2029,20 @@ def test_miner_submit_and_chain_adapter():
                      committed_value=st["commit_value"])
         assert dec.accepted, dec.reasons
 
-        # the validator adapter parses the miner's envelope, and refuses anything else
-        class _Inner:
-            class MG:
-                hotkeys = ["hkA", "hkB", "hkC"]
-                coldkeys = ["ckA", "ckB", "ckC"]
-            metagraph = MG()
+        # the validator adapter parses the miner's envelope, and refuses anything else. The
+        # subtensor and metagraph are injected rather than wrapped: since v1 was retired this talks
+        # to bittensor directly, so the seam that has to stay testable is the SDK boundary.
+        class _MG:
+            hotkeys = ["hkA", "hkB", "hkC"]
+            coldkeys = ["ckA", "ckB", "ckC"]
 
-            class Sub:
-                def get_commitment(self, netuid, uid):
-                    return {0: st["envelope"], 1: "legacy-v1-handshake",
-                            2: '{"v":9,"tier":"x"}'}[uid]
-            subtensor = Sub()
+        class _Sub:
+            def get_commitment(self, netuid, uid):
+                return {0: st["envelope"], 1: "legacy-v1-handshake",
+                        2: '{"v":9,"tier":"x"}'}[uid]
 
-            def get_uid(self, hk):
-                return {"hkA": 0, "hkB": 1, "hkC": 2}[hk]
+            def metagraph(self, netuid):
+                return _MG()
 
             def get_current_block(self):
                 return 1234
@@ -2051,7 +2050,7 @@ def test_miner_submit_and_chain_adapter():
             def get_block_hash(self, b):
                 return f"0x{b}"
 
-        io = BittensorChainIO(inner=_Inner(), netuid=40,
+        io = BittensorChainIO(subtensor=_Sub(), netuid=40,
                               fetch_dir_for=lambda hk, uri: str(d) if hk == "hkA" else "",
                               reveals={"hkA": {"content_hash": st["content_hash"],
                                                "salt": st["salt"]}})
@@ -2068,6 +2067,10 @@ def test_miner_submit_and_chain_adapter():
         assert io.set_weights({"hkA": 1.0}) is False
         io.set_king("ternary-4b", "hkA", "mid")
         assert [e[0] for e in io.log] == ["set_weights", "set_king"], io.log
+        assert io.current_block() == 1234 and io.block_hash(7) == "0x7"
+        # v2 has no on-chain king store on purpose: the crown lives in the signed record, so a
+        # second source of truth that could disagree with it is not created
+        assert io.get_king("ternary-4b") is None
 
     env = build_commitment_envelope("ternary-4b", "cv", "hf://x@1")
     assert _json.loads(env)["v"] == 2 and len(env) < 300, env

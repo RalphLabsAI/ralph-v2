@@ -732,15 +732,15 @@ def chain_head_anchor(netuid: int, network: str, hotkey: str):
 
     This is the only value in the whole loop the operator cannot edit, which is what makes an
     auditor's trail check different from re-reading the operator's own index back to them."""
+    from .chain_bittensor import BittensorChainIO
+    io = BittensorChainIO(netuid=netuid, network=network, read_only=True)
+
     def read() -> str:
-        import bittensor as bt
-        st = bt.Subtensor(network=network)
-        mg = st.metagraph(netuid=netuid)
-        try:
-            uid = list(mg.hotkeys).index(hotkey)
-        except ValueError:
+        # ONE implementation of "read a commitment", shared with the validator's own gate. A second
+        # copy here would be a rule that can drift from the one it is meant to check.
+        if io.uid_of(hotkey) is None:
             raise RuntimeError(f"{hotkey[:16]}… is not registered on netuid {netuid}")
-        return str(st.get_commitment(netuid=netuid, uid=uid) or "")
+        return io.commitment_of_hotkey(hotkey)
 
     return read
 
@@ -752,9 +752,10 @@ def bittensor_chain(cfg: AuditorConfig):
 
     def get():
         if "c" not in holder:
-            from karpa.chain_layer.bittensor_chain import BittensorChain  # type: ignore
-            holder["c"] = BittensorChain(network=cfg.network, netuid=cfg.netuid,
-                                         wallet_name=cfg.wallet, wallet_hotkey=cfg.hotkey)
+            from .chain_bittensor import BittensorChainIO
+            holder["c"] = BittensorChainIO(netuid=cfg.netuid, network=cfg.network,
+                                           wallet_name=cfg.wallet, hotkey_name=cfg.hotkey,
+                                           burn_uid=cfg.burn_uid, read_only=False)
         return holder["c"]
 
     return get
@@ -772,7 +773,6 @@ def bittensor_weight_setter(cfg: AuditorConfig, get_chain=None):
         return bool(get().set_weights(weights))
 
     def burn() -> bool:
-        os.environ.setdefault("RALPH_BURN_UID", str(cfg.burn_uid))
         return bool(get().set_burn_weights())
 
     return setter, burn
@@ -826,9 +826,9 @@ def preflight(cfg: AuditorConfig, out=sys.stdout) -> list:
             bad.append("--set-weights needs --signer <the validator's record-signing public id>: "
                        "an unpinned signer means following whoever holds the repo")
         try:
-            from karpa.chain_layer.bittensor_chain import BittensorChain  # noqa: F401
+            import bittensor  # noqa: F401
         except Exception as e:
-            bad.append(f"--set-weights needs the v1 chain layer (karpa.chain_layer): {e}")
+            bad.append(f"--set-weights needs bittensor>=10.5,<11: {e}")
     try:
         import huggingface_hub  # noqa: F401
     except Exception:

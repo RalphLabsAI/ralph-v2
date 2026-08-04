@@ -4,7 +4,7 @@ This is what an operator runs to see the REAL crown substrate end to end: a Fake
 supplies committed submissions and the round nonce, and everything downstream is the
 production path — intake (economics + safety + tier + commit-reveal), axis_round over the
 deterministic-checker cover, the genre-overfit crown precondition, bond settlement, a
-SIGNED record, and weights. Swapping FakeChain for the karpa validator's ChainIO is the
+SIGNED record, and weights. Swapping FakeChain for eval.chain_bittensor.BittensorChainIO is
 only step to a live shadow; nothing else changes.
 
     python -m eval.shadow_axis_epoch      # real HF models on a GPU; env-configurable

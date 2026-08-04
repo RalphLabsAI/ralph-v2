@@ -4,13 +4,10 @@
 only thing between it and a live subnet is chain I/O — reading what miners committed,
 drawing the round nonce, and writing back weights / crown / the round-record hash.
 
-This module defines that boundary as a small PROTOCOL (`ChainIO`) and wires it to the
-round in `run_v2_epoch`. It does NOT import or modify Ralph's live v1 validator — the v1
-service (karpa/validator/service.py) already implements every method here
-(get_king/set_king/set_weights/current_block/get_commitment/blacklist), so bringing v2 up
-is: construct the pile + pinned (glm, base, judge), then call `run_v2_epoch(chain, ...)`
-from the existing epoch loop. Keeping it a protocol lets the whole thing be tested against
-`FakeChain` with zero chain dependency, and keeps this session off the live signer.
+This module defines that boundary as a small PROTOCOL (`ChainIO`) and wires it to the round in
+`run_v2_epoch`. `eval/chain_bittensor.BittensorChainIO` implements every method here directly
+against bittensor. Keeping it a protocol lets the whole thing be tested against `FakeChain` with
+zero chain dependency, and keeps a test run off the live signer.
 
 Commit-then-generate ordering enforced here:
   1. read commitments (sealed H(content_hash‖salt)) that locked BEFORE this block
@@ -51,7 +48,7 @@ class Commitment:
 
 @runtime_checkable
 class ChainIO(Protocol):
-    """Exactly what a v2 epoch needs from the chain. v1's service satisfies all of it."""
+    """Exactly what a v2 epoch needs from the chain."""
 
     def current_block(self) -> int: ...
     def block_hash(self, block: int) -> str: ...

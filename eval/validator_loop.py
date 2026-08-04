@@ -10,7 +10,7 @@
 
 Model/pile/chain access is injected, so this runs on CPU with sims and against real GLM
 on a GPU unchanged. The CHAIN I/O (read commitments, set weights, publish the record
-hash) is the documented boundary — the karpa validator wraps this and provides:
+hash) is the documented boundary — eval/chain.py wraps this and provides:
   read_commitments() -> [(hotkey, coldkey, tier, ckpt_dir, declared_compute, bond)]
   commit_root, round_nonce   (from the on-chain commitment + block hash)
   set_weights(weights); publish(record)
