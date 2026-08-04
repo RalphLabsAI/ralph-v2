@@ -69,8 +69,30 @@ _NON_WEIGHT = ("norm", "bias", "_scale", "rope_freqs")
 
 
 def type_bits(ggml_type: int) -> float | None:
+    """CONTAINER bits per weight: the whole block, scales and all."""
     t = GGML_TYPES.get(ggml_type)
     return None if t is None else t[2] * 8.0 / t[1]
+
+
+def code_bits(type_name: str) -> float:
+    """ACHIEVEMENT bits per weight: the index width the format name asserts.
+
+    `Q4_K` -> 4, `IQ2_XXS` -> 2, `F16` -> 16. A block holds N packed indices plus scales and mins;
+    the indices are the information that survived quantization, and the rest is container overhead.
+    That is exactly the code/container split the tiers are built on — and unlike safetensors,
+    nothing needs sampling or level-counting, because the block layout is fixed and published, so
+    an auditor recomputing this cannot disagree. An unrecognised name returns 0 and the caller
+    refuses the artifact rather than guessing a budget."""
+    import re
+    n = (type_name or "").upper()
+    if n.startswith("BF"):
+        return float(n[2:] or 0)
+    if n.startswith("F") and n[1:].isdigit():
+        return float(n[1:])
+    # Any letter prefix before the Q: Q4_K, IQ2_XXS, and TQ2_0 — the TERNARY format, which is
+    # this subnet's headline tier and which an `^I?Q` pattern silently failed to match.
+    m = re.match(r"^[A-Z]*Q(\d+)", n)
+    return float(m.group(1)) if m else 0.0
 
 
 @dataclass
@@ -79,7 +101,13 @@ class GGUFInfo:
     version: int = 0
     n_tensors: int = 0
     params: int = 0              # weight-bearing elements
-    bits_per_weight: float = 0.0  # exact, from the per-tensor ggml types
+    bits_per_weight: float = 0.0  # CONTAINER bits/weight — what you download, exact
+    # ACHIEVEMENT bits/weight: the per-weight index width, excluding the block's scales and mins.
+    # The tiers gate on the container and RANK on this, so both have to come out of the same walk
+    # — deriving one of them in another module means two parsers that can disagree about the same
+    # artifact, and the bit budget is the number the whole tier system rests on.
+    code_bits_per_weight: float = 0.0
+    weight_type_hist: dict = field(default_factory=dict)   # weight-bearing elements per ggml type
     file_bytes: int = 0
     arch: str = ""
     type_hist: dict = field(default_factory=dict)
@@ -134,7 +162,7 @@ def read_gguf(path) -> GGUFInfo:
                 if key == "general.architecture" and isinstance(val, str):
                     info.arch = val
 
-            bits_total, params = 0.0, 0
+            bits_total, code_total, params = 0.0, 0.0, 0
             for _ in range(n_tensors):
                 name = _read_str(f)
                 (ndim,) = struct.unpack("<I", f.read(4))
@@ -156,13 +184,20 @@ def read_gguf(path) -> GGUFInfo:
                     # HARD REJECT: an unrecognized packing whose width we would have to guess.
                     info.reasons.append(f"unknown ggml type {tt} in {name}")
                     return info
+                c = code_bits(tname)
+                if c <= 0:
+                    info.reasons.append(f"no code width for ggml type {tname!r} in {name}")
+                    return info
                 bits_total += b * n
+                code_total += c * n
+                info.weight_type_hist[tname] = info.weight_type_hist.get(tname, 0) + n
                 params += n
             if params == 0:
                 info.reasons.append("no weight tensors found")
                 return info
             info.params = params
             info.bits_per_weight = round(bits_total / params, 4)
+            info.code_bits_per_weight = round(code_total / params, 4)
             info.ok = True
     except Exception as e:                                # malformed header -> fail closed
         info.reasons.append(f"gguf parse error: {e}")

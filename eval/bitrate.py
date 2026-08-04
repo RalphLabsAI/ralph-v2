@@ -177,6 +177,14 @@ def measure_checkpoint(ckpt_dir, group_size: int = 128, max_groups_per_tensor: i
     from pathlib import Path
 
     rep = BitReport(group_size=group_size)
+    # GGUF FIRST, because it was invisible here. This function globbed *.safetensors only, so a
+    # GGUF artifact measured params=0 and the bit-tier gate failed closed with "no weights
+    # measured" — safe, but it meant NO GGUF SUBMISSION COULD EVER BE ACCEPTED, while the README
+    # advertises GGUF, fetch.py allows it, and parent_compat goes out of its way to support it.
+    # Found by quantizing the real parent and running it through the real gates.
+    gg = sorted(Path(ckpt_dir).glob("*.gguf"))
+    if gg:
+        return measure_gguf_dir(gg, group_size=group_size)
     files = sorted(Path(ckpt_dir).glob("*.safetensors"))
     tot_code, tot_container, tot_n, max_levels = 0.0, 0.0, 0, 0
     seen = 0
@@ -231,6 +239,44 @@ def measure_checkpoint(ckpt_dir, group_size: int = 128, max_groups_per_tensor: i
         rep.code_bits = round(tot_code / tot_n, 4)
         rep.container_bits = round(tot_container / tot_n, 4)
         rep.codebook = max_levels
+    else:
+        rep.notes.append("no weight tensors measured")
+    return rep
+
+
+from .gguf import code_bits as _gguf_code   # ONE definition of the code width
+
+
+def measure_gguf_dir(paths, group_size: int = 128) -> BitReport:
+    """Exact bit accounting for a GGUF artifact, straight out of `read_gguf`'s own walk.
+
+    No sampling and no second parser: `eval.gguf` already visits every tensor to compute container
+    bits, so it computes the code bits in the same pass and this just reports them. Writing the
+    walk again here is how two modules end up disagreeing about one artifact's bit budget."""
+    from .gguf import read_gguf
+    rep = BitReport(group_size=group_size)
+    tot_code = tot_container = 0.0
+    tot_n = 0
+    widths = set()
+    for path in paths:
+        info = read_gguf(path)
+        if not info.ok:
+            rep.notes.extend(info.reasons[:2])
+            continue
+        tot_code += info.code_bits_per_weight * info.params
+        tot_container += info.bits_per_weight * info.params
+        tot_n += info.params
+        for tname, n in (info.weight_type_hist or {}).items():
+            rep.per_tensor[tname] = rep.per_tensor.get(tname, 0) + n
+            widths.add(int(_gguf_code(tname)))
+    if tot_n:
+        rep.params = tot_n
+        rep.code_bits = round(tot_code / tot_n, 4)
+        rep.container_bits = round(tot_container / tot_n, 4)
+        # the NARROWEST code present is what the artifact can honestly claim: a model with one
+        # 2-bit tensor and the rest at 8 is not a 2-bit model, and the mean above says so, but
+        # the codebook field should not overstate it either
+        rep.codebook = 2 ** min(widths) if widths else 0
     else:
         rep.notes.append("no weight tensors measured")
     return rep
