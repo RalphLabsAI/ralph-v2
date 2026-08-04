@@ -155,10 +155,11 @@ The old capability axes remain as a cheap **canary**, not the crown, because obs
 structurally blind to exactly one failure: a student that moves the observer correctly while
 being unusable.
 
-## Auditability — one validator, many auditors
+## Auditability — scoring is expensive, checking is cheap
 
-v2 runs **one owner validator**, like several production subnets. The question that matters is not
-how many validators there are, but whether an outsider can *check* the one that exists.
+Ralph validators run the GPU scoring; **auditors run on CPU**, so anyone can check a crown without
+a datacentre. The question that matters is not how many validators there are, but whether an
+outsider can *check* the ones that exist.
 
 Publishing artifacts is not enough. A subnet can publish every prompt, every judge verdict and
 every score and still be unfalsifiable, because if the grade came from an unpinned LLM with no seed
