@@ -86,13 +86,29 @@ class ShadeformProvider(Provider):
         self.ssh_key_id = ssh_key_id or os.environ.get("SHADEFORM_SSH_KEY_ID", "")
 
     def _key(self) -> str:
-        try:
-            with open(self.key_file) as fh:
-                return fh.read().strip()
-        except OSError as e:
-            raise RuntimeError(
-                f"no Shadeform API key at {self.key_file}: {e}. Renting is the only step of the "
-                f"round that needs it — put the key there and nothing else changes.") from e
+        """Accept a bare key OR a `SHADEFORM_API_KEY=...` line OR the env var.
+
+        A key file is hand-written, and writing the whole assignment line into it is the obvious
+        thing to do. The bare-`.strip()` version sent the literal string `SHADEFORM_API_KEY=...`
+        as the header and got back an unexplained 401 — a config shape that common deserves parsing,
+        not a diagnosis session."""
+        raw = os.environ.get("SHADEFORM_API_KEY", "")
+        if not raw:
+            try:
+                with open(self.key_file) as fh:
+                    raw = fh.read()
+            except OSError as e:
+                raise RuntimeError(
+                    f"no Shadeform API key: set SHADEFORM_API_KEY or put it in {self.key_file} "
+                    f"({e}). Renting is the only step of the round that needs it.") from e
+        key = raw.strip()
+        if "=" in key.split("\n")[0]:
+            key = key.split("\n")[0].split("=", 1)[1].strip()
+        key = key.strip().strip('"').strip("'")
+        if not key or any(c.isspace() for c in key):
+            raise RuntimeError(f"the Shadeform key in {self.key_file} does not look like a key "
+                               f"(len={len(key)}); expected a bare token or NAME=token")
+        return key
 
     def _api(self, method: str, path: str, body: dict | None = None) -> dict:
         import urllib.error
@@ -156,19 +172,55 @@ class ShadeformProvider(Provider):
         raise RuntimeError(f"instance {inst.id} not ready within {timeout_s:.0f}s")
 
     def destroy(self, inst: Instance) -> None:
-        # v1's helper documents that DELETE returns 204 with an empty body, which the JSON decode
-        # treats as a failure even though the delete succeeded. Swallow that specific shape rather
-        # than retrying a teardown that already worked.
-        try:
-            self._api("DELETE", f"/instances/{inst.id}/delete")
-        except Exception as e:
-            if "204" not in str(e) and "Expecting value" not in str(e):
-                raise
+        """POST, not DELETE — and then CHECK IT ACTUALLY WENT.
+
+        Both halves of this are scar tissue. The first version used the HTTP verb the endpoint name
+        suggests; the API wants `POST /instances/{id}/delete` and answers `DELETE` with a 405. I
+        found that by leaking a $2.73/hr instance, which is the worst possible place in this module
+        for a bug — teardown is the thing that stops billing, and it would have failed on every
+        real round.
+
+        The second half is the same lesson publish.py learned: a write whose return value you trust
+        is a write you have not verified. So the instance is re-listed afterwards, and a failure to
+        disappear is raised rather than assumed away. The empty body on success is expected and is
+        NOT an error."""
+        last = None
+        for _ in range(3):
+            try:
+                self._api("POST", f"/instances/{inst.id}/delete")
+            except Exception as e:
+                # success returns an empty body, which the JSON decode reports as a value error
+                if "Expecting value" not in str(e) and "204" not in str(e):
+                    last = e
+            time.sleep(3)
+            if not any(str(i.get("id", "")) == inst.id for i in self.list_active()):
+                return
+        raise RuntimeError(
+            f"instance {inst.id} is STILL ACTIVE after three delete attempts — it is billing right "
+            f"now, go and kill it in the console" + (f" (last error: {last})" if last else ""))
 
     def list_active(self) -> list:
         r = self._api("GET", "/instances")
         return [i for i in r.get("instances", [])
                 if str(i.get("status", "")).lower() not in ("deleted", "error")]
+
+    def sweep(self, prefix: str = "ralph-", out=sys.stdout) -> list:
+        """Kill anything we named that is still up. The backstop for a process that died between
+        renting and destroying — which is exactly how the bug above was found.
+
+        SCOPED BY NAME PREFIX, deliberately and narrowly: this account also carries instances
+        belonging to other projects, and a sweep that reached them would be a far worse failure
+        than the leak it prevents."""
+        killed = []
+        for i in self.list_active():
+            name = str(i.get("name", ""))
+            if not name.startswith(prefix):
+                continue
+            iid = str(i.get("id", ""))
+            out.write(f"  sweeping orphan {name} ({iid[:12]})\n")
+            self.destroy(Instance(id=iid))
+            killed.append(name)
+        return killed
 
 
 @dataclass
@@ -325,7 +377,8 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
                 "instance": inst, "cost": inst.price_per_hour * (time.time() - t0) / 3600.0}
     finally:
         # ALWAYS. A leaked instance bills until somebody notices, and the process that leaked it is
-        # by definition the one that already went wrong.
+        # by definition the one that already went wrong. `destroy` verifies rather than assumes:
+        # the first version of it used the wrong HTTP verb and would have failed silently here.
         try:
             provider.destroy(inst)
             w(f"  destroyed {inst.id} after {(time.time() - t0) / 60:.1f} min "

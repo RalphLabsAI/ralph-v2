@@ -3695,6 +3695,34 @@ def test_orchestrator_audits_its_own_scorer_before_signing():
             pass
         assert events == ["rent", "ready", "destroy"], events
 
+        # ---- 5b. AND TEARDOWN IS VERIFIED, NOT ASSUMED. The first version of destroy() used the
+        #          HTTP verb the endpoint name suggests; the API wants POST and answers DELETE with
+        #          a 405, so teardown would have failed on every real round and left an H100
+        #          billing. A write whose return value you trust is a write you have not verified —
+        #          the same lesson publish.py learned about `put`.
+        from eval.orchestrator import ShadeformProvider
+
+        class _Stubborn(ShadeformProvider):
+            def __init__(self):
+                self.calls = []
+
+            def _key(self):
+                return "k"
+
+            def _api(self, method, path, body=None):
+                self.calls.append((method, path))
+                if path == "/instances":
+                    return {"instances": [{"id": "i-9", "name": "ralph-x", "status": "active"}]}
+                return {}
+
+        sp = _Stubborn()
+        try:
+            sp.destroy(Instance(id="i-9"))
+            raise AssertionError("a delete that did not take must raise, not return quietly")
+        except RuntimeError as e:
+            assert "STILL ACTIVE" in str(e), e
+        assert all(m == "POST" for m, p_ in sp.calls if p_.endswith("/delete")), sp.calls
+
         # ---- 6. AND NO SECRET EVER REACHES THE JOB SPEC, asserted rather than assumed: the spec
         #         is written to disk and copied to somebody else's machine.
         leaky = RoundPlan(round=1, commit_root="a", round_nonce="b", prev_anchor="",
