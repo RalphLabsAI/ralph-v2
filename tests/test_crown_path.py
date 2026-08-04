@@ -3589,6 +3589,98 @@ def test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent():
         assert len(burned) == 1, f"expected exactly one burn, got {len(burned)}"
 
 
+def test_auditor_publishes_its_verdicts_or_stops_voting():
+    """"The verdict is the product" is a claim about PUBLISHING, and until this existed it was
+    false: rulings went to a local directory, so nobody could read them, the `prev` chain protected
+    nothing, and an auditor setting weights was on-chain indistinguishable from a copier.
+
+    Three properties, each the mirror of one the operator's publisher has — but note where they
+    DIVERGE, because the adversary is different. A record may never be replaced; a verdict may
+    legitimately be revised, since an auditor that could not fetch a record rules INCOMPLETE and
+    must be able to rule again when the sink recovers. Refusing that would force it to lie the
+    first time or stay silent. So a revision APPENDS and both rulings stay readable."""
+    import io
+    import json as _json
+    import tempfile
+    from pathlib import Path
+    from eval.auditor import ACCEPT, Auditor, AuditorConfig
+    from eval.publish import LocalSink, PublishError
+    from eval.signing import Ed25519Signer
+    from eval.verdicts import VerdictPublisher, verify_verdict_trail
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        committed = []
+        vroot = str(Path(dd) / "verdict-trail")
+
+        def build(work, vsink, **kw):
+            cfg = AuditorConfig(expected_signer=sig.public_id(), require=("L0",),
+                                pool_from_trail=False, work_dir=str(Path(dd) / work), **kw)
+            return Auditor(cfg, sink=LocalSink(root), signer=Ed25519Signer(seed=b"a" * 32),
+                           head_anchor_fn=lambda: chain.head_anchor(), verdict_sink=vsink,
+                           commit_head_fn=committed.append, out=io.StringIO())
+
+        # ---- 1. verdicts reach a sink a third party can read, and the chain is anchored
+        a = build("pub", LocalSink(vroot))
+        vs = a.once()
+        assert all(v.verdict == ACCEPT for v in vs)
+        pub = VerdictPublisher(LocalSink(vroot))
+        published = pub.load_index()["verdicts"]
+        assert [e["round"] for e in published] == [1, 2], published
+        assert published[0]["sha256"] == vs[0].sha256()
+        # the chain head was written to the auditor's own commitment slot -- without that, the
+        # chain is the auditor's computation over the auditor's files against the auditor's index
+        assert committed and committed[-1] == published[-1]["chain"], committed
+
+        # a third party can walk it, and says so honestly when it has no on-chain head to check
+        rep = verify_verdict_trail(pub)
+        assert not rep["broken"] and not rep["chain_breaks"], rep
+        assert rep["ok"] is False and rep["head_checked"] is False, "unanchored must not read ok"
+        rep = verify_verdict_trail(pub, head_chain=committed[-1])
+        assert rep["ok"] and rep["n"] == 2, rep
+
+        # ---- 2. DELETING A VERDICT BREAKS THE CHAIN. That is the whole point of `prev`: an
+        #         auditor must not be able to quietly drop the ruling it later regrets.
+        Path(vroot, published[0]["name"]).unlink()
+        rep = verify_verdict_trail(pub, head_chain=committed[-1])
+        assert rep["broken"] and not rep["ok"], rep
+
+        # ---- 3. A FAILED PUBLISH STOPS THE VOTE. A validator writing weights with no published
+        #         reasoning is exactly the copier this role exists to be distinguishable from.
+        class Broken(LocalSink):
+            def put(self, name, blob):
+                raise PublishError("sink is down")
+
+        wrote = []
+        b = build("hold", Broken(str(Path(dd) / "broken")), set_weights=True)
+        b.set_weights_fn = lambda w: (wrote.append(w), True)[1]
+        b.set_burn_fn = lambda: (wrote.append("burn"), True)[1]
+        b.once()
+        assert b.publish_error, "a failed publish must be recorded, not swallowed"
+        assert not wrote, "must not vote on a ruling it could not publish"
+
+        # ---- 4. AND A REVISION APPENDS. Same round, different ruling, both readable — unlike a
+        #         round record, which may never be replaced.
+        pub2 = VerdictPublisher(LocalSink(vroot))
+        revised = vs[0]
+        revised.note = "re-ruled after the sink recovered"
+        revised.signature = ""
+        revised.sign(Ed25519Signer(seed=b"a" * 32))
+        pub2.publish(revised)
+        rounds = [e["round"] for e in pub2.load_index()["verdicts"]]
+        assert rounds == [1, 2, 1], f"a revision must append, not overwrite: {rounds}"
+
+        # ...but a DIFFERENT auditor cannot write into this trail, or nobody could attribute it
+        alien = vs[1]
+        alien.signature = ""
+        alien.sign(Ed25519Signer(seed=b"z" * 32))
+        try:
+            pub2.publish(alien)
+            raise AssertionError("a second identity must not share one verdict trail")
+        except PublishError as e:
+            assert "separate repo per auditor" in str(e), e
+
+
 def test_auditor_treats_silence_as_a_finding():
     """v1's failure was not a wrong number. The validator stopped publishing on 7 July and kept
     setting weights; king.json went stale, events.json was never published at all, and nothing
@@ -3660,6 +3752,7 @@ def main() -> int:
              test_auditor_verifies_then_diverges,
              test_auditor_verdict_states_what_it_did_not_check,
              test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent,
+             test_auditor_publishes_its_verdicts_or_stops_voting,
              test_auditor_treats_silence_as_a_finding]
     failed = 0
     for t in tests:

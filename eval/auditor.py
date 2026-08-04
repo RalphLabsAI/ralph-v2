@@ -106,6 +106,12 @@ class AuditorConfig:
     # operator declares and it loads whichever one that round drew.
     observers: tuple = ()
     artifacts_dir: str = ""            # local checkpoints -> enables L3
+
+    # WHERE THE VERDICTS GO. Without this they are local files, which makes "the verdict is the
+    # product" false: nobody can read them, the `prev` chain protects nothing, and an auditor
+    # setting weights is on-chain indistinguishable from a copier.
+    verdicts_repo: str = ""            # an HF dataset repo the AUDITOR owns
+    commit_verdict_head: bool = False  # anchor the verdict chain in the auditor's commitment slot
     l3_items: int = 0                  # 0 = every item
 
     # consequences
@@ -146,6 +152,7 @@ class AuditorConfig:
             pool_path=e("RALPH_AUDIT_POOL", ""),
             observers=obs,
             artifacts_dir=e("RALPH_AUDIT_ARTIFACTS", ""),
+            verdicts_repo=e("RALPH_AUDIT_VERDICTS_REPO", ""),
             burn_uid=int(e("RALPH_BURN_UID", "0")),
             wallet=e("RALPH_WALLET", "ralph"),
             hotkey=e("RALPH_AUDIT_HOTKEY", "auditor"),
@@ -236,7 +243,8 @@ class Auditor:
     which round it is currently willing to follow."""
 
     def __init__(self, cfg: AuditorConfig, sink=None, signer=None, head_anchor_fn=None,
-                 set_weights_fn=None, set_burn_fn=None, out=sys.stdout, now_fn=time.time):
+                 set_weights_fn=None, set_burn_fn=None, verdict_sink=None,
+                 commit_head_fn=None, out=sys.stdout, now_fn=time.time):
         self.cfg = cfg
         self.out = out
         self.now = now_fn
@@ -244,6 +252,10 @@ class Auditor:
         self.head_anchor_fn = head_anchor_fn
         self.set_weights_fn = set_weights_fn
         self.set_burn_fn = set_burn_fn
+        self.commit_head_fn = commit_head_fn
+        # Publishing failures are RECORDED, never swallowed: an auditor that cannot publish its
+        # ruling must not go on setting weights as if it had. See _apply_weights.
+        self.publish_error = ""
         os.makedirs(cfg.work_dir, exist_ok=True)
         os.makedirs(cfg.verdict_dir, exist_ok=True)
 
@@ -255,6 +267,13 @@ class Auditor:
         # the full one, which is v1's lineage bug pointed the other way.
         self.pub = RecordPublisher(self.sink, window=8,
                                    state_path=os.path.join(cfg.work_dir, "auditor-hwm.json"))
+        # THE AUDITOR'S OWN PUBLISHER, over a sink it can WRITE to. Deliberately a different sink
+        # from `self.sink`, which is fetch-only and belongs to the operator.
+        from .verdicts import VerdictPublisher
+        self.vsink = verdict_sink
+        self.vpub = (VerdictPublisher(verdict_sink, auditor=signer.public_id() if signer else "",
+                                      state_path=os.path.join(cfg.work_dir, "verdict-hwm.json"))
+                     if verdict_sink is not None else None)
         self.state = self._load_state()
         self._pool = None
         self._pool_sha = ""
@@ -517,6 +536,9 @@ class Auditor:
         return v
 
     def publish_verdict(self, v: Verdict) -> str:
+        """Local file first, then the public trail. Local always happens — an operator debugging a
+        daemon should never have to have a working HF token — but a configured public sink that
+        FAILS is recorded, and _apply_weights refuses to write weights while it is set."""
         path = os.path.join(self.cfg.verdict_dir, f"verdict-{v.round:08d}.json")
         blob = json.dumps(asdict(v), sort_keys=True, indent=1).encode()
         tmp = path + ".part"
@@ -532,6 +554,15 @@ class Auditor:
             with open(os.path.join(self.cfg.verdict_dir, "verdicts.jsonl"), "a") as fh:
                 fh.write(json.dumps(asdict(v), sort_keys=True, separators=(",", ":")) + "\n")
             self._last_logged = key
+        if self.vpub is not None:
+            try:
+                entry = self.vpub.publish(v, commit_head_fn=self.commit_head_fn)
+                self.publish_error = ""
+                self.out.write(f"          published {entry['name']} "
+                               f"(chain {entry['chain'][:12]}…)\n")
+            except Exception as e:
+                self.publish_error = f"{type(e).__name__}: {e}"
+                self.out.write(f"          PUBLISH FAILED: {self.publish_error}\n")
         return path
 
     def once(self) -> list:
@@ -646,6 +677,14 @@ class Auditor:
         STILL sets weights every epoch — this keeps the validator's vTrust alive")."""
         if not (self.cfg.set_weights and self.set_weights_fn is not None):
             return
+        if self.publish_error:
+            # FAIL CLOSED, same direction as everything else. A validator writing weights with no
+            # published reasoning is on chain indistinguishable from a weight-copier, which is the
+            # single thing this role exists to be distinguishable from. Holding is not silence: the
+            # previously set weights persist, and the reason is on stdout every pass.
+            self.out.write(f"  HOLD  not setting weights: the verdict did not publish "
+                           f"({self.publish_error})\n")
+            return
         weights = dict(self.state.get("followed_weights") or {})
         src = self.state.get("followed_round", -1)
         if not weights:
@@ -739,6 +778,22 @@ def bittensor_weight_setter(cfg: AuditorConfig, get_chain=None):
     return setter, burn
 
 
+def verdict_head_committer(cfg: AuditorConfig, get_chain=None):
+    """Write the verdict-chain head to the AUDITOR's own on-chain commitment slot.
+
+    Without this the chain is the auditor's own computation, over the auditor's own files, checked
+    against the auditor's own index — the same self-referential loop that made the operator's first
+    anchor check worthless. One slot holds one value, which is why the chain exists: committing the
+    head commits the whole verdict history, and a deleted past verdict changes a head that block
+    history already recorded."""
+    get = get_chain or bittensor_chain(cfg)
+
+    def commit(head: str) -> None:
+        get().commit_audit_root(head)
+
+    return commit
+
+
 def preflight(cfg: AuditorConfig, out=sys.stdout) -> list:
     """Everything that can be checked before the first fetch. Returns a list of fatal reasons.
 
@@ -753,6 +808,12 @@ def preflight(cfg: AuditorConfig, out=sys.stdout) -> list:
         bad.append("--require L2 needs --observer <hf id>[,<hf id>…] (the round's observer pool)")
     if "L3" in cfg.require and not cfg.artifacts_dir:
         bad.append("--require L3 needs --artifacts <dir of checkpoints>")
+    if cfg.commit_verdict_head and not cfg.verdicts_repo:
+        bad.append("--commit-verdicts needs --verdicts-repo: anchoring a chain over verdicts "
+                   "nobody can fetch commits to nothing")
+    if cfg.verdicts_repo and not os.environ.get("HF_TOKEN"):
+        bad.append("--verdicts-repo needs HF_TOKEN (the AUDITOR's own write token) — publishing "
+                   "is what makes a verdict a product rather than a local log file")
     if cfg.set_weights:
         # WEIGHT-SETTING NEEDS THE CHAIN, and the chain needs an identity that is not the record
         # signer. Refusing here is the difference between "this cannot work" and "this silently
@@ -804,6 +865,8 @@ def main(argv: list) -> int:
         cfg.observers = tuple(x.strip() for x in obs.split(",") if x.strip())
     cfg.artifacts_dir = opt("--artifacts") or cfg.artifacts_dir
     cfg.records_repo = opt("--repo") or cfg.records_repo
+    cfg.verdicts_repo = opt("--verdicts-repo") or cfg.verdicts_repo
+    cfg.commit_verdict_head = "--commit-verdicts" in argv
     cfg.expected_signer = opt("--signer") or cfg.expected_signer
     cfg.validator_hotkey = opt("--validator-hotkey") or cfg.validator_hotkey
     cfg.wallet = opt("--wallet") or cfg.wallet
@@ -833,13 +896,28 @@ def main(argv: list) -> int:
     if not cfg.validator_hotkey:
         print("  WARN   no --validator-hotkey: the on-chain anchor cannot be read, so every "
               "verdict reads INCOMPLETE (the trail is only checkable against the operator's index)")
+    if cfg.verdicts_repo:
+        print(f"  verdicts -> {cfg.verdicts_repo}"
+              f"{'  (chain head committed on chain)' if cfg.commit_verdict_head else ''}")
+    else:
+        print("  WARN   no --verdicts-repo: rulings stay on local disk, so nobody can read them "
+              "and the verdict chain protects nothing")
     if cfg.set_weights:
         print(f"  LIVE   will set weights as {cfg.wallet}/{cfg.hotkey}; with nothing verified "
               f"yet it burns to uid {cfg.burn_uid} rather than setting nothing")
     print()
 
-    set_w, set_burn = (bittensor_weight_setter(cfg) if cfg.set_weights else (None, None))
-    a = Auditor(cfg, signer=_signer(),
+    signer = _signer()
+    get_chain = bittensor_chain(cfg) if (cfg.set_weights or cfg.commit_verdict_head) else None
+    set_w, set_burn = (bittensor_weight_setter(cfg, get_chain) if cfg.set_weights
+                       else (None, None))
+    vsink = None
+    if cfg.verdicts_repo:
+        from .publish import HFSink
+        vsink = HFSink(cfg.verdicts_repo)
+    a = Auditor(cfg, signer=signer, verdict_sink=vsink,
+                commit_head_fn=(verdict_head_committer(cfg, get_chain)
+                                if cfg.commit_verdict_head else None),
                 head_anchor_fn=(chain_head_anchor(cfg.netuid, cfg.network, cfg.validator_hotkey)
                                 if cfg.validator_hotkey else None),
                 set_weights_fn=set_w, set_burn_fn=set_burn)

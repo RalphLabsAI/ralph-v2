@@ -101,7 +101,7 @@ attributes a record and never validates it.
 ## Run it locally
 
 ```bash
-python -m tests.test_crown_path        # 55/55, CPU, no GPU needed
+python -m tests.test_crown_path        # 56/56, CPU, no GPU needed
 python -m eval.simulate_submission     # miner -> validator -> auditor in seconds
 ```
 
@@ -280,8 +280,28 @@ incumbent operator — its previous weights persist on chain — but a fresh aud
 and a validator that writes no weights contributes nothing to consensus and eventually crosses
 `activity_cutoff` into inactive while believing it is validating.
 
+### Publishing your verdicts
+
+```bash
+python -m eval.auditor --follow --require L0,L1 --signer <key> \
+    --verdicts-repo <your-hf-org>/ralph-audits --commit-verdicts
+```
+
 Verdicts chain (`prev` = the previous verdict's hash, inside the signed body) so an auditor cannot
-quietly drop the one it later regrets.
+quietly drop the one it later regrets — and `--commit-verdicts` writes the chain head to **your own**
+on-chain commitment slot, because a chain you compute over files you own, checked against an index
+you write, proves nothing. That is the same trap the operator's anchor check fell into first.
+
+Anyone can then walk your trail with `eval.verdicts.verify_verdict_trail`, and it reports
+`ok=False` when there is no on-chain head to check against rather than glossing it.
+
+Unlike a round record, **a verdict may be revised** — an auditor that could not fetch a record rules
+INCOMPLETE and must be able to rule again when the sink recovers. So a revision *appends* and both
+rulings stay readable. Changing your mind is allowed; pretending you never held the first view is not.
+
+**A failed publish stops the vote.** If a verdicts repo is configured and publishing fails, the
+auditor holds rather than setting weights — a validator writing weights with no published reasoning
+is on chain indistinguishable from the copier this whole role exists to be distinguishable from.
 
 **A missing record is not an accusation until it persists.** A deleted record and a 429 from
 HuggingFace are byte-for-byte the same observation; only recurrence distinguishes them. So an

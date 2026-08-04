@@ -329,15 +329,26 @@ def main(argv) -> int:
                          work_dir=str(outdir / "auditor"))
     # a DIFFERENT key from the validator's: an auditor signing with the operator's key would be
     # the operator agreeing with itself
+    vcommits = []
     aud = Auditor(acfg, sink=publisher.sink,
                   signer=Ed25519Signer(seed=b"auditor-demo-key-32bytes-long!!!"[:32]),
-                  head_anchor_fn=chain.head_anchor, out=sys.stdout)
+                  head_anchor_fn=chain.head_anchor, out=sys.stdout,
+                  # the auditor's OWN sink, and its OWN commitment slot -- a verdict chain the
+                  # auditor computes over files the auditor owns proves nothing on its own
+                  verdict_sink=LocalSink(str(outdir / "verdict-trail")),
+                  commit_head_fn=vcommits.append)
     for v in aud.once():
         log(f"  verdict         : {v.verdict}  (ran {'+'.join(v.levels_run)}, "
             f"required {'+'.join(v.levels_required)})")
         log(f"  would weight    : round {v.followed_round} -> {v.weights}")
         log(f"  signed by       : {v.auditor[:16]}…  verifies={v.verify_signature()}")
-    log(f"  verdicts written: {acfg.verdict_dir}")
+    from .verdicts import VerdictPublisher, verify_verdict_trail
+    vpub = VerdictPublisher(LocalSink(str(outdir / "verdict-trail")))
+    vrep = verify_verdict_trail(vpub, head_chain=vcommits[-1] if vcommits else "")
+    log(f"  verdict trail   : {outdir / 'verdict-trail'}  "
+        f"({vrep['n']} published, chain head {vrep['head_chain'][:16]}…)")
+    log(f"  trail verifies  : ok={vrep['ok']} head_checked={vrep['head_checked']} "
+        f"broken={vrep['broken']} chain_breaks={vrep['chain_breaks']}")
     log("")
     log("  This auditor needed no GPU and no corpus file — it fetched the pool the record pins")
     log("  from the trail and re-digested it against the signed manifest. That is the whole")
