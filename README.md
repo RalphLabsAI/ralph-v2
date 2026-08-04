@@ -244,11 +244,18 @@ records with; `--validator-hotkey` is the ss58 whose on-chain commitment holds t
 setting needs both, and preflight refuses to start without them rather than letting a
 misconfigured daemon look identical to a quiet subnet.
 
-**The verdict is the product, not the weight.** Yuma consensus penalises divergence from the
-stake-weighted median, so an auditor who correctly catches the operator cheating and diverges
-*on chain* pays a vtrust cost for doing its job. Enforcement through weights is backwards.
-What this publishes instead is a signed statement anyone can check — round, record digest, on-chain
-head, which levels ran, which did not, and why. Weight-setting is a separate opt-in consequence.
+**The verdict is the primary product; the weight is a paid vote.** Simulating the shipped Yuma steps
+on the two-tier layout this repo runs, an auditor with 30% stake that dissents on one disputed crown
+settles at about half its dividends (0.30 → 0.15, vtrust 1.0 → 0.5) — and drives the disputed king's
+incentive down 18%, because clipping only clips downward, so a dissenting zero survives and removes
+that stake share from the rigged king's rank. Dissent is a proportional vote at a proportional price,
+not a futile gesture.
+
+But nothing on chain distinguishes an auditor that **verified** from one that **copied**: identical
+vectors are never clipped, vtrust and bonds are maximal, and there is no copier detection anywhere in
+the pallet. Only the published verdict makes that difference visible — round, record digest, on-chain
+head, which levels ran, which did not, and why. It is free, it costs no vtrust, and anyone can check
+it. Weight-setting is a second channel with a known price, which is why it is opt-in.
 
 Four properties keep a verdict honest:
 

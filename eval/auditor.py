@@ -7,12 +7,28 @@ independent agreement while adding no safety at all, because a copier sets ident
 whether the round reproduces or not. This is the other version: verify first, and diverge when
 verification fails.
 
-THE VERDICT IS THE PRODUCT, NOT THE WEIGHT. Yuma consensus penalises divergence from the
-stake-weighted median, so an auditor who correctly catches the operator cheating and diverges
-on-chain pays a vtrust cost for doing its job. Enforcement through weights is therefore backwards.
-What an auditor produces here is a SIGNED, PUBLISHED VERDICT: "I fetched round N, its digest was
-X, I ran L0 and L1, they passed, L2 and L3 I did not run." Reputational, checkable by anyone, and
-free of the perverse incentive. Weight-setting is a separate, opt-in consequence.
+THE VERDICT IS THE PRIMARY PRODUCT; THE WEIGHT IS A PAID VOTE. An earlier version of this file
+claimed Yuma makes correct divergence pure self-harm. That is overstated, and the real numbers are
+worth stating because they set the price of dissent:
+
+  * Divergence COSTS. Simulating the shipped Yuma steps on the two-tier layout this repo actually
+    runs (`("ternary","sub4")`, half the vector each), an auditor holding 30% stake that dissents
+    on one disputed crown settles at roughly HALF its dividends (0.30 -> 0.15) and vtrust 1.0 ->
+    0.5. Not ~100% — a disputed crown is one tier, not the whole vector.
+  * Divergence WORKS. Miner incentive is `normalize(matmul(clipped_weights, active_stake))`, and
+    clipping only clips DOWNWARD, so a dissenting zero survives intact and removes the dissenter's
+    stake share from the rigged king's rank. The same simulation puts the rigged king's incentive
+    down 18% at 30% dissenting stake and 29% at 45%. A proportional vote at a proportional price.
+  * Nothing on chain detects or punishes weight COPYING — identical vectors are never clipped,
+    vtrust and bonds are maximal. The chain will not distinguish an auditor that verified from one
+    that copied. Only the published verdict can.
+
+So the verdict is still what this daemon is FOR: it is free, it costs no vtrust, anyone can check
+it, and it is the only artifact that separates verification from copying. Weight-setting is a real
+second channel with a known price, which is why it is opt-in rather than the default.
+
+A verdict is a SIGNED STATEMENT: "I fetched round N, its digest was X, I ran L0 and L1, they
+passed, L2 and L3 I did not run."
 
 FOUR PROPERTIES THAT MAKE A VERDICT WORTH ANYTHING:
 
