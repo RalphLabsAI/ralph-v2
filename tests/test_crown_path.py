@@ -2012,7 +2012,7 @@ def test_miner_submit_and_chain_adapter():
         gguf(d / "model.gguf")
         (d / "config.json").write_text('{"hidden_size":512}')
         r = subprocess.run([sys.executable, "-m", "miner.submit", "commit", "--ckpt", str(d),
-                            "--tier", "ternary-4b", "--uri", "hf://acme/demo@v1", "--dry-run"],
+                            "--tier", "sub4", "--uri", "hf://acme/demo@v1", "--dry-run"],
                            capture_output=True, text=True, cwd=str(Path(__file__).parent.parent))
         assert r.returncode == 0, r.stdout + r.stderr
 
@@ -2023,7 +2023,7 @@ def test_miner_submit_and_chain_adapter():
 
         # and the commitment must still verify against the artifact — writing state must not
         # have perturbed the hash
-        dec = intake(str(d), TierBudget(name="ternary-4b", max_params=10 ** 12,
+        dec = intake(str(d), TierBudget(name="sub4", max_params=10 ** 12,
                                         max_effective_bits=3.0),
                      revealed_hash=st["content_hash"], salt=st["salt"],
                      committed_value=st["commit_value"])
@@ -2056,7 +2056,7 @@ def test_miner_submit_and_chain_adapter():
                                                "salt": st["salt"]}})
         cs = io.read_commitments(1100, 1234)
         assert len(cs) == 1 and cs[0].hotkey == "hkA", cs
-        assert cs[0].tier == "ternary-4b" and cs[0].artifact_uri == "hf://acme/demo@v1"
+        assert cs[0].tier == "sub4" and cs[0].artifact_uri == "hf://acme/demo@v1"
         # a v1 handshake and an unknown version are SKIPPED with reasons, never guessed at
         assert len(io.skipped) == 2, io.skipped
         assert any("not JSON" in w for _, w in io.skipped)
@@ -2065,7 +2065,7 @@ def test_miner_submit_and_chain_adapter():
 
         # WRITES ARE OFF BY DEFAULT — nothing may touch a live signer by accident
         assert io.set_weights({"hkA": 1.0}) is False
-        io.set_king("ternary-4b", "hkA", "mid")
+        io.set_king("sub4", "hkA", "mid")
         # the map query degrades to the per-uid path against a stub with no `substrate`, and says
         # so in `log` rather than in `skipped` — skipped is the miner-facing column
         assert [e[0] for e in io.log if e[0] != "commitments_map"] == \
@@ -2075,7 +2075,7 @@ def test_miner_submit_and_chain_adapter():
         # second source of truth that could disagree with it is not created
         assert io.get_king("ternary-4b") is None
 
-    env = build_commitment_envelope("ternary-4b", "cv", "hf://x@1")
+    env = build_commitment_envelope("sub4", "cv", "hf://x@1")
     assert _json.loads(env)["v"] == 2 and len(env) < 300, env
 
 

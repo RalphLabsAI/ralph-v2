@@ -3,8 +3,8 @@
 Without this a miner has nowhere to put a submission: the validator reads commitments off-chain
 slots, and nothing wrote them. Two steps, in this order, and the order is the security property:
 
-    python -m miner.submit commit  --ckpt ./my-model --tier ternary-4b \\
-                                   --uri hf://acme/bonsai-0.5b@abc123 \\
+    python -m miner.submit commit  --ckpt ./my-model --tier sub4 \\
+                                   --uri hf://acme/my-compressed-qwen3@abc123 \\
                                    --wallet mykey --hotkey default
     # ... the round's nonce is drawn AFTER your commitment locks ...
     python -m miner.submit reveal  --ckpt ./my-model
@@ -59,6 +59,15 @@ def cmd_commit(a) -> int:
 
     # Run the validator's OWN inspector first. Finding out at intake that your artifact is
     # inadmissible wastes a round; finding out here costs nothing.
+    # THE TIER NAME IS CHECKED BEFORE ANYTHING ELSE. It travels to chain inside the envelope and
+    # is only validated at intake, so a typo — or the `ternary-4b` this docstring used to
+    # advertise, which was never a real tier — burned a whole round before anyone found out.
+    from eval.bitrate import TIERS
+    known = [t.name for t in TIERS]
+    if a.tier not in known:
+        print(f"REJECT: unknown tier {a.tier!r}; valid tiers are {known}")
+        return 1
+
     insp = inspect(ckpt)
     print(f"inspect: ok={insp.ok} params={insp.params:,} "
           f"effective_bits={insp.effective_bits_per_param}")
