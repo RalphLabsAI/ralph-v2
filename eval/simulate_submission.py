@@ -322,11 +322,32 @@ def main(argv) -> int:
                         make_runner=lambda mid, uri: make_runner(uri)))
     h = verify_history(publisher, head_anchor_fn=chain.head_anchor)
     log(f"  trail: {h.n_rounds} round(s), head_checked={h.head_checked}, complete={h.ok}")
+
+    hr("6. AN AUDITOR VALIDATOR RULES ON IT — and signs what it did and did not check")
+    from .auditor import Auditor, AuditorConfig
+    acfg = AuditorConfig(expected_signer=o.record.signer, require=("L0", "L1"),
+                         work_dir=str(outdir / "auditor"))
+    # a DIFFERENT key from the validator's: an auditor signing with the operator's key would be
+    # the operator agreeing with itself
+    aud = Auditor(acfg, sink=publisher.sink,
+                  signer=Ed25519Signer(seed=b"auditor-demo-key-32bytes-long!!!"[:32]),
+                  head_anchor_fn=chain.head_anchor, out=sys.stdout)
+    for v in aud.once():
+        log(f"  verdict         : {v.verdict}  (ran {'+'.join(v.levels_run)}, "
+            f"required {'+'.join(v.levels_required)})")
+        log(f"  would weight    : round {v.followed_round} -> {v.weights}")
+        log(f"  signed by       : {v.auditor[:16]}…  verifies={v.verify_signature()}")
+    log(f"  verdicts written: {acfg.verdict_dir}")
+    log("")
+    log("  This auditor needed no GPU and no corpus file — it fetched the pool the record pins")
+    log("  from the trail and re-digested it against the signed manifest. That is the whole")
+    log("  point: one scorer, many checkers, and a verdict that cannot claim more than it ran.")
     log("")
     log("  Reproduce any of this yourself:")
     log(f"    python -m eval.rerun {rec_path} --pool {pool_path} \\")
     log(f"        --observer <the observer named in the manifest> --artifacts <dir of ckpts>")
     log(f"    python -m eval.rerun --history {sink_root} --head {chain.slot[:16]}…")
+    log(f"    python -m eval.auditor --once --require L0,L1 --signer {o.record.signer[:16]}…")
     return 0 if code == 0 else 0
 
 

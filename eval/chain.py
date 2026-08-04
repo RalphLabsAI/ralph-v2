@@ -277,6 +277,14 @@ def run_v2_observer_epoch(
         signer=signer, max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens,
         noise_safety=noise_safety, canary=canary, n_items=n_items, corpus_spec=corpus_spec,
     )
+    # The pool goes up BEFORE the record. The record's manifest pins its digest, so publishing the
+    # record first would leave a window where the trail names a corpus nobody can fetch — and L1 is
+    # exactly the level that stops being runnable when that happens.
+    if publisher is not None and outcome.record is not None:
+        from .pool import dump_pool
+        want = (outcome.record.manifest or {}).get("pool_sha256") or ""
+        if want:
+            publisher.publish_pool(dump_pool(trajectory_pool), digest=want)
     return _write_back(chain, tiers, tournament, outcome, round_no,
                        publisher=publisher, require_publish=require_publish)
 

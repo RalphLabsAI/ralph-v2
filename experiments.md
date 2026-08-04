@@ -110,7 +110,7 @@ What has still not happened:
 ## To poke at it
 
 ```bash
-python -m tests.test_crown_path        # 50/50, CPU
+python -m tests.test_crown_path        # 53/53, CPU
 python -m eval.simulate_submission     # miner -> validator -> auditor, seconds
 ```
 

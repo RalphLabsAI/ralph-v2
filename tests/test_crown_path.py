@@ -3196,6 +3196,275 @@ def test_fetch_refuses_hostile_artifacts_before_downloading():
         assert log and log[-1][1] == "refused"
 
 
+def _auditor_fixture(dd):
+    """Two published rounds on a real publisher + a single-slot anchoring chain.
+
+    Shared by the auditor tests so each one can concentrate on the POLICY rather than on rebuilding
+    a trail. Returns (sink_root, chain, signer, rounds_index)."""
+    import json as _json
+    import struct
+    from dataclasses import asdict
+    from pathlib import Path
+    from eval.chain import Commitment, run_v2_observer_epoch
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.koth import Tier, Tournament
+    from eval.publish import LocalSink, RecordPublisher, anchor_of
+    from eval.shadow_axis_epoch import FakeChain
+    from eval.signing import Ed25519Signer
+    from eval.steps import Trajectory
+
+    pool = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"p{i}", step="s", index=0)
+            for i in range(200)]
+    d3 = lambda x, y, z: {"a": x, "b": y, "c": z}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            t = prefix.rstrip()[-1:]
+            return [d3(0.8, 0.1, 0.1)] * 6 if t == "X" else \
+                [d3(0.55, 0.25, 0.20)] * 6 if t == "W" else [d3(0.34, 0.33, 0.33)] * 6
+
+    class Step:
+        def __init__(self, tok):
+            self.tok = tok
+
+        def generate(self, prompts, max_new_tokens=256):
+            return [self.tok] * len(prompts)
+
+    class AnchoringChain(FakeChain):
+        def __init__(self, commits):
+            super().__init__(commits)
+            self.slot = ""
+
+        def publish_record(self, record):
+            self.slot = anchor_of(getattr(record, "prev_anchor", ""), record.sha256())
+
+        def head_anchor(self):
+            return self.slot
+
+    def ck(name, n):
+        q = Path(dd) / name
+        q.mkdir()
+        hb = _json.dumps({"w": {"dtype": "F32", "shape": [n],
+                                "data_offsets": [0, 4 * n]}}).encode()
+        (q / "model.safetensors").write_bytes(struct.pack("<Q", len(hb)) + hb + b"\0" * 4 * n)
+        (q / "config.json").write_text('{"hidden_size":8}')
+        return str(q)
+
+    weak, strong = ck("weak", 4), ck("strong", 6)
+    runners = {weak: Step("W"), strong: Step("X")}
+    tiers = [Tier("t", 10 ** 12, 1.0)]
+    bud = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
+    sig = Ed25519Signer(seed=b"z" * 32)
+    root = str(Path(dd) / "sink")
+    pubr = RecordPublisher(LocalSink(root), window=8, state_path=str(Path(dd) / "hwm.json"))
+    chain = AnchoringChain([])
+    tour, led, reg = Tournament(tiers, margin=0.03), RegistrationLedger(), {}
+
+    for rnd, cd in ((1, weak), (2, strong)):
+        hh, ss = content_hash(cd), f"s{rnd}"
+        chain._commits = [Commitment(f"hot{rnd}", f"cold{rnd}", "t", cd, 1.0, revealed_hash=hh,
+                                     salt=ss, committed_value=commit_value(hh, ss),
+                                     artifact_uri=f"file://{cd}")]
+        run_v2_observer_epoch(chain, rnd, pool, Step("X"), {"kimi": Obs(), "qwen": Obs()},
+                              tiers, bud, tour, led, reg,
+                              make_safe_runner=lambda c: runners[c], signer=sig, n_items=20,
+                              corpus_spec="glaive_r1@rev=abc|order=stream", publisher=pubr)
+    idx = _json.loads(LocalSink(root).get("index.json").decode())
+    return root, chain, sig, idx
+
+
+def test_auditor_verifies_then_diverges():
+    """THE POINT OF AN AUDITOR. "Other validators set weights aligned with the owner validator" is
+    one word away from weight-copying with extra steps: a copier sets identical weights whether the
+    round reproduces or not, so it adds no safety while manufacturing the APPEARANCE of independent
+    agreement. This is the other version — verify first, and when verification fails, weight the
+    last round that actually checked out.
+
+    The adversary here is the operator, holding every key: the rigged round is re-signed, its index
+    entry is rewritten to match, and the on-chain anchor is committed over the rigged bytes. Every
+    signature and every hash is self-consistent. Only recomputing the score catches it."""
+    import io
+    import json as _json
+    import tempfile
+    from dataclasses import asdict
+    from pathlib import Path
+    from eval.auditor import ACCEPT, REJECT, Auditor, AuditorConfig
+    from eval.publish import INDEX, LocalSink, anchor_of, record_name
+    from eval.rerun import record_from_blob
+    from eval.signing import Ed25519Signer
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        sink = LocalSink(root)
+        pinned = sig.public_id()
+
+        def make(work, **kw):
+            cfg = AuditorConfig(expected_signer=pinned, require=("L0", "L1"),
+                                work_dir=str(Path(dd) / work), **kw)
+            return Auditor(cfg, sink=sink, signer=Ed25519Signer(seed=b"a" * 32),
+                           head_anchor_fn=lambda: chain.head_anchor(), out=io.StringIO())
+
+        # ---- 1. HONEST TRAIL: both rounds accepted, and the auditor follows each one's weights.
+        a = make("audit-honest")
+        vs = a.once()
+        assert [v.round for v in vs] == [1, 2], [v.round for v in vs]
+        assert all(v.verdict == ACCEPT for v in vs), [(v.round, v.verdict, v.failed) for v in vs]
+        # L1 ran WITHOUT the operator handing over a corpus file: the pool the record pins was
+        # fetched from the trail and re-digested against the signed manifest.
+        assert vs[0].levels_run == ["L0", "L1"], vs[0].levels_run
+        assert vs[1].followed_round == 2 and vs[1].weights, vs[1].weights
+        round1_weights = dict(vs[0].weights)
+        round2_weights = dict(vs[1].weights)
+        assert round1_weights != round2_weights, "fixture must dethrone, or the test proves nothing"
+
+        # verdicts are signed, and chained so one cannot be quietly dropped later
+        assert vs[0].verify_signature() and vs[1].verify_signature()
+        assert vs[1].prev == vs[0].sha256(), "verdicts must chain"
+        vs[1].round = 99
+        assert not vs[1].verify_signature(), "a tampered verdict must stop verifying"
+
+        # ---- 2. RIG ROUND 2 THE WAY AN OPERATOR ACTUALLY COULD: inflate the headline score over
+        #         honest per-sample measurements, re-sign, rewrite the index entry, and commit the
+        #         new anchor. Nothing is inconsistent; the arithmetic is simply wrong.
+        e2 = [r for r in idx["rounds"] if r["round"] == 2][0]
+        raw = _json.loads(sink.get(e2["name"]).decode())
+        raw["submissions"][0]["retention"] = 0.99
+        raw["submissions"][0]["retention_lb"] = 0.99
+        rec2 = record_from_blob(_json.dumps(raw).encode())
+        rec2.signature = rec2.signer = rec2.sig_scheme = ""
+        rec2.sign(sig)
+        digest = rec2.sha256()
+        name = record_name(2, digest)
+        sink.put(name, _json.dumps(asdict(rec2), sort_keys=True, separators=(",", ":")).encode())
+        e2.update(sha256=digest, name=name, signature=rec2.signature,
+                  anchor=anchor_of(e2["prev_anchor"], digest))
+        sink.put(INDEX, _json.dumps(idx, sort_keys=True, indent=1).encode())
+        chain.slot = e2["anchor"]
+
+        b = make("audit-rigged")
+        vs = b.once()
+        assert vs[0].verdict == ACCEPT and vs[1].verdict == REJECT, \
+            [(v.round, v.verdict) for v in vs]
+        assert any("recompute score" in name for _, name, _ in vs[1].failed), vs[1].failed
+        # the signature still verifies — which is exactly why signature-checking is not auditing
+        assert not any("signature" in name for _, name, _ in vs[1].failed), vs[1].failed
+
+        # HOLD, NOT HALT, and NOT COPY. The rejected crown is not paid; the last round this
+        # auditor actually verified keeps earning.
+        assert vs[1].followed_round == 1, vs[1].followed_round
+        assert vs[1].weights == round1_weights, (vs[1].weights, round1_weights)
+        assert vs[1].weights != round2_weights, "an auditor that pays the disputed crown is a copier"
+
+        # ---- 3. A BROKEN TRAIL REJECTS EVEN A ROUND THAT REPRODUCES. Deleting a published record
+        #         is the cheapest tamper there is, and per-record checks cannot see it: there is no
+        #         record left to check.
+        Path(root, [r for r in idx["rounds"] if r["round"] == 1][0]["name"]).unlink()
+        c = make("audit-gap")
+        vs = c.once()
+        assert all(v.verdict == REJECT for v in vs), [(v.round, v.verdict, v.trail) for v in vs]
+        assert vs[-1].trail == "TRAIL BROKEN", vs[-1].trail
+
+
+def test_auditor_verdict_states_what_it_did_not_check():
+    """A verdict is worth something only if it cannot claim more than it did.
+
+    Three ways an auditor could quietly overstate itself, each of which has to be visible in the
+    signed body: running only the free level and calling it verified; requiring a level whose
+    inputs it does not have and passing anyway; and — the one `rerun` structurally cannot catch —
+    verifying a validly signed record without knowing WHOSE signature it should be."""
+    import io
+    import tempfile
+    from pathlib import Path
+    from eval.auditor import ACCEPT, INCOMPLETE, REJECT, Auditor, AuditorConfig
+    from eval.publish import LocalSink
+    from eval.signing import Ed25519Signer
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, _ = _auditor_fixture(dd)
+        sink = LocalSink(root)
+
+        def run(work, **kw):
+            cfg = AuditorConfig(work_dir=str(Path(dd) / work), **kw)
+            a = Auditor(cfg, sink=sink, signer=Ed25519Signer(seed=b"a" * 32),
+                        head_anchor_fn=lambda: chain.head_anchor(), out=io.StringIO())
+            return a.once()
+
+        # ---- the CHEAP auditor is legitimate, and says so. L0 needs no corpus and no GPU; it
+        #      catches a fabricated aggregate over honest measurements, which is the fraud a lone
+        #      operator is most able to commit. What it must not do is imply it ran more.
+        vs = run("cheap", expected_signer=sig.public_id(), require=("L0",), pool_from_trail=False)
+        assert all(v.verdict == ACCEPT for v in vs), [(v.round, v.failed) for v in vs]
+        assert vs[0].levels_run == ["L0"], vs[0].levels_run
+        assert vs[0].level_status["L1"] == "SKIP" and vs[0].level_status["L2"] == "SKIP"
+
+        # ---- claiming a level you cannot run is INCOMPLETE, never ACCEPT — and INCOMPLETE does
+        #      not advance what the auditor is willing to pay. "Follow what you did not check" is
+        #      the copier again, so it is opt-in (`on_incomplete="follow"`) rather than the default.
+        vs = run("strict", expected_signer=sig.public_id(), require=("L0", "L1", "L2"),
+                 pool_from_trail=False)
+        assert all(v.verdict == INCOMPLETE for v in vs), [(v.round, v.verdict) for v in vs]
+        assert all(v.followed_round == -1 and not v.weights for v in vs)
+        assert any("L2" in (v.note or "") for v in vs), [v.note for v in vs]
+
+        # ---- AN UNPINNED SIGNER IS NOT A PASS. rerun can prove a signature is valid; it has no
+        #      way to know whose it should be, so an auditor following a repo without pinning the
+        #      validator is verifying whatever the repo holder signs.
+        vs = run("unpinned", expected_signer="", require=("L0",), pool_from_trail=False)
+        assert all(v.verdict == INCOMPLETE for v in vs), [(v.round, v.verdict) for v in vs]
+        assert any("expected validator" in n for _, n, _ in vs[0].skipped), vs[0].skipped
+
+        # ---- and a record signed by SOMEONE ELSE is a rejection, not a shrug. This is the key
+        #      rotation / wrong-trail case, and it is the difference between auditing the subnet's
+        #      validator and auditing a HuggingFace repo.
+        vs = run("wrongkey", expected_signer=Ed25519Signer(seed=b"q" * 32).public_id(),
+                 require=("L0",), pool_from_trail=False)
+        assert all(v.verdict == REJECT for v in vs), [(v.round, v.verdict) for v in vs]
+
+
+def test_auditor_treats_silence_as_a_finding():
+    """v1's failure was not a wrong number. The validator stopped publishing on 7 July and kept
+    setting weights; king.json went stale, events.json was never published at all, and nothing
+    alarmed for four days. An auditor that only ever reacts to NEW records is blind to exactly
+    that, because the symptom is the absence of one."""
+    import io
+    import tempfile
+    from pathlib import Path
+    from eval.auditor import ACCEPT, STALE, Auditor, AuditorConfig
+    from eval.publish import LocalSink
+    from eval.signing import Ed25519Signer
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, _ = _auditor_fixture(dd)
+        clock = [1000.0]
+        cfg = AuditorConfig(expected_signer=sig.public_id(), require=("L0",),
+                            pool_from_trail=False, stale_after_s=3600.0,
+                            work_dir=str(Path(dd) / "audit"))
+        a = Auditor(cfg, sink=LocalSink(root), signer=Ed25519Signer(seed=b"a" * 32),
+                    head_anchor_fn=lambda: chain.head_anchor(), out=io.StringIO(),
+                    now_fn=lambda: clock[0])
+
+        assert all(v.verdict == ACCEPT for v in a.once())
+        clock[0] += 1800.0                      # half an hour later: quiet, but not yet late
+        assert a.once() == []
+        clock[0] += 7200.0                      # now the trail has been silent past the threshold
+        vs = a.once()
+        assert len(vs) == 1 and vs[0].verdict == STALE, [(v.round, v.verdict) for v in vs]
+        assert "emission continues" in vs[0].note
+        # one verdict per stale EPISODE, not one per pass — an alarm that repeats every interval
+        # is an alarm operators filter, and the condition is already on the record
+        clock[0] += 7200.0
+        assert a.once() == [], "staleness must not re-alarm every pass"
+        # a stale verdict still carries the weights it last verified — the finding is that the
+        # trail went quiet, not that the last good crown became invalid
+        assert vs[0].followed_round == 2 and vs[0].weights
+        assert vs[0].verify_signature()
+
+
 def main() -> int:
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
@@ -3223,7 +3492,10 @@ def main() -> int:
              test_pool_is_language_balanced_or_the_round_refuses,
              test_density_and_model_card_are_derived_not_asserted,
              test_fetch_refuses_hostile_artifacts_before_downloading,
-             test_saturation_guard_retires_flat_axes]
+             test_saturation_guard_retires_flat_axes,
+             test_auditor_verifies_then_diverges,
+             test_auditor_verdict_states_what_it_did_not_check,
+             test_auditor_treats_silence_as_a_finding]
     failed = 0
     for t in tests:
         try:

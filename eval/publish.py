@@ -129,6 +129,38 @@ class HFSink:
             return None
 
 
+class HFReadSink:
+    """The same repo, fetch-only — what an AUDITOR uses.
+
+    HFSink refuses to construct without a write token, deliberately: a publisher that cannot write
+    should fail at startup rather than after a round is scored. But an auditor is a third party.
+    Requiring a token to READ a public trail would mean the only people who can check the operator
+    are people the operator gave credentials to, which is the opposite of the point.
+
+    `put` raises rather than silently doing nothing, so this can never be handed to a publisher by
+    mistake and have the writes disappear."""
+
+    def __init__(self, repo_id: str, revision: str = "main", token: str = ""):
+        self.repo_id, self.revision = repo_id, revision
+        # A token is OPTIONAL here and only exists so the trail can be audited before launch while
+        # the repo is still private. Public repos need nothing.
+        self._token = token or os.environ.get("HF_TOKEN") or ""
+
+    def put(self, name: str, blob: bytes) -> str:
+        raise PublishError(f"HFReadSink is fetch-only; refusing to write {name}")
+
+    def get(self, name: str) -> bytes | None:
+        from huggingface_hub import hf_hub_download
+        try:
+            p = hf_hub_download(self.repo_id, name, repo_type="dataset",
+                                token=self._token or None, revision=self.revision,
+                                force_download=True)
+            with open(p, "rb") as fh:
+                return fh.read()
+        except Exception:
+            return None
+
+
 INDEX = "index.json"
 
 
@@ -144,6 +176,49 @@ def anchor_of(prev_anchor: str, record_digest: str) -> str:
     changes the recomputed head, which the operator cannot retroactively fix because the old
     commitment is in block history."""
     return hashlib.sha256(f"{prev_anchor}|{record_digest}".encode()).hexdigest()
+
+
+def roundtrip_reason(blob: bytes, digest: str, expect_round: int | None = None,
+                     expect_signature: str = "") -> tuple[bool, str]:
+    """Are these bytes the record the index says they are? Digest + round number + signature.
+
+    Checking only the digest let one round's blob be aliased into another round's index slot: the
+    entry says round 7, the bytes are round 3's record, the recorded sha matches those bytes, and
+    every check passed while round 7 was erased. And because canonical() excludes the signature
+    fields, a published record could be re-signed by any key (or stripped of attribution) with both
+    the digest and the anchor still matching — so the signature is pinned in the index too.
+
+    NOTE THAT THE DIGEST IS OVER canonical(), NOT over the stored bytes: two different serialisations
+    of the same record are the same record. Anything comparing `sha256(blob)` to this value is
+    asking a different question and will reject honest records.
+
+    Returns a reason as well as a verdict, because an AUDITOR publishes this and "it did not match"
+    is not something a reader can act on."""
+    from .round_record import RoundRecord, SubmissionRecord
+    try:
+        raw = json.loads(blob.decode())
+        subs = [SubmissionRecord(**s) for s in raw.pop("submissions", [])]
+        rec = RoundRecord(**{**raw, "submissions": subs})
+    except Exception as e:
+        return False, f"served bytes do not parse as a round record: {type(e).__name__}"
+    if rec.sha256() != digest:
+        return False, (f"record digests to {rec.sha256()[:16]}… but the index claims "
+                       f"{(digest or '(none)')[:16]}… — the bytes are not the ones indexed")
+    if expect_round is not None and rec.round != expect_round:
+        return False, (f"bytes are round {rec.round} but they are indexed as round "
+                       f"{expect_round} — one round's record aliased into another's slot")
+    if expect_signature and rec.signature != expect_signature:
+        return False, ("record has been re-signed since it was indexed; canonical() excludes the "
+                       "signature, so the digest and the anchor both still match")
+    if rec.signature and not rec.verify_signature():
+        return False, "record signature does not verify over its own body"
+    return True, ""
+
+
+def pool_name(digest: str) -> str:
+    """Content-addressed, so republishing the same pool is a no-op and two different pools can
+    never collide at one path."""
+    return f"pool/{digest}.jsonl"
 
 
 def record_name(round_no: int, digest: str) -> str:
@@ -240,6 +315,15 @@ class RecordPublisher:
             os.fsync(fh.fileno())
         os.replace(tmp, self.state_path)
 
+    def note_seen(self, n_rounds: int) -> None:
+        """Advance the never-shrink mark from a READ instead of a write.
+
+        An auditor uses this class to walk the trail and never calls `publish`, so its high-water
+        mark would stay at 0 forever and the shrink guard it inherits would be inert — the operator
+        could serve a truncated index to an auditor that had already seen the full one, and nothing
+        would notice. The auditor calls this after each successful pass."""
+        self._save_hwm(int(n_rounds))
+
     # ---- index -------------------------------------------------------------
 
     def load_index(self) -> dict:
@@ -295,6 +379,28 @@ class RecordPublisher:
         rounds = self.load_index().get("rounds", [])
         return rounds[-1].get("anchor", "") if rounds else ""
 
+    def publish_pool(self, blob: bytes, digest: str = "") -> str:
+        """Put the corpus where an auditor can fetch it, once per distinct pool.
+
+        Without this, L1 is unrunnable by anyone but the operator: the record stores integer
+        indices, and an index means nothing without the ordering it points into. The name is the
+        digest, so an existing identical pool is simply re-verified rather than rewritten — and a
+        pool that reads back wrong is an error here rather than a mystery at audit time."""
+        want = digest or hashlib.sha256(blob).hexdigest()
+        if hashlib.sha256(blob).hexdigest() != want:
+            raise PublishError("pool digest does not match the bytes handed to publish_pool")
+        name = pool_name(want)
+        back = self.sink.get(name)
+        if back is not None:
+            if hashlib.sha256(back).hexdigest() != want:
+                raise PublishError(f"{name} is already present with different content")
+            return name
+        self.sink.put(name, blob)
+        back = self.sink.get(name)
+        if back is None or hashlib.sha256(back).hexdigest() != want:
+            raise PublishError(f"published {name} but it does not read back intact")
+        return name
+
     def publish(self, record) -> Published:
         digest = record.sha256()
         idx0 = self.load_index()
@@ -342,28 +448,7 @@ class RecordPublisher:
     @staticmethod
     def _roundtrip_ok(blob: bytes, digest: str, expect_round: int | None = None,
                       expect_signature: str = "") -> bool:
-        """Digest + signature + ROUND NUMBER + signature bytes.
-
-        Checking only the digest let one round's blob be aliased into another round's index slot:
-        the entry says round 7, the bytes are round 3's record, the recorded sha matches those
-        bytes, and every check passed while round 7 was erased. And because canonical() excludes
-        the signature fields, a published record could be re-signed by any key (or stripped of
-        attribution) with both the digest and the anchor still matching — so the signature is
-        pinned in the index too."""
-        from .round_record import RoundRecord, SubmissionRecord
-        try:
-            raw = json.loads(blob.decode())
-            subs = [SubmissionRecord(**s) for s in raw.pop("submissions", [])]
-            rec = RoundRecord(**{**raw, "submissions": subs})
-        except Exception:
-            return False
-        if rec.sha256() != digest:
-            return False
-        if expect_round is not None and rec.round != expect_round:
-            return False
-        if expect_signature and rec.signature != expect_signature:
-            return False
-        return rec.verify_signature() if rec.signature else True
+        return roundtrip_reason(blob, digest, expect_round, expect_signature)[0]
 
     # ---- heartbeat ---------------------------------------------------------
 

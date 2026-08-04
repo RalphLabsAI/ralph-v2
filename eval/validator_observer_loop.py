@@ -38,6 +38,16 @@ def _sha(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()
 
 
+def _pool_sha(trajectory_pool) -> str:
+    """Best-effort: a pool of plain Trajectory objects digests; anything else records "" rather
+    than raising, because a round must not die over an audit convenience."""
+    try:
+        from .pool import pool_digest
+        return pool_digest(trajectory_pool)
+    except Exception:
+        return ""
+
+
 def _freeze(runner, usable, max_step_tokens: int) -> list:
     """Re-emit this model's steps as literal text for the record, so an audit is a pure forward
     pass over recorded strings instead of a reproduction of batched greedy generation — the
@@ -339,6 +349,10 @@ def run_observer_round(
            for s in usable]
     manifest = {
         "corpus_spec": corpus_spec,
+        # The pool's digest lives in the SIGNED body. corpus_spec names the sources; this pins the
+        # exact bytes, so an operator cannot score against one pool and hand an auditor another in
+        # which the drawn indices happen to land on easier items.
+        "pool_sha256": _pool_sha(trajectory_pool),
         "item_indices": list(out.item_indices),
         "n_items_requested": n_items,
         "observer": obs_name,

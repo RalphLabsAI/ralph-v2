@@ -104,12 +104,18 @@ class Audit:
         return {0: "REPRODUCED", 1: "DIVERGED", 2: "INCOMPLETE"}[self.exit_code]
 
 
-def load_record(path: str):
+def record_from_blob(blob: bytes):
+    """Bytes -> RoundRecord. The auditor daemon fetches records from a sink and never touches the
+    filesystem, so parsing lives here rather than inside the file loader."""
     from .round_record import RoundRecord, SubmissionRecord
-    raw = json.loads(open(path).read())
+    raw = json.loads(blob.decode() if isinstance(blob, bytes) else blob)
     subs = [SubmissionRecord(**s) for s in raw.pop("submissions", [])]
-    rec = RoundRecord(**{**raw, "submissions": subs})
-    return rec
+    return RoundRecord(**{**raw, "submissions": subs})
+
+
+def load_record(path: str):
+    with open(path, "rb") as fh:
+        return record_from_blob(fh.read())
 
 
 # ---------------------------------------------------------------- L0: arithmetic
@@ -517,24 +523,43 @@ def audit_provenance(rec, items, make_runner, a: Audit, max_items: int = 0) -> N
 
 # ---------------------------------------------------------------- driver
 
-def audit(record_path: str, pool_path: str = "", observer=None, observer_name: str = "",
-          make_runner=None, max_l3_items: int = 0) -> Audit:
+def audit_loaded(rec, pool=None, observer=None, observer_name: str = "",
+                 make_runner=None, max_l3_items: int = 0) -> Audit:
+    """The audit itself, over an already-parsed record and an already-loaded pool.
+
+    Split out from `audit` so a long-running auditor can hold ONE pool in memory across hundreds of
+    rounds instead of re-reading and re-parsing a corpus file per round — and so a record fetched
+    from a sink never has to be written to disk just to be checked."""
     a = Audit()
-    rec = load_record(record_path)
     audit_arithmetic(rec, a)
 
     items = []
-    if not pool_path:
+    if pool is None:
         a.add("L1", "item selection derives from the nonce", SKIP, "no --pool given")
         a.add("L1", "recorded prefixes match the pinned corpus", SKIP, "no --pool given")
     else:
-        pool = load_pool(pool_path)
         spec = (rec.manifest or {}).get("corpus_spec") or ""
         # Checked BEFORE the indices: an index into the wrong ordering would compare two unrelated
         # things and could pass or fail for no reason connected to the round.
         a.ok("L1", "corpus spec pinned", bool(spec),
              fail="record does not pin the pool's ordering — indices are unanchored",
              info=spec)
+        # THE POOL IS PART OF THE EXAM. corpus_spec names sources and revisions in prose; it does
+        # not bind bytes, so an auditor handed "a pool matching the spec" was checking indices
+        # against an ordering the record never committed to. The digest is inside the signed body,
+        # so this is the check that makes L1 about the round rather than about some pool.
+        want_pool = (rec.manifest or {}).get("pool_sha256") or ""
+        if want_pool:
+            from .pool import pool_digest
+            got_pool = pool_digest(pool)
+            a.ok("L1", "pool matches the one the record signed", got_pool == want_pool,
+                 fail=f"loaded pool digests to {got_pool[:16]}… but the record pins "
+                      f"{want_pool[:16]}… — this is a different corpus, so every index below "
+                      f"points somewhere else",
+                 info=f"{len(pool)} trajectories, sha256 {got_pool[:16]}…")
+        else:
+            a.add("L1", "pool matches the one the record signed", SKIP,
+                  "record pins no pool_sha256, so the corpus is named but not bound")
         items = audit_selection(rec, pool, a)
 
     if observer is None:
@@ -554,6 +579,14 @@ def audit(record_path: str, pool_path: str = "", observer=None, observer_name: s
     else:
         audit_provenance(rec, items, make_runner, a, max_items=max_l3_items)
     return a
+
+
+def audit(record_path: str, pool_path: str = "", observer=None, observer_name: str = "",
+          make_runner=None, max_l3_items: int = 0) -> Audit:
+    return audit_loaded(load_record(record_path),
+                        pool=load_pool(pool_path) if pool_path else None,
+                        observer=observer, observer_name=observer_name,
+                        make_runner=make_runner, max_l3_items=max_l3_items)
 
 
 def report(a: Audit, out=sys.stdout) -> int:

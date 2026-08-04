@@ -87,6 +87,7 @@ python -m eval.rerun <record.json>                                    # arithmet
 python -m eval.rerun <record.json> --pool <items.jsonl> \
     --observer <hf-id> --artifacts <ckpt-dir>                         # full re-derivation
 python -m eval.rerun --history <dir> --head <on-chain anchor>         # is the trail complete?
+python -m eval.auditor --follow --require L0,L1 --signer <key>        # ... as a standing role
 ```
 
 Exit `0` reproduced · `1` diverged · `2` incomplete. Skipping the expensive levels exits 2, never
@@ -100,7 +101,7 @@ attributes a record and never validates it.
 ## Run it locally
 
 ```bash
-python -m tests.test_crown_path        # 49/49, CPU, no GPU needed
+python -m tests.test_crown_path        # 53/53, CPU, no GPU needed
 python -m eval.simulate_submission     # miner -> validator -> auditor in seconds
 ```
 
@@ -210,6 +211,50 @@ last verifiably published crown keeps earning until publishing is fixed. An oper
 publishing while their own model is king benefits from the freeze. That residual is why the gate
 re-verifies a *window* of past rounds every round rather than only the current one.
 
+### Running as an auditor validator
+
+One GPU scorer, many CPU checkers. `eval.auditor` is the daemon for the second role: it follows the
+published trail, re-runs each new round, and writes a **signed verdict**.
+
+```bash
+python -m eval.auditor --once  --require L0     --signer <validator record key>   # free, no models
+python -m eval.auditor --follow --require L0,L1 --signer <key> --interval 600     # + the exam
+python -m eval.auditor --follow --require L0,L1,L2 --signer <key> \
+    --observer HuggingFaceTB/SmolLM2-1.7B-Instruct                                # + the grades
+python -m eval.auditor --once --require L0,L1 --signer <key> --set-weights        # act on it
+```
+
+L1 needs no corpus file: the record pins the pool's digest inside its signed body, so the auditor
+fetches the pool from the trail and re-digests it. L2 needs a 3.4 GB observer — a laptop, not a
+datacentre.
+
+**The verdict is the product, not the weight.** Yuma consensus penalises divergence from the
+stake-weighted median, so an auditor who correctly catches the operator cheating and diverges
+*on chain* pays a vtrust cost for doing its job. Enforcement through weights is backwards.
+What this publishes instead is a signed statement anyone can check — round, record digest, on-chain
+head, which levels ran, which did not, and why. Weight-setting is a separate opt-in consequence.
+
+Four properties keep a verdict honest:
+
+* **It says what it did not do.** `levels_run` and `levels_required` are inside the signed body, so
+  an auditor that ran only the free arithmetic cannot be mistaken for one that reloaded checkpoints.
+* **Any failure is a failure.** A FAIL at a level the auditor did not declare as required still
+  rejects the round. `required` only decides whether a *skip* makes the verdict INCOMPLETE.
+* **The signer is pinned.** `eval.rerun` can prove a signature is valid; it cannot know whose it
+  should be. Without `--signer`, the verdict says the record is internally consistent — **not** that
+  the subnet's validator wrote it — and reads INCOMPLETE.
+* **Silence is a finding.** A trail with no new round past the threshold emits a `STALE` verdict.
+  v1's validator stopped publishing on 7 July 2026 and kept setting weights; nothing alarmed for
+  four days.
+
+On a rejected round the auditor **holds** — it weights the last round it actually verified, the same
+direction the operator's own publish gate fails. An auditor that pays the disputed crown anyway is a
+weight-copier, which manufactures the appearance of independent agreement while adding no safety.
+That is the distinction the whole role turns on, and it is what the tests assert.
+
+Verdicts chain (`prev` = the previous verdict's hash, inside the signed body) so an auditor cannot
+quietly drop the one it later regrets.
+
 ## Anti-gaming — economics, not detection
 
 The last team proved you **cannot detect** copying on a shared base. v2 makes gaming
@@ -233,12 +278,10 @@ The last team proved you **cannot detect** copying on a shared base. v2 makes ga
 
 ## Not yet done — read this before running it anywhere real
 
-The mechanism is complete and tested end to end against a fake chain. What has **not** happened:
+The mechanism is complete, has been run against real models on real GPUs
+([`experiments.md`](experiments.md)), and has published a real round record. What has **not**
+happened:
 
-- **No run with real models, ever.** Every number in this repo comes from stubs or from real
-  *data*; parent + observer + a genuinely quantized student on a GPU has never been executed
-  once. Four of the last five real bugs here only appeared against real inputs, so expect that
-  first run to surface more.
 - **Determinism is a property of the BOX, and two of the three knobs are now pinned in the
   record.** Measured on H100 PCIe / A100 SXM4 / L40S with byte-identical items: within a fixed
   configuration a round is bit-exact (0.0 spread, byte-identical generations), but the H100
@@ -246,34 +289,28 @@ The mechanism is complete and tested end to end against a fake chain. What has *
   implementation was pinned. Across GPUs the boxes still generate different step text, so a score
   is only meaningful against a recorded (gpu, batch_size, attn_implementation) — all three now
   live in the signed manifest, and the audit reports a mismatch as hardware rather than fraud.
-- **The noise floor is still unmeasured in the old KL sense, and it sets the audit tolerance.**
-  `eval/determinism.py` gates crowns on it and the record derives `reproduction_tolerance` from
-  it, so the same unmeasured number decides both whether a crown is real and whether a re-run
-  counts as reproducing. Worse, it is currently probed only on the single-sequence
-  `distributions` path — never over a whole round, and never across two GPU models — so the 0.0
-  it reports under stubs is an artefact, not a result. SN97 measured 2-5 percentage points of run-to-run variance on
-  logit-derived metrics; if ours lands there, the crown may be unable to resolve honest
-  differences and the aggregation needs retuning. **This single number decides whether the
-  mechanism works.**
+- **The score saturates at the bottom.** Perturbing every weight and sweeping the magnitude, the
+  score falls monotonically to σ=0.05 and then flattens around 0.43–0.57 — it never reaches the
+  0.135 inert floor, because a wrecked model still emits *something* and something still moves the
+  observer. So the metric cannot tell a broken model from a very broken one. Two things stop that
+  deciding a crown: the tail wobble (0.036–0.048) is below the dethrone margin, and a real 4-bit
+  beats the luckiest wrecked model by 0.066–0.083, above it. Crowns are contested at the top and
+  the top is clean, but this is the closest thing here to scoring well while being useless, and it
+  is why the capability canary stays.
 - **The anchor chain has never been committed by a real chain.** `A_n = H(A_{n-1} ‖ digest)` makes
   one commitment slot cover the whole history, and `BittensorChainIO` computes and reads it — but
-  against FakeChain only. Until a real `commit_audit_root` call lands, the strongest guarantee here
+  no `commit_audit_root` call has landed on mainnet. Until one does, the strongest guarantee here
   is untested on the network it is for.
-- **No round record has ever been published to a real sink.** The publisher, its fail-closed
-  gate and the re-run tool are tested end to end against a local directory and a fake chain;
-  `HFSink` has never uploaded anything. Until it has, "anyone can re-run a crown" is a property of
-  the code and not yet a fact about the network.
-- **`verify_history` is not run automatically.** Every round re-checks a trailing window; nothing
-  walks the full trail on a schedule, so a gap or a deletion outside the window waits for a human
-  to look.
-- **No miner has ever submitted anything.** The end-to-end submission flow is untested by a
-  third party, and `fetch_dir_for` is unwired — the validator cannot yet resolve a committed URI
-  to bytes at all.
+- **No miner has ever submitted anything.** The path is wired end to end — including the fetcher,
+  which was the piece that made a submission impossible to score at all — but no third party has
+  used it, and no auditor other than the operator's own has ever ruled on a round.
+- **Weights have never been set by this validator.** It runs read-only by default and will keep
+  doing so until there is something worth crowning; a second signer on a live hotkey fights the
+  first.
 - **Non-Latin coverage is Hindi and Chinese.** That is where the anti-clone axis binds today; the
   published evidence for low-bit collapse is Persian and Cyrillic, so the pool does not yet test
   where the proof is.
-- **Chain integration is FakeChain only**, and the validator box needs `bubblewrap` for the
-  sandboxed code canary.
+- **The validator box needs `bubblewrap`** for the sandboxed code canary.
 - **`eval/budget.py`** (score-at-budget / convergence gate) is written and tested but not wired
   into the crown path.
 

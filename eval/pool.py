@@ -70,6 +70,35 @@ class PoolSpec:
         return f"{parts}@rev={self.revision}|dedup={self.dedup}|langs={langs}|n={self.n}"
 
 
+POOL_FIELDS = ("id", "source", "prefix", "step", "index", "meta")
+
+
+def dump_pool(trajectories) -> bytes:
+    """The pool as the JSONL an auditor loads, in the pool's own order.
+
+    L1 asks whether the operator chose the exam. Answering it requires the POOL the indices point
+    into — and until this existed the pool was built in memory, used, and thrown away, so no third
+    party could run L1 at all no matter how much they wanted to. `corpus_spec` names the sources
+    and revisions, which lets a determined auditor rebuild an equivalent pool; this lets an
+    ordinary one just fetch it.
+
+    Order is the identity and must never be sorted: the record stores integer indices."""
+    import json
+    from dataclasses import asdict
+    out = []
+    for t in trajectories:
+        row = {k: v for k, v in asdict(t).items() if k in POOL_FIELDS}
+        out.append(json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    return ("\n".join(out) + "\n").encode()
+
+
+def pool_digest(trajectories) -> str:
+    """sha256 of `dump_pool`. Goes in the manifest, so it is inside the SIGNED body — which is what
+    stops the operator serving one pool to the round and a friendlier one to the auditor."""
+    import hashlib
+    return hashlib.sha256(dump_pool(trajectories)).hexdigest()
+
+
 def language_balance(trajectories) -> dict:
     """Count trajectories per language slice, using the same derivation the scorer uses."""
     from .observer_round import _lang_of

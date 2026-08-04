@@ -154,7 +154,14 @@ class BittensorChainIO:
 
     def head_anchor(self) -> str:
         """The anchor currently committed on chain. Read from the chain when we can, so an auditor
-        and the gate are both looking at the same authority rather than at our own memory."""
+        and the gate are both looking at the same authority rather than at our own memory.
+
+        THE FALLBACK IS NOT A CHECK. `_head` is what WE last committed, so returning it makes
+        publish_and_gate compare the operator's bytes against the operator's memory — the exact
+        self-referential comparison the anchor exists to escape. v1's `BittensorChain` exposes
+        neither `get_audit_root` nor `get_commitment`, so before the subtensor path below every
+        production round took the fallback silently. The read is now attempted directly against
+        `subtensor.get_commitment`, the same call the handshake verifier uses."""
         get = getattr(self.inner, "get_audit_root", None) or \
             getattr(self.inner, "get_commitment", None)
         if get is not None:
@@ -164,7 +171,25 @@ class BittensorChainIO:
                     return str(v)
             except Exception:
                 pass
-        return self._head
+        v = self._read_commitment()
+        return v if v else self._head
+
+    def _read_commitment(self) -> str:
+        """`subtensor.get_commitment(netuid, uid)` for our own hotkey. Best-effort by design: a
+        chain read that fails must not take a round down, and the caller treats an empty head as
+        'not verified' rather than as 'verified against nothing'."""
+        try:
+            st = getattr(self.inner, "subtensor", None)
+            wallet = getattr(self.inner, "wallet", None)
+            if st is None or wallet is None:
+                return ""
+            me = wallet.hotkey.ss58_address
+            uid = self.inner.get_uid(me) if hasattr(self.inner, "get_uid") else None
+            if uid is None:
+                return ""
+            return str(st.get_commitment(netuid=self.netuid, uid=uid) or "")
+        except Exception:
+            return ""
 
     def settle_bonds(self, refunds: dict) -> None:
         # Bonds are an off-chain ledger rebuilt from commitments each epoch; there is no
