@@ -3866,7 +3866,25 @@ def test_auditor_treats_silence_as_a_finding():
         assert vs[0].verify_signature()
 
 
+def _isolate_env() -> None:
+    """Clear the production RALPH_* switches before running anything.
+
+    Found by deploying: on the orchestrator box, where `RALPH_REQUIRE_PUBLISH=1` is correctly set,
+    this suite reported 53/57 and looked broken. It was not — the gate was doing its job, refusing
+    four epochs that construct no publisher. But a suite whose result depends on the operator's
+    shell is a suite you cannot trust on the machine you actually deploy to, which is the one
+    machine where you most want to run it. The two tests that exercise the env var set and unset it
+    themselves, so isolating here does not weaken them."""
+    import os as _o
+    for k in [k for k in _o.environ if k.startswith("RALPH_")]:
+        _o.environ.pop(k, None)
+
+
+_isolate_env()          # also covers `pytest tests/test_crown_path.py`, which never calls main()
+
+
 def main() -> int:
+    _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
