@@ -3847,9 +3847,15 @@ def test_one_bad_artifact_cannot_take_the_round_down():
         def boom():
             raise ValueError("GGUF is not loadable by this runner")
 
+        # A TIER THIS ROUND DOES NOT RUN IS A REJECTION, NOT A CRASH. `binary` is a real tier; a
+        # miner naming one outside this round's config hit a bare dict lookup and KeyError'd the
+        # whole round. Verified against a live round: it killed a round with five submissions.
+        wrong_tier = cm("wrongtier", good, lambda: Step())
+        wrong_tier.tier = "binary"
+
         out = run_observer_round(
             1, "root", "nonce",
-            [cm("attacker", poison, boom), cm("honest", good, lambda: Step())],
+            [cm("attacker", poison, boom), wrong_tier, cm("honest", good, lambda: Step())],
             pool, Step(), {"kimi": Obs(), "qwen": Obs()}, tiers, bud,
             Tournament(tiers, margin=0.03), RegistrationLedger(), {}, n_items=20,
             corpus_spec="glaive_r1@rev=abc|order=stream")
@@ -3859,6 +3865,8 @@ def test_one_bad_artifact_cannot_take_the_round_down():
         assert "honest" in out.accepted, (out.accepted, out.rejected)
         why = dict((h, r) for h, r in out.rejected).get("attacker", [])
         assert any("could not be loaded" in x for x in why), why
+        wt = dict((h, r) for h, r in out.rejected).get("wrongtier", [])
+        assert any("not being scored this round" in x for x in wt), wt
         assert out.record is not None, "the round must still produce a record"
 
 

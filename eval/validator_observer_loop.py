@@ -202,6 +202,15 @@ def run_observer_round(
     d_root: dict = {}
     d_bits: dict = {}
     for c in committed:
+        # THE TIER IS MINER-CONTROLLED. `tier_budgets[c.tier]` was a bare lookup, so a submission
+        # naming a tier this round does not run — `binary` is a REAL tier, just not one in this
+        # round's config — raised KeyError and took the whole round down for everyone. Same shape
+        # as the unguarded runner: a miner-supplied value reaching a lookup with no guard is a
+        # denial of service that costs the attacker one commitment.
+        if c.tier not in tier_budgets:
+            out.rejected.append((c.hotkey, [f"tier {c.tier!r} is not being scored this round "
+                                            f"(running: {sorted(tier_budgets)})"]))
+            continue
         d = intake(c.ckpt_dir, tier_budgets[c.tier], ledger, c.hotkey, c.coldkey,
                    c.bond_posted, revealed_hash=c.revealed_hash, salt=c.salt,
                    committed_value=c.committed_value)
