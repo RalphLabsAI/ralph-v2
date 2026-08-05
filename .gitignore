@@ -3,3 +3,9 @@
 __pycache__/
 eval/runs/
 runs/
+
+# Internal, deliberately never published: the security review and the competitor reference
+# corpus. Both are untracked already — listing them means a future `git add -A` cannot
+# quietly publish them.
+SECURITY-REVIEW-*.md
+ref/
