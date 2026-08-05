@@ -119,8 +119,13 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
 
     chain = BittensorChainIO(netuid=cfg.netuid, network=cfg.network, wallet_name=cfg.wallet,
                              hotkey_name=cfg.hotkey, read_only=not cfg.live)
-    publisher = RecordPublisher(HFSink(cfg.records_repo), window=8,
-                                state_path=os.path.join(cfg.work_dir, "publish-hwm.json"))
+    # THE HIGH-WATER MARK IS PER-REPO. It is the never-shrink guard: "I have published N rounds
+    # before, so an index serving fewer is a shrunken history — refuse." Keying it by work_dir
+    # alone means switching trails (shakedown -> production) carries the shakedown's count to an
+    # empty production repo, and the very first real round refuses to write with "history has
+    # shrunk". The guard would be correct about the count and wrong about the question.
+    hwm = os.path.join(cfg.work_dir, f"publish-hwm-{cfg.records_repo.replace('/', '_')}.json")
+    publisher = RecordPublisher(HFSink(cfg.records_repo), window=8, state_path=hwm)
 
     now = chain.current_block()
     lo, hi = now - cfg.commit_window, now
