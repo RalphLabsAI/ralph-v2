@@ -98,6 +98,18 @@ def _versions() -> dict:
     except Exception:
         pass
     try:
+        # A GGUF student's output depends on llama.cpp's thread count and batch exactly as an HF
+        # student's depends on torch's batch size — reduction order either way. An auditor
+        # re-running at a different thread count gets a different answer through no fault of the
+        # record, so it is pinned here rather than left to whatever the box defaulted to.
+        from .runners import GGUFStudentRunner
+        out["gguf_n_threads"] = GGUFStudentRunner.N_THREADS
+        out["gguf_n_batch"] = GGUFStudentRunner.N_BATCH
+        import llama_cpp
+        out["llama_cpp"] = llama_cpp.__version__
+    except Exception:
+        pass
+    try:
         from .runners import HFRunner
         out["topk"] = HFRunner.TOPK
         out["prob_decimals"] = HFRunner.PROB_DECIMALS

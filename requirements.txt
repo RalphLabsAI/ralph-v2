@@ -20,5 +20,9 @@ huggingface_hub        # fetch the published trail (eval/publish.py)
 #   torch
 #   transformers
 #   safetensors
+#   llama-cpp-python    # GGUF students. NOT optional: integer safetensors measure at their full
+#                       # container width (int8 -> 8.0 bpw) so no safetensors artifact can clear
+#                       # sub4's 4.0/5.0, and a 4-bit-packed one fails the pinned-parent element
+#                       # count. GGUF is the only format that can pass the tiers at all.
 #   datasets            # only for the live trajectory pool (eval/pool.py, eval/corpus_hf.py)
 # and, for the code-axis grader sandbox in production, the system package `bubblewrap` (bwrap).

@@ -400,7 +400,7 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     w("  installing…\n")
     _ssh(inst, spec, f"cd {remote_dir} && python3 -m venv .venv 2>/dev/null; "
                      f".venv/bin/pip -q install torch transformers safetensors datasets "
-                     f"huggingface_hub pynacl accelerate 2>&1 | tail -2", timeout=2400)
+                     f"huggingface_hub pynacl accelerate llama-cpp-python 2>&1 | tail -2", timeout=2400)
 
     w("  scoring (this is the expensive part)…\n")
     env = "HF_TOKEN=%s " % os.environ.get("HF_TOKEN_READ", os.environ.get("HF_TOKEN", ""))

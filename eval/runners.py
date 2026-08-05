@@ -395,3 +395,96 @@ class SafeStudentRunner(HFRunner):
             self.model_id, dtype=getattr(torch, self._dtype), device_map=self._device,
             trust_remote_code=False, use_safetensors=True)
         self._model.eval()
+
+
+class GGUFStudentRunner:
+    """Generate from an UNTRUSTED GGUF checkpoint. The only student format that can pass the tiers.
+
+    WHY THIS HAS TO EXIST. The bit tiers are expressed in bits per weight — sub4 allows 4.0 code /
+    5.0 container — and no safetensors artifact can reach them. `measure_checkpoint` treats integer
+    dtypes as already-packed codes and credits them their full container width, so an int8 file
+    measures 8.0/8.0 and clears nothing; and a genuinely 4-bit-packed safetensors would carry half
+    the element count, failing the pinned-parent gate instead. GGUF is the only format that can
+    express sub-8-bit storage AND keep an honest weight-element count — and it is what the field
+    actually ships (PrismML's Bonsai, every llama.cpp quant). Until this existed the gates accepted
+    GGUF and the loader refused it, so the subnet had NO submittable format at all.
+
+    A STUDENT ONLY HAS TO GENERATE. The observer computes distributions and stays an HF model; the
+    submission is asked for one thing, `generate(prompts, max_new_tokens) -> list[str]`. That is
+    why this is tractable at all — no logits, no tokenizer surgery, no KV plumbing.
+
+    DETERMINISM IS PINNED THE SAME WAY THE HF PATH PINS IT, and for the same measured reason: a
+    round that is not bit-exact on repeat cannot be audited. Greedy only (temperature 0, no
+    sampling), a fixed thread count and batch size, and a fixed context — thread count changes
+    reduction order in llama.cpp exactly as batch size does in torch, so it belongs in the record's
+    pinned versions rather than in whatever the box happened to default to.
+
+    UNTRUSTED, so the same refusals as SafeStudentRunner: no forbidden files, and nothing is
+    imported or executed out of the artifact — a GGUF is data to llama.cpp, never code.
+    """
+
+    N_THREADS = 8            # pinned: thread count changes reduction order, hence the output
+    N_CTX = 4096
+    N_BATCH = 512
+
+    def __init__(self, ckpt_dir: str, name: str | None = None, backend=None):
+        from pathlib import Path
+        from .gates import FORBIDDEN_FILES
+        d = Path(ckpt_dir)
+        bad = [p.name for p in d.rglob("*") if p.is_file() and p.suffix.lower() in FORBIDDEN_FILES]
+        if bad:
+            raise ValueError(f"refusing to load: forbidden files present {bad}")
+        gg = sorted(d.rglob("*.gguf"))
+        if not gg:
+            raise ValueError("refusing to load: no gguf weights")
+        if len(gg) > 1:
+            # Which file is the model would be a guess, and a guess here silently scores something
+            # other than what was committed.
+            raise ValueError(f"refusing to load: {len(gg)} gguf files, expected exactly one")
+        self.path = str(gg[0])
+        self.name = name or f"student:{d.name}"
+        self._backend = backend          # injectable: the whole path is testable without llama.cpp
+        self._llm = None
+
+    def _load(self):
+        if self._llm is not None:
+            return self._llm
+        if self._backend is not None:
+            self._llm = self._backend(self.path)
+            return self._llm
+        from llama_cpp import Llama       # local import: nothing else here needs llama.cpp
+        self._llm = Llama(model_path=self.path, n_ctx=self.N_CTX, n_threads=self.N_THREADS,
+                          n_batch=self.N_BATCH, logits_all=False, verbose=False, seed=0)
+        return self._llm
+
+    def generate(self, prompts, max_new_tokens: int = 512) -> list[str]:
+        """Greedy continuation per prompt. Same contract as HFRunner.generate."""
+        llm = self._load()
+        out = []
+        for p in prompts:
+            r = llm(p, max_tokens=int(max_new_tokens), temperature=0.0, top_k=1, top_p=1.0,
+                    repeat_penalty=1.0, echo=False)
+            try:
+                out.append(r["choices"][0]["text"])
+            except Exception:
+                # A backend that returns an unexpected shape must not be guessed at: an empty step
+                # scores as inert, which is the honest reading of "this model produced nothing".
+                out.append("")
+        return out
+
+
+def student_runner(ckpt_dir: str, **kw):
+    """Pick the loader by what the artifact actually IS.
+
+    Miners choose their format and both are legitimate, so dispatch belongs here rather than in
+    every call site — the round should not have to know, and the previous arrangement (one loader
+    that raised on the only format the tiers admit) was invisible until a real submission arrived.
+    """
+    from pathlib import Path
+    d = Path(ckpt_dir)
+    if list(d.rglob("*.safetensors")):
+        return SafeStudentRunner(str(d), **{k: v for k, v in kw.items() if k != "backend"})
+    if list(d.rglob("*.gguf")):
+        return GGUFStudentRunner(str(d), **{k: v for k, v in kw.items()
+                                            if k in ("name", "backend")})
+    raise ValueError("refusing to load: artifact holds neither safetensors nor gguf weights")

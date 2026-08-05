@@ -32,7 +32,7 @@ def score(job: dict, out_dir: str) -> dict:
     from .koth import Tier, Tournament
     from .parent import PARENTS
     from .pool import build_pool, check_balance, dump_pool
-    from .runners import HFRunner, SafeStudentRunner
+    from .runners import HFRunner, student_runner
     from .validator_observer_loop import CommittedSubmission, run_observer_round
 
     os.makedirs(out_dir, exist_ok=True)
@@ -73,7 +73,9 @@ def score(job: dict, out_dir: str) -> dict:
             hotkey=c["hotkey"], coldkey=c.get("coldkey", ""), tier=c["tier"], ckpt_dir=d,
             declared_compute_h100h=float(c.get("declared_compute_h100h", 0.0)),
             bond_posted=float(c.get("bond_posted", 0.0)),
-            make_runner=(lambda cd=d: SafeStudentRunner(cd)),
+            # dispatch by FORMAT: GGUF is the only artifact that can pass the bit tiers,
+            # and hardcoding the safetensors loader here made every one of them unscoreable
+            make_runner=(lambda cd=d: student_runner(cd)),
             revealed_hash=c.get("revealed_hash", ""), salt=c.get("salt", ""),
             committed_value=c.get("committed_value", ""), artifact_uri=c.get("artifact_uri", "")))
 

@@ -3613,6 +3613,56 @@ def test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent():
         assert len(burned) == 1, f"expected exactly one burn, got {len(burned)}"
 
 
+def test_gguf_is_loadable_because_nothing_else_can_pass_the_tiers():
+    """GGUF is not one option among several — it is the ONLY artifact that can clear the bit tiers.
+
+    `measure_checkpoint` credits integer dtypes their full container width, so an int8 safetensors
+    measures 8.0/8.0 against sub4's 4.0/5.0 and clears nothing; a genuinely 4-bit-packed
+    safetensors would carry half the element count and fail the pinned-parent gate instead. So
+    until the loader could open a GGUF, the subnet accepted a format it could not score and had no
+    submittable format at all."""
+    import json as _json, struct, tempfile
+    from pathlib import Path
+    from eval.runners import GGUFStudentRunner, student_runner
+
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd) / "sub"
+        d.mkdir()
+        (d / "model.gguf").write_bytes(b"GGUF" + b"\0" * 32)
+        (d / "config.json").write_text('{"model_type":"qwen3"}')
+
+        seen = {}
+
+        def fake_llama(path):
+            seen["path"] = path
+
+            def call(prompt, **kw):
+                seen["kw"] = kw
+                return {"choices": [{"text": f"step<{prompt[-2:]}>"}]}
+
+            return call
+
+        # dispatch picks the GGUF loader for a gguf-only artifact...
+        r = student_runner(str(d), backend=fake_llama)
+        assert isinstance(r, GGUFStudentRunner), type(r)
+        got = r.generate(["aX", "bY"], max_new_tokens=16)
+        assert got == ["step<aX>", "step<bY>"], got
+
+        # ...GREEDY ONLY. A sampled student is not reproducible, and a round that cannot be
+        # re-run bit-exactly cannot be audited, which is the entire product.
+        assert seen["kw"]["temperature"] == 0.0 and seen["kw"]["top_k"] == 1, seen["kw"]
+        assert seen["kw"]["max_tokens"] == 16
+
+        # two gguf files is a REFUSAL, never a guess: picking one would silently score something
+        # other than what was committed
+        (d / "second.gguf").write_bytes(b"GGUF" + b"\0" * 32)
+        try:
+            student_runner(str(d), backend=fake_llama)
+            raise AssertionError("two gguf files must be refused, not guessed between")
+        except ValueError as e:
+            assert "expected exactly one" in str(e), e
+
+
 def test_one_bad_artifact_cannot_take_the_round_down():
     """A SUBMISSION THAT PASSES THE GATES AND THEN FAILS TO LOAD IS A REJECTION, NOT AN OUTAGE.
 
@@ -4011,6 +4061,7 @@ def main() -> int:
              test_auditor_verifies_then_diverges,
              test_auditor_verdict_states_what_it_did_not_check,
              test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent,
+             test_gguf_is_loadable_because_nothing_else_can_pass_the_tiers,
              test_one_bad_artifact_cannot_take_the_round_down,
              test_orchestrator_audits_its_own_scorer_before_signing,
              test_auditor_publishes_its_verdicts_or_stops_voting,
