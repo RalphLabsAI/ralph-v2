@@ -204,13 +204,16 @@ class ShadeformProvider(Provider):
         return [i for i in r.get("instances", [])
                 if str(i.get("status", "")).lower() not in ("deleted", "error")]
 
-    def sweep(self, prefix: str = "ralph-", out=sys.stdout) -> list:
+    def sweep(self, prefix: str = "ralph-round-", out=sys.stdout) -> list:
         """Kill anything we named that is still up. The backstop for a process that died between
         renting and destroying — which is exactly how the bug above was found.
 
-        SCOPED BY NAME PREFIX, deliberately and narrowly: this account also carries instances
-        belonging to other projects, and a sweep that reached them would be a far worse failure
-        than the leak it prevents."""
+        SCOPED TO THE NAMES WE MINT, and narrowly. `run_remote_round` names its rentals
+        `ralph-round-<n>-<ts>`, so that is the prefix — NOT `ralph-`, which was the first version
+        and which matches `ralph-v2-miner-m19`, a live miner box on this same account that this
+        code has no business touching. A sweep that kills someone else's running work is a far
+        worse failure than the leak it exists to prevent, so the prefix must match what we create
+        rather than what we are called."""
         killed = []
         for i in self.list_active():
             name = str(i.get("name", ""))
