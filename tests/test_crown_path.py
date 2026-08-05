@@ -3613,6 +3613,73 @@ def test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent():
         assert len(burned) == 1, f"expected exactly one burn, got {len(burned)}"
 
 
+def test_the_throne_is_inherited_from_the_published_trail():
+    """A KING NOBODY HAS TO BEAT IS NOT A KING.
+
+    `Tournament` was built fresh every round and nothing rebuilt its kings, so koth took the
+    open-throne branch every time and crowned max(retention) outright. The dethrone margin, the
+    paired bootstrap, axis_regression and the anti-copy guarantee were unreachable code — the
+    subnet documented a king of the hill and ran a leaderboard that reset hourly.
+
+    The lineage is DERIVED from the published trail rather than stored: the records are signed,
+    hash-chained and anchored, so an outsider can rebuild the same throne, and there is no local
+    file the operator could edit. Both the scorer and `audit_emission` call the same walk, because
+    two derivations of who is king means every honest round fails its own emission audit."""
+    import json as _json
+    import tempfile
+    from pathlib import Path
+    from eval.lineage import apply_events, replay, replay_from_trail
+    from eval.publish import LocalSink, PublishError, RecordPublisher
+    from eval.rerun import record_from_blob
+
+    with tempfile.TemporaryDirectory() as dd:
+        root, chain, sig, idx = _auditor_fixture(dd)
+        sink = LocalSink(root)
+        recs = [record_from_blob(sink.get(e["name"]))
+                for e in sorted(idx["rounds"], key=lambda r: r["round"])]
+
+        # the fixture crowns in round 1 and dethrones in round 2 — replaying must land on the
+        # round-2 winner, bound to the miner through the SUBMISSION rather than the event's own
+        # `miner` field (which the operator writes beside the weights, so trusting it is circular)
+        kings = replay(recs)
+        assert list(kings) == ["t"], kings
+        r2 = [s_ for s_ in recs[1].submissions if s_.role == "challenger"][0]
+        assert kings["t"].model_id == r2.model_id, (kings["t"].model_id, r2.model_id)
+        assert kings["t"].miner == r2.miner
+        # ...and it carries a locator, or the incumbent cannot be refetched and re-scored
+        assert kings["t"].artifact_uri, kings["t"]
+
+        # ORDER IS NOT OPTIONAL: replaying a dethrone before the crown it beats gives a different
+        # throne, so the walk sorts rather than trusting the operator-written index order
+        assert replay(list(reversed(recs)))["t"].model_id == kings["t"].model_id
+
+        # VACATE empties the throne
+        vac = apply_events(kings, [{"tier": "t", "action": "vacate", "king": kings["t"].model_id}])
+        assert vac == {}, vac
+
+        # a HOLD keeps the same king and counts the reign
+        held = apply_events(kings, [{"tier": "t", "action": "hold", "king": kings["t"].model_id}])
+        assert held["t"].model_id == kings["t"].model_id and held["t"].reign == 1
+
+        # AND THE SAME WALK BACKS THE AUDIT. audit_emission reconstructs through apply_events, so
+        # the scorer and the auditor cannot disagree about who holds the throne.
+        from eval.rerun import audit_emission, Audit
+        a = Audit()
+        audit_emission(recs[1], a)
+        assert not a.failed, [(c.name, c.detail) for c in a.failed]
+
+        # A PARTIAL HISTORY MUST ABORT, NOT GUESS. Skipping an unfetchable round would rebuild the
+        # throne from an incomplete lineage — most likely handing the crown back to whoever held it
+        # before the gap, which is a live emission change caused by a network error.
+        pub = RecordPublisher(sink, state_path=str(Path(dd) / "lin-hwm.json"))
+        Path(root, idx["rounds"][0]["name"]).unlink()
+        try:
+            replay_from_trail(pub)
+            raise AssertionError("a missing round must abort the lineage, not be skipped")
+        except RuntimeError as e:
+            assert "cannot be rebuilt" in str(e), e
+
+
 def test_gguf_is_loadable_because_nothing_else_can_pass_the_tiers():
     """GGUF is not one option among several — it is the ONLY artifact that can clear the bit tiers.
 
@@ -4061,6 +4128,7 @@ def main() -> int:
              test_auditor_verifies_then_diverges,
              test_auditor_verdict_states_what_it_did_not_check,
              test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent,
+             test_the_throne_is_inherited_from_the_published_trail,
              test_gguf_is_loadable_because_nothing_else_can_pass_the_tiers,
              test_one_bad_artifact_cannot_take_the_round_down,
              test_orchestrator_audits_its_own_scorer_before_signing,

@@ -79,12 +79,35 @@ def score(job: dict, out_dir: str) -> dict:
             revealed_hash=c.get("revealed_hash", ""), salt=c.get("salt", ""),
             committed_value=c.get("committed_value", ""), artifact_uri=c.get("artifact_uri", "")))
 
-    # THE CHAIN VALUES ARE SUPPLIED, NEVER READ HERE. This box has no wallet and no business
-    # deciding which block seeded the round — and a box that chose its own nonce could grind it.
+    # THE THRONE IS INHERITED, NOT RE-OPENED. A fresh Tournament takes koth's open-throne branch
+    # every round and crowns max(retention) outright, which makes the dethrone margin, the paired
+    # bootstrap and the anti-copy guarantee unreachable — a leaderboard that resets hourly wearing
+    # the name of a king of the hill. The lineage is derived from the published trail by the
+    # orchestrator (eval/lineage.py) and supplied here, and the king's artifact is refetched so the
+    # incumbent is RE-SCORED on this round's items rather than defended on last round's number.
+    from .lineage import Reign
+    tournament = Tournament(tiers, margin=float(job.get("margin", 0.05)))
+    registry = {}
+    for tier, k in (job.get("kings") or {}).items():
+        r = Reign(**k)
+        tournament.kings[tier] = r.as_king()
+        kd = fetch_dir_for(f"king:{tier}", r.artifact_uri)
+        if kd:
+            try:
+                registry[r.model_id] = student_runner(kd)
+            except Exception as e:
+                # koth emits a "king unavailable" hold for a missing registry entry, which keeps the
+                # throne without re-scoring it. That is the right conservative default and it is
+                # recorded, not silent.
+                skipped.append((f"king:{tier}", f"incumbent not loadable: {type(e).__name__}: {e}"))
+        else:
+            skipped.append((f"king:{tier}", f"incumbent artifact not fetchable: {r.artifact_uri}"))
+
     out = run_observer_round(
         int(job["round"]), job["commit_root"], job["round_nonce"], committed, pool, parent,
-        observers, tiers, budgets, Tournament(tiers, margin=float(job.get("margin", 0.05))),
-        RegistrationLedger(), {}, parent_id=spec.name, prev_anchor=job.get("prev_anchor", ""),
+        observers, tiers, budgets, tournament,
+        RegistrationLedger(), registry, parent_id=spec.name,
+        prev_anchor=job.get("prev_anchor", ""),
         signer=None,                       # UNSIGNED, deliberately: the key is not on this box
         n_items=int(job["n_items"]), corpus_spec=pspec.as_corpus_spec())
 
@@ -93,6 +116,7 @@ def score(job: dict, out_dir: str) -> dict:
     with open(os.path.join(out_dir, "pool.jsonl"), "wb") as fh:
         fh.write(dump_pool(pool))
     summary = {"round": int(job["round"]), "accepted": list(out.accepted),
+               "kings_before": {t: k.model_id for t, k in (out.kings_before or {}).items()},
                "rejected": [[h, r] for h, r in out.rejected], "skipped": skipped,
                "identity": out.identity, "observer": out.observer,
                "events": out.events, "weights": out.weights,

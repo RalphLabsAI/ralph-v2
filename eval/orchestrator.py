@@ -231,6 +231,9 @@ class RoundPlan:
     round_nonce: str
     prev_anchor: str
     committed: list = field(default_factory=list)
+    # tier -> Reign, replayed from the published trail. Without it the rented box opens every
+    # throne and crowns max(retention) outright, and the dethrone margin never runs.
+    kings: dict = field(default_factory=dict)
     parent_key: str = "qwen3-8b"
     observers: list = field(default_factory=list)
     tiers: list = field(default_factory=list)

@@ -135,6 +135,13 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
         w("  no v2 submissions this window — not renting. Nothing to score is not a failure.\n")
         return 0
 
+    # THE THRONE IS INHERITED. Derived from the published trail, never from local state: the
+    # records are signed, hash-chained and anchored, so the lineage is recoverable by anyone — and
+    # a local kings.json would be a second source of truth the operator controls, which is exactly
+    # what BittensorChainIO.get_king returns None to avoid.
+    from .lineage import replay_from_trail
+    kings = replay_from_trail(publisher, out=out)
+
     idx_round = round_no if round_no is not None else len(publisher.load_index()["rounds"]) + 1
     plan = RoundPlan(
         round=idx_round, commit_root=chain.commit_root(lo, hi), round_nonce=chain.block_hash(now),
@@ -146,6 +153,7 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
                     "revealed_hash": c.revealed_hash, "salt": c.salt,
                     "declared_compute_h100h": c.declared_compute_h100h,
                     "bond_posted": c.bond_posted} for c in commits])
+    plan.kings = {t: vars(r) for t, r in kings.items()}
 
     spec = GpuSpec(gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,
                    max_price_per_hour=cfg.max_price_per_hour)

@@ -283,16 +283,12 @@ def audit_emission(rec, a: Audit) -> None:
     caught as well as inventing one."""
     from .koth import MIN_CROWN_LB
 
-    # 1. WHO IS KING. Every event carries `king` (Tournament.consider seeds it with the reigning
-    #    king's model_id before it decides anything), so holds carry the incumbent forward and only
-    #    `vacate` removes a throne.
-    kings: dict = {}
-    for e in rec.events:
-        tier = e.get("tier")
-        if e.get("action") == "vacate":
-            kings.pop(tier, None)
-        elif e.get("king"):
-            kings[tier] = e["king"]
+    # 1. WHO IS KING — through eval/lineage, the SAME walk the scorer seeds its Tournament from.
+    #    Deriving it separately here is how the audit and the round come to disagree about who holds
+    #    the throne, at which point every honest round fails its own emission check. One walk.
+    from .lineage import apply_events
+    kings = {t: r.model_id for t, r in
+             apply_events({}, rec.events, round_no=rec.round, submissions=rec.submissions).items()}
 
     # 2. BIND MODEL -> MINER THROUGH THE SCORED SUBMISSIONS, not through the event's own `miner`
     #    field. The event is written by the operator next to the weights; using it to validate the
