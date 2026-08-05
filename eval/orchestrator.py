@@ -336,7 +336,7 @@ def verify_returned_record(rec, plan: RoundPlan, pool, spec: GpuSpec, summary: d
 
 
 def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_dir: str,
-                     repo_dir: str = ".", remote_dir: str = "/workspace/ralph-v2",
+                     repo_dir: str = ".", remote_dir: str = "~/ralph-v2",
                      runner=None, out=sys.stdout) -> dict:
     """Rent, score, pull back, AUDIT, and return the unsigned record + pool for the caller to sign.
 
@@ -410,6 +410,10 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     """Push the repo, install, score, pull the artifacts back. Replaceable for tests."""
     w("  pushing repo…\n")
     _ssh(inst, spec, f"mkdir -p {remote_dir} && rm -rf {remote_dir}/eval")
+    # HOME-RELATIVE, because the rented box is not our box. It logs in as `shadeform`, not root,
+    # and /workspace is either absent or root-owned there — `mkdir -p /workspace/ralph-v2` failed
+    # with Permission denied after the GPU was already rented and paid for. The one directory a
+    # login user can always write is their own home.
     subprocess.run(["rsync", "-az", "-e",
                     f"ssh -i {spec.ssh_key} -p {inst.ssh_port} -o StrictHostKeyChecking=accept-new",
                     # EXPLICIT SECRET EXCLUSIONS. The list used to be runs/ and .git/ only, which
@@ -421,7 +425,7 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
                     "--exclude", "wallets/", "--exclude", ".venv/", "--exclude", "__pycache__/",
                     "--exclude", ".hf_read", "--exclude", "*.pem",
                     f"{repo_dir}/",
-                    f"{inst.ssh_user}@{inst.ip}:{remote_dir}/"], check=True, timeout=900)
+                    f"{inst.ssh_user}@{inst.ip}:ralph-v2/"], check=True, timeout=900)
     _scp(spec, inst, job_path, f"{remote_dir}/job.json", to_remote=True)
 
     w("  installing…\n")
