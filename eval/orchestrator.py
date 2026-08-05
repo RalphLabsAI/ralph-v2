@@ -247,11 +247,14 @@ class RemoteRoundError(RuntimeError):
     """Raised INSTEAD of signing. Nothing is published and no weights are set."""
 
 
-def _ssh(inst: Instance, spec: GpuSpec, cmd: str, timeout: int = 3600) -> str:
+def _ssh(inst: Instance, spec: GpuSpec, cmd: str, timeout: int = 3600, stdin: str = "") -> str:
+    """`stdin` exists so a secret can reach the box WITHOUT appearing in argv — the remote process
+    table is readable by any co-tenant, and argv lands verbatim in the exception text below."""
     r = subprocess.run(
         ["ssh", "-i", spec.ssh_key, "-p", str(inst.ssh_port),
          "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
          f"{inst.ssh_user}@{inst.ip}", cmd],
+        input=stdin if stdin else None,
         capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RemoteRoundError(f"remote command failed ({r.returncode}): {cmd[:80]}\n"
@@ -393,7 +396,15 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     _ssh(inst, spec, f"mkdir -p {remote_dir} && rm -rf {remote_dir}/eval")
     subprocess.run(["rsync", "-az", "-e",
                     f"ssh -i {spec.ssh_key} -p {inst.ssh_port} -o StrictHostKeyChecking=accept-new",
-                    "--exclude", "runs/", "--exclude", ".git/", f"{repo_dir}/",
+                    # EXPLICIT SECRET EXCLUSIONS. The list used to be runs/ and .git/ only, which
+                    # kept .env off the box by accident (it is not in the repo dir) rather than on
+                    # purpose. An operator who ever drops a .env or a wallet beside the code would
+                    # have shipped it to somebody else's hardware with no warning.
+                    "--exclude", "runs/", "--exclude", ".git/",
+                    "--exclude", ".env", "--exclude", ".env.*", "--exclude", "*.key",
+                    "--exclude", "wallets/", "--exclude", ".venv/", "--exclude", "__pycache__/",
+                    "--exclude", ".hf_read", "--exclude", "*.pem",
+                    f"{repo_dir}/",
                     f"{inst.ssh_user}@{inst.ip}:{remote_dir}/"], check=True, timeout=900)
     _scp(spec, inst, job_path, f"{remote_dir}/job.json", to_remote=True)
 
@@ -403,7 +414,26 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
                      f"huggingface_hub pynacl accelerate llama-cpp-python 2>&1 | tail -2", timeout=2400)
 
     w("  scoring (this is the expensive part)…\n")
-    env = "HF_TOKEN=%s " % os.environ.get("HF_TOKEN_READ", os.environ.get("HF_TOKEN", ""))
+    # THE WRITE TOKEN NEVER GOES TO THE RENTED BOX, and the fallback that sent it was the single
+    # worst line in this module: it defeated the one thing the whole split exists to guarantee.
+    # HF_TOKEN is the token that can publish the round trail and overwrite the artifact repos;
+    # `HF_TOKEN_READ` is a read-scoped token, and its only job on that box is gated public models
+    # (google/gemma-2-2b-it needs one). If there is no read token we send NOTHING — an ungated
+    # observer works fine anonymously, and a missing gated model is a loud failure rather than a
+    # leaked credential.
+    read_tok = os.environ.get("HF_TOKEN_READ", "")
+    if read_tok and read_tok == os.environ.get("HF_TOKEN", ""):
+        raise RemoteRoundError(
+            "HF_TOKEN_READ is the same value as HF_TOKEN — that is the WRITE token, and shipping "
+            "it to a rented box hands whoever holds that box the ability to rewrite the published "
+            "round trail. Mint a read-scoped token, or unset HF_TOKEN_READ.")
+    env = ""
+    if read_tok:
+        # ...and not on the COMMAND LINE, where it sits in the remote process table for any
+        # co-tenant to read and lands verbatim in any error message this raises.
+        _ssh(inst, spec, f"umask 077 && mkdir -p {remote_dir} && cat > {remote_dir}/.hf_read",
+             timeout=60, stdin=read_tok)
+        env = f"HF_TOKEN=$(cat {remote_dir}/.hf_read) "
     # NO `| tail`. A pipeline's exit status is the LAST command's, so piping the scorer through
     # tail made every remote crash exit 0 — _ssh saw success, and the operator's first sign of a
     # failed round was `scp failed` on a record that was never written. A file-transfer error is a
