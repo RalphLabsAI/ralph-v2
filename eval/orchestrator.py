@@ -258,7 +258,15 @@ def _ssh(inst: Instance, spec: GpuSpec, cmd: str, timeout: int = 3600, stdin: st
     table is readable by any co-tenant, and argv lands verbatim in the exception text below."""
     r = subprocess.run(
         ["ssh", "-i", spec.ssh_key, "-p", str(inst.ssh_port),
-         "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
+         # EPHEMERAL HOSTS GET NO known_hosts. Providers recycle IPs: scaleway handed us
+         # 51.159.162.43 twice with different host keys, and `accept-new` correctly refuses a
+         # CHANGED key — so the second rental at a reused IP failed after the GPU was paid for,
+         # and every stale entry would poison the next reuse forever. Pinning buys nothing here
+         # anyway: we have no prior key for a box that did not exist a minute ago. What makes
+         # this safe is the trust model, not the host key — the box gets no write credentials,
+         # and everything it returns is audited before our key touches it.
+         "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+         "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=15",
          f"{inst.ssh_user}@{inst.ip}", cmd],
         input=stdin if stdin else None,
         capture_output=True, text=True, timeout=timeout)
@@ -272,7 +280,8 @@ def _scp(spec: GpuSpec, inst: Instance, src: str, dst: str, to_remote: bool = Tr
     a = f"{inst.ssh_user}@{inst.ip}:{dst}" if to_remote else src
     b = dst if to_remote else f"{inst.ssh_user}@{inst.ip}:{src}"
     args = ["scp", "-i", spec.ssh_key, "-P", str(inst.ssh_port), "-r",
-            "-o", "StrictHostKeyChecking=accept-new"]
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR"]
     args += [src, a] if to_remote else [b, dst]
     r = subprocess.run(args, capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
@@ -427,7 +436,8 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     # with Permission denied after the GPU was already rented and paid for. The one directory a
     # login user can always write is their own home.
     subprocess.run(["rsync", "-az", "-e",
-                    f"ssh -i {spec.ssh_key} -p {inst.ssh_port} -o StrictHostKeyChecking=accept-new",
+                    f"ssh -i {spec.ssh_key} -p {inst.ssh_port} -o StrictHostKeyChecking=no "
+                    f"-o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
                     # EXPLICIT SECRET EXCLUSIONS. The list used to be runs/ and .git/ only, which
                     # kept .env off the box by accident (it is not in the repo dir) rather than on
                     # purpose. An operator who ever drops a .env or a wallet beside the code would
