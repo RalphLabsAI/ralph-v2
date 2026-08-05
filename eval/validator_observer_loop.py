@@ -204,7 +204,22 @@ def run_observer_round(
         sub = Submission(miner=c.hotkey, tier=c.tier, model_id=d.content_hash,
                          params=d.inspection.params, compute_h100h=c.declared_compute_h100h,
                          coldkey=c.coldkey)
-        subs.append((sub, c.make_runner(), c.artifact_uri))
+        # ONE MINER'S ARTIFACT MUST NEVER TAKE THE ROUND DOWN. This constructor was called bare,
+        # and it is the first code that touches miner-controlled bytes as a MODEL rather than as a
+        # file — SafeStudentRunner raises on anything it cannot open. So a single artifact that
+        # cleared all six gates and then failed to load unwound the whole round: the GPU was rented,
+        # the parent downloaded, and nothing was scored for anybody. That is a denial of service any
+        # registered miner can mount for the cost of one commitment, indefinitely.
+        #
+        # It is also not hypothetical for honest miners: a GGUF passes every gate (the format is
+        # explicitly allowlisted and measured) and SafeStudentRunner has no GGUF path at all.
+        try:
+            runner = c.make_runner()
+        except Exception as e:
+            out.rejected.append((c.hotkey, [f"artifact passed the gates but could not be loaded: "
+                                            f"{type(e).__name__}: {e}"]))
+            continue
+        subs.append((sub, runner, c.artifact_uri))
         out.accepted.append(c.hotkey)
 
     # 2. the observer is post-commit entropy, so it cannot be pre-fitted

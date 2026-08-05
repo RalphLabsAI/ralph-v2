@@ -3613,6 +3613,80 @@ def test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent():
         assert len(burned) == 1, f"expected exactly one burn, got {len(burned)}"
 
 
+def test_one_bad_artifact_cannot_take_the_round_down():
+    """A SUBMISSION THAT PASSES THE GATES AND THEN FAILS TO LOAD IS A REJECTION, NOT AN OUTAGE.
+
+    The runner constructor is the first code that touches miner-controlled bytes as a MODEL rather
+    than as a file, and it was called bare inside the intake loop. So one artifact that cleared all
+    six gates and then raised unwound the entire round: the GPU rented, the parent downloaded,
+    nothing scored for anybody. Any registered miner could mount that for the cost of one
+    commitment, indefinitely — and it was not hypothetical, because a GGUF passes every gate while
+    SafeStudentRunner has no GGUF path at all."""
+    from eval.koth import Tier, Tournament
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.validator_observer_loop import CommittedSubmission, run_observer_round
+    from eval.steps import Trajectory
+    import json as _json, struct, tempfile
+    from pathlib import Path
+
+    pool = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"p{i}", step="s", index=0)
+            for i in range(200)]
+    d3 = lambda x, y, z: {"a": x, "b": y, "c": z}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            t = prefix.rstrip()[-1:]
+            return [d3(0.8, 0.1, 0.1)] * 6 if t == "X" else [d3(0.34, 0.33, 0.33)] * 6
+
+    class Step:
+        def generate(self, prompts, max_new_tokens=256):
+            return ["X"] * len(prompts)
+
+    with tempfile.TemporaryDirectory() as dd:
+        def ck(name, n):
+            q = Path(dd) / name
+            q.mkdir()
+            hb = _json.dumps({"w": {"dtype": "F32", "shape": [n],
+                                    "data_offsets": [0, 4 * n]}}).encode()
+            (q / "model.safetensors").write_bytes(struct.pack("<Q", len(hb)) + hb + b"\0" * 4 * n)
+            (q / "config.json").write_text('{"hidden_size":8}')
+            return str(q)
+
+        good, poison = ck("good", 4), ck("poison", 6)
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        bud = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
+
+        def cm(hot, cd, runner):
+            hh, ss = content_hash(cd), "s" + hot
+            return CommittedSubmission(hotkey=hot, coldkey="c" + hot, tier="t", ckpt_dir=cd,
+                                       declared_compute_h100h=1.0, bond_posted=1.0,
+                                       make_runner=runner, revealed_hash=hh, salt=ss,
+                                       committed_value=commit_value(hh, ss),
+                                       artifact_uri=f"file://{cd}")
+
+        def boom():
+            raise ValueError("GGUF is not loadable by this runner")
+
+        out = run_observer_round(
+            1, "root", "nonce",
+            [cm("attacker", poison, boom), cm("honest", good, lambda: Step())],
+            pool, Step(), {"kimi": Obs(), "qwen": Obs()}, tiers, bud,
+            Tournament(tiers, margin=0.03), RegistrationLedger(), {}, n_items=20,
+            corpus_spec="glaive_r1@rev=abc|order=stream")
+
+        # the poison artifact is REJECTED WITH A REASON, and the honest miner is still scored
+        assert "attacker" not in out.accepted, out.accepted
+        assert "honest" in out.accepted, (out.accepted, out.rejected)
+        why = dict((h, r) for h, r in out.rejected).get("attacker", [])
+        assert any("could not be loaded" in x for x in why), why
+        assert out.record is not None, "the round must still produce a record"
+
+
 def test_orchestrator_audits_its_own_scorer_before_signing():
     """The validator is split so the SIGNING KEY never reaches the rented GPU. That only helps if
     the orchestrator refuses to rubber-stamp what comes back.
@@ -3937,6 +4011,7 @@ def main() -> int:
              test_auditor_verifies_then_diverges,
              test_auditor_verdict_states_what_it_did_not_check,
              test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent,
+             test_one_bad_artifact_cannot_take_the_round_down,
              test_orchestrator_audits_its_own_scorer_before_signing,
              test_auditor_publishes_its_verdicts_or_stops_voting,
              test_auditor_treats_silence_as_a_finding]

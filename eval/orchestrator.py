@@ -404,8 +404,14 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
 
     w("  scoring (this is the expensive part)…\n")
     env = "HF_TOKEN=%s " % os.environ.get("HF_TOKEN_READ", os.environ.get("HF_TOKEN", ""))
-    _ssh(inst, spec, f"cd {remote_dir} && {env}.venv/bin/python -m eval.score_job "
-                     f"job.json out/ 2>&1 | tail -30", timeout=10800)
+    # NO `| tail`. A pipeline's exit status is the LAST command's, so piping the scorer through
+    # tail made every remote crash exit 0 — _ssh saw success, and the operator's first sign of a
+    # failed round was `scp failed` on a record that was never written. A file-transfer error is a
+    # terrible way to report that scoring died.
+    out_txt = _ssh(inst, spec, f"cd {remote_dir} && {env}.venv/bin/python -u -m eval.score_job "
+                               f"job.json out/", timeout=10800)
+    for line in out_txt.strip().splitlines()[-12:]:
+        w(f"    | {line}\n")
 
     w("  pulling results…\n")
     for f in ("record.json", "pool.jsonl", "summary.json"):

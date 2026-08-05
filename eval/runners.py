@@ -344,6 +344,16 @@ class SafeStudentRunner(HFRunner):
         if bad:
             raise ValueError(f"refusing to load: forbidden files present {bad}")
         if not list(d.rglob("*.safetensors")):
+            # NAME THE FORMAT. "no safetensors weights" was the message a GGUF submission got after
+            # clearing all six gates — a gate allowlists .gguf, bitrate measures it, and
+            # parent_compat goes out of its way to match its architecture, so the miner has every
+            # reason to think it is supported. Telling them WHICH format they shipped and what to
+            # use instead is the difference between a bug report and a wasted round.
+            if list(d.rglob("*.gguf")):
+                raise ValueError(
+                    "GGUF is not loadable by this runner: the gates accept it but there is no GGUF "
+                    "inference path, so it cannot be scored. Use GGUFStudentRunner, or submit "
+                    "safetensors.")
             raise ValueError("refusing to load: no safetensors weights")
         super().__init__(str(d), device=device, dtype=dtype,
                          name=name or f"student:{d.name}", trust_remote_code=False,
