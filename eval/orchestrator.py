@@ -366,6 +366,18 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
     if "PRIVATE KEY" in blob or "mnemonic" in blob.lower():
         raise RemoteRoundError("refusing to ship a job spec containing key material")
 
+    # SWEEP BEFORE RENTING. `finally` covers exceptions; it does NOT cover the process being
+    # killed, and that is not hypothetical — an ssh session timing out took a round down mid-score
+    # and left an H100 billing at $3.30/hr with no teardown. There is no server-side TTL to fall
+    # back on, so the guarantee has to be "the next round cleans up the last one's corpse", which
+    # is what v1's helper did at the top of every command for the same reason.
+    try:
+        swept = provider.sweep(out=out) if hasattr(provider, "sweep") else []
+        if swept:
+            w(f"  swept {len(swept)} orphaned instance(s) from a previous run\n")
+    except Exception as e:
+        w(f"  WARNING orphan sweep failed: {e} — check the provider console\n")
+
     name = f"ralph-round-{plan.round}-{int(time.time()) % 100000}"
     inst = provider.rent(spec, name)
     w(f"  rented {inst.id} {inst.instance_type} @ ${inst.price_per_hour:.2f}/hr "
