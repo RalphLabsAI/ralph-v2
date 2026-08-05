@@ -3995,14 +3995,30 @@ def test_orchestrator_audits_its_own_scorer_before_signing():
 
         # ---- 6. AND NO SECRET EVER REACHES THE JOB SPEC, asserted rather than assumed: the spec
         #         is written to disk and copied to somebody else's machine.
+        # the guard checks for the VALUES this process holds, not for field names. The first
+        # version matched the word "coldkey" — which every real spec carries as a miner's PUBLIC
+        # ss58 — so it blocked round 1 outright while protecting nothing.
+        import os as _o
+        _o.environ["RALPH_RECORD_SEED"] = "de" * 32
         leaky = RoundPlan(round=1, commit_root="a", round_nonce="b", prev_anchor="",
-                          committed=[{"hotkey": "h", "RALPH_RECORD_SEED": "de" * 32}])
+                          committed=[{"hotkey": "h", "note": "de" * 32}])
         try:
             run_remote_round(leaky, _Provider(), spec, str(Path(dd) / "w2"),
                              runner=_boom, out=io.StringIO())
             raise AssertionError("a job spec carrying a seed must be refused")
         except RemoteRoundError as e:
             assert "refusing to ship" in str(e), e
+        finally:
+            _o.environ.pop("RALPH_RECORD_SEED", None)
+
+        # ...and a spec carrying an ordinary public coldkey is NOT refused
+        fine = RoundPlan(round=1, commit_root="a", round_nonce="b", prev_anchor="",
+                         committed=[{"hotkey": "h", "coldkey": "5Fabc"}])
+        try:
+            run_remote_round(fine, _Provider(), spec, str(Path(dd) / "w3"),
+                             runner=_boom, out=io.StringIO())
+        except RemoteRoundError as e:
+            assert "refusing to ship" not in str(e), f"public coldkey must not trip the guard: {e}"
 
 
 def test_auditor_publishes_its_verdicts_or_stops_voting():
