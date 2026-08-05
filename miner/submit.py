@@ -133,9 +133,7 @@ def cmd_reveal(a) -> int:
     revealed = json.dumps(body, separators=(",", ":"), sort_keys=True)
     print(json.dumps({"content_hash": st["content_hash"], "salt": st["salt"]}, indent=2))
     print(f"\nreveal envelope ({len(revealed)} bytes):\n  {revealed}")
-    print("\nPublish the two values above to the validator's reveal endpoint (or the reveal "
-          "commitment slot) once the round has opened.")
-    return 0
+    return _write_chain(a, revealed)
 
 
 def _write_chain(a, envelope: str) -> int:

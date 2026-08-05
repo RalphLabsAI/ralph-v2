@@ -2041,6 +2041,17 @@ def test_miner_submit_and_chain_adapter():
                 return {0: st["envelope"], 1: "legacy-v1-handshake",
                         2: '{"v":9,"tier":"x"}'}[uid]
 
+            # commitments_map is preferred; give it the write heights so the ordering check runs
+            class _Substrate:
+                def query_map(self, module, storage_function, params):
+                    def wrap(raw, blk):
+                        return {"block": blk, "info": {"fields": [
+                            {"Raw64": "0x" + raw.encode().hex()}]}}
+                    return [("hkA", wrap(st["envelope"], 100)),
+                            ("hkB", wrap("legacy-v1-handshake", 100)),
+                            ("hkC", wrap('{"v":9,"tier":"x"}', 100))]
+            substrate = _Substrate()
+
             def metagraph(self, netuid):
                 return _MG()
 
@@ -2056,6 +2067,24 @@ def test_miner_submit_and_chain_adapter():
                                                "salt": st["salt"]}})
         cs = io.read_commitments(1100, 1234)
         assert len(cs) == 1 and cs[0].hotkey == "hkA", cs
+
+        # SEALED BEFORE THE NONCE, OR NOT SCORED. One slot holds cv, ch and salt in a single
+        # write, so a miner who waits for the nonce block can see which items and observer it
+        # draws, fit to that exam, and write all three together — verify_reveal passes trivially
+        # because they were computed together. max_block IS the nonce block, so a commitment at
+        # or after it was not sealed first. Reported by a miner, 2026-08-05.
+        late = BittensorChainIO(subtensor=_Sub(), netuid=40,
+                                fetch_dir_for=lambda hk, uri: str(d),
+                                reveals={"hkA": {"content_hash": st["content_hash"],
+                                                 "salt": st["salt"]}})
+        assert late.read_commitments(0, 100) == [], "a commitment at the nonce block must not score"
+        assert any("not sealed before" in w for _, w in late.skipped), late.skipped
+        # ...and one written before it still scores
+        early = BittensorChainIO(subtensor=_Sub(), netuid=40,
+                                 fetch_dir_for=lambda hk, uri: str(d),
+                                 reveals={"hkA": {"content_hash": st["content_hash"],
+                                                  "salt": st["salt"]}})
+        assert len(early.read_commitments(0, 101)) == 1
         assert cs[0].tier == "sub4" and cs[0].artifact_uri == "hf://acme/demo@v1"
         # a v1 handshake and an unknown version are SKIPPED with reasons, never guessed at
         assert len(io.skipped) == 2, io.skipped
@@ -2072,6 +2101,11 @@ def test_miner_submit_and_chain_adapter():
         class _Empty(_Sub):
             def get_commitment(self, netuid, uid):
                 return None
+
+            class _NoSubstrate:
+                def query_map(self, module, storage_function, params):
+                    return []
+            substrate = _NoSubstrate()
 
         bare = BittensorChainIO(subtensor=_Empty(), netuid=40)
         assert bare.commit_root(1100, 1234) != root_live, \

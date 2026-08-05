@@ -127,9 +127,17 @@ class BittensorChainIO:
                                                 f"({type(e).__name__}) — falling back to per-uid"))
             return out
         for k, v in res:
-            raw = _decode_commitment(getattr(v, "value", v))
+            val = getattr(v, "value", v)
+            raw = _decode_commitment(val)
             if raw:
-                out[str(k)] = raw
+                # THE WRITE HEIGHT COMES WITH IT. Without it nothing can check WHEN a commitment
+                # was made, which is the whole basis of commit-then-generate — see read_commitments.
+                blk = 0
+                try:
+                    blk = int((val or {}).get("block") or 0)
+                except Exception:
+                    blk = 0
+                out[str(k)] = (raw, blk)
         return out
 
     def read_commitments(self, min_block: int, max_block: int, require_local: bool = True) -> list:
@@ -142,8 +150,25 @@ class BittensorChainIO:
         out: list[Commitment] = []
         cmap = self.commitments_map()
         for uid, hotkey in enumerate(self._hotkeys()):
-            raw = cmap.get(hotkey) if cmap else self._commitment_of(uid, hotkey)
+            entry = cmap.get(hotkey) if cmap else (self._commitment_of(uid, hotkey), 0)
+            raw, wrote_at = entry if isinstance(entry, tuple) else (entry, 0)
             if not raw:
+                continue
+            # SEALED BEFORE THE NONCE, OR NOT SCORED. `min_block`/`max_block` were accepted and
+            # then ignored, and the commitment's write height was never read — so nothing checked
+            # WHEN a miner committed. Since one slot holds cv, ch and salt in a single write, a
+            # miner could watch for the nonce block, see which items and which observer it draws,
+            # fit an artifact to that exam, and write all three values together: verify_reveal
+            # passes trivially because they were computed together. That defeats the one property
+            # the whole commit-then-generate ordering exists to provide.
+            #
+            # `max_block` IS the nonce block (run_orchestrated draws the nonce from `now` and
+            # passes it as `hi`), so a commitment written at or after it was not sealed first.
+            # Reported by a miner, 2026-08-05.
+            if max_block and wrote_at and wrote_at >= max_block:
+                self.skipped.append((hotkey, f"committed at block {wrote_at}, at or after the "
+                                             f"round nonce block {max_block} — not sealed before "
+                                             f"the exam was drawn"))
                 continue
             env = self._parse(hotkey, raw)
             if env is None:
