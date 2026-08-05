@@ -148,7 +148,13 @@ class BittensorChainIO:
             env = self._parse(hotkey, raw)
             if env is None:
                 continue
+            # THE REVEAL RIDES IN THE ENVELOPE. `reveals` was an injectable dict that nothing in
+            # production ever populated, so every submission arrived unrevealed and intake skipped
+            # its seal check. A miner's commitment slot is the only channel they have, so the
+            # reveal is written back into it alongside the `cv` it has to match.
             rev = self.reveals.get(hotkey) or {}
+            if not rev.get("content_hash") and env.get("ch"):
+                rev = {"content_hash": str(env.get("ch", "")), "salt": str(env.get("salt", ""))}
             ckpt = ""
             if self.fetch_dir_for is not None:
                 try:

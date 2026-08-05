@@ -3613,6 +3613,64 @@ def test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent():
         assert len(burned) == 1, f"expected exactly one burn, got {len(burned)}"
 
 
+def test_an_unrevealed_submission_is_refused_not_waved_through():
+    """COMMIT-REVEAL WAS FAIL-OPEN, AND UNREACHABLE FROM THE MINER'S SIDE.
+
+    intake ran the seal check only `if revealed_hash and salt and committed_value`, so a submission
+    with no reveal skipped it entirely and scored as though it had passed. And no miner could have
+    revealed anyway: `submit reveal` printed the two values and told them to publish to "the
+    validator's reveal endpoint", which never existed. So the gate that binds the scored bytes to
+    what was sealed before the nonce existed was absent on every real submission — while the
+    announcement told miners their checkpoint was sealed before the exam was drawn."""
+    import json as _json, struct, tempfile
+    from pathlib import Path
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.intake import intake
+    from eval.chain_bittensor import BittensorChainIO, build_commitment_envelope
+
+    with tempfile.TemporaryDirectory() as dd:
+        d = Path(dd) / "ck"
+        d.mkdir()
+        hb = _json.dumps({"w": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}).encode()
+        (d / "model.safetensors").write_bytes(struct.pack("<Q", len(hb)) + hb + b"\0" * 16)
+        (d / "config.json").write_text('{"hidden_size":8}')
+        h, salt = content_hash(str(d)), "s0"
+        cv = commit_value(h, salt)
+        bud = TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)
+
+        # committed but NOT revealed -> REFUSED with a reason, never silently accepted
+        dec = intake(str(d), bud, committed_value=cv)
+        assert not dec.accepted and any("not revealed" in r for r in dec.reasons), dec.reasons
+
+        # revealed -> accepted
+        assert intake(str(d), bud, revealed_hash=h, salt=salt, committed_value=cv).accepted
+
+        # and a WRONG reveal is still caught (the seal is checked, not merely present)
+        bad = intake(str(d), bud, revealed_hash="f" * 64, salt=salt, committed_value=cv)
+        assert not bad.accepted, bad.reasons
+
+        # THE REVEAL TRAVELS IN THE ENVELOPE, because the commitment slot is the only channel a
+        # miner has. The validator reads it back out with no injected state.
+        env = _json.loads(build_commitment_envelope("t", cv, f"file://{d}"))
+        env["ch"], env["salt"] = h, salt
+        raw = _json.dumps(env, separators=(",", ":"), sort_keys=True)
+
+        class _MG:
+            hotkeys = ["hkA"]; coldkeys = ["ckA"]
+
+        class _Sub:
+            def metagraph(self, netuid): return _MG()
+            def get_commitment(self, netuid, uid): return raw
+
+        io = BittensorChainIO(subtensor=_Sub(), netuid=40,
+                              fetch_dir_for=lambda hk, uri: str(d))
+        cs = io.read_commitments(0, 100)
+        assert len(cs) == 1 and cs[0].revealed_hash == h and cs[0].salt == salt, cs
+        assert intake(str(d), bud, revealed_hash=cs[0].revealed_hash, salt=cs[0].salt,
+                      committed_value=cs[0].committed_value).accepted
+
+
 def test_the_throne_is_inherited_from_the_published_trail():
     """A KING NOBODY HAS TO BEAT IS NOT A KING.
 
@@ -4128,6 +4186,7 @@ def main() -> int:
              test_auditor_verifies_then_diverges,
              test_auditor_verdict_states_what_it_did_not_check,
              test_auditor_touches_the_chain_once_per_pass_and_never_goes_silent,
+             test_an_unrevealed_submission_is_refused_not_waved_through,
              test_the_throne_is_inherited_from_the_published_trail,
              test_gguf_is_loadable_because_nothing_else_can_pass_the_tiers,
              test_one_bad_artifact_cannot_take_the_round_down,

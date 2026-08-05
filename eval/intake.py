@@ -36,8 +36,13 @@ class IntakeDecision:
 def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | None = None,
            hotkey: str = "", coldkey: str = "", bond_posted: float = 0.0,
            revealed_hash: str = "", salt: str = "", committed_value: str = "") -> IntakeDecision:
-    """`revealed_hash`/`salt`/`committed_value`: when all three are supplied, the artifact
-    is fetch-verified against the on-chain commit-reveal before it is ever loaded."""
+    """`revealed_hash`/`salt`/`committed_value`: the artifact is fetch-verified against the
+    on-chain commit-reveal before it is ever loaded.
+
+    A `committed_value` with no reveal is REFUSED, not skipped. The check used to run only when all
+    three arrived together, so an unrevealed submission bypassed the one gate that binds the scored
+    bytes to what was sealed before the round nonce existed — and since nothing populated the
+    reveal in production, that was every submission."""
     reasons: list[str] = []
 
     # 1. economics first — cheapest, and stops spam before any file work
@@ -105,6 +110,15 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
     # 4. identity: content-hash the artifact, and fetch-verify it against the commitment
     #    when one was supplied. Done before any runner is built (no untrusted load yet).
     from .identity import content_hash, verify_reveal
+    # FAIL CLOSED. This used to be `if all three are supplied`, which meant a submission with no
+    # reveal skipped the seal check ENTIRELY and was scored as if it had passed — the one gate that
+    # binds the scored bytes to what was committed before the nonce existed, silently absent. A
+    # missing reveal is a miner who has not finished submitting, not a miner who passed.
+    if committed_value and not (revealed_hash and salt):
+        reasons.append("committed but not revealed: the sealed value cannot be checked against the "
+                       "fetched bytes, so nothing binds this artifact to the commitment. Run "
+                       "`python -m miner.submit reveal`.")
+        return IntakeDecision(False, reasons=reasons)
     if revealed_hash and salt and committed_value:
         ok, res = verify_reveal(ckpt_dir, revealed_hash, salt, committed_value)
         if not ok:

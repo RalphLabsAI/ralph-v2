@@ -122,7 +122,17 @@ def cmd_reveal(a) -> int:
               f"The validator would reject this as bait-and-switch. Restore the committed bytes "
               f"or commit again.")
         return 1
+    # THE REVEAL GOES ON CHAIN, into the same slot. It printed these two values and told the miner
+    # to "publish them to the validator's reveal endpoint" — there is no such endpoint and never
+    # was, so no miner could complete a submission and the validator skipped the seal check on
+    # every one. The slot is the only channel a miner has; `cv` stays in the envelope, so the
+    # validator still checks H(content_hash‖salt) == cv and a rewritten reveal cannot forge it.
+    env = envelope(st["tier"], st["commit_value"], st["artifact_uri"])
+    body = json.loads(env)
+    body["ch"], body["salt"] = st["content_hash"], st["salt"]
+    revealed = json.dumps(body, separators=(",", ":"), sort_keys=True)
     print(json.dumps({"content_hash": st["content_hash"], "salt": st["salt"]}, indent=2))
+    print(f"\nreveal envelope ({len(revealed)} bytes):\n  {revealed}")
     print("\nPublish the two values above to the validator's reveal endpoint (or the reveal "
           "commitment slot) once the round has opened.")
     return 0
