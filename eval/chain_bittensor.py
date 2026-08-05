@@ -175,10 +175,20 @@ class BittensorChainIO:
 
     def commit_root(self, min_block: int, max_block: int) -> str:
         """Deterministic digest over the window's sealed values. Binds the item/observer seeds to
-        the exact set of submissions, so an auditor can prove which cohort a round scored."""
+        the exact set of submissions, so an auditor can prove which cohort a round scored.
+
+        `require_local=False` IS THE POINT, and getting this wrong was a blocker. A commit root is a
+        digest over what miners wrote ON CHAIN; whether this box could download their bytes is a
+        separate and later question. The default (`require_local=True`) drops every submission whose
+        artifact is not on local disk — so on the CPU orchestrator, which deliberately never fetches
+        artifacts, EVERY submission was dropped and commit_root returned
+        e3b0c44298fc1c14… (the digest of nothing) no matter who had submitted. The round's exam
+        would then attest to no cohort at all, which is precisely the property the value exists to
+        provide. It also stops the single-box path downloading every artifact twice."""
         import hashlib
         h = hashlib.sha256()
-        for c in sorted(self.read_commitments(min_block, max_block), key=lambda x: x.hotkey):
+        for c in sorted(self.read_commitments(min_block, max_block, require_local=False),
+                        key=lambda x: x.hotkey):
             h.update(f"{c.hotkey}|{c.committed_value}".encode())
             h.update(b"\0")
         return h.hexdigest()

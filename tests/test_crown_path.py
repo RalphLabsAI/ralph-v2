@@ -2061,7 +2061,25 @@ def test_miner_submit_and_chain_adapter():
         assert len(io.skipped) == 2, io.skipped
         assert any("not JSON" in w for _, w in io.skipped)
         assert any("not a v2" in w for _, w in io.skipped)
-        assert len(io.commit_root(1100, 1234)) == 64
+        # COMMIT_ROOT MUST BIND THE COHORT. It is a digest over what miners wrote ON CHAIN, so it
+        # cannot depend on whether this box happened to download their bytes — the CPU orchestrator
+        # deliberately never fetches, and with the local requirement applied here every submission
+        # was dropped and commit_root returned the digest of nothing for every round, attesting to
+        # no cohort at all. That is the one property the value exists to provide.
+        root_live = io.commit_root(1100, 1234)
+        assert len(root_live) == 64
+
+        class _Empty(_Sub):
+            def get_commitment(self, netuid, uid):
+                return None
+
+        bare = BittensorChainIO(subtensor=_Empty(), netuid=40)
+        assert bare.commit_root(1100, 1234) != root_live, \
+            "commit_root is identical with and without submissions — it binds nothing"
+        # and it must not depend on the fetcher, which is what made it constant
+        nofetch = BittensorChainIO(subtensor=_Sub(), netuid=40, fetch_dir_for=None)
+        assert nofetch.commit_root(1100, 1234) == root_live, \
+            "commit_root changed when no artifact was fetched — on-chain commitments are the input"
 
         # WRITES ARE OFF BY DEFAULT — nothing may touch a live signer by accident
         assert io.set_weights({"hkA": 1.0}) is False
