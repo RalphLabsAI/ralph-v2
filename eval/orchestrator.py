@@ -348,10 +348,20 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
 
     # NO SECRETS IN THE JOB SPEC. Asserted rather than assumed, because the spec is written to disk
     # and copied to somebody else's machine.
+    # CHECK FOR THE VALUES, NOT FOR WORDS. The first version matched field NAMES — including
+    # "coldkey", which the spec legitimately carries as a miner's PUBLIC ss58 address because the
+    # economics gate is per-coldkey. It refused every real round while protecting nothing: a secret
+    # that happened not to contain one of those five words would have shipped regardless. So this
+    # looks for the actual secrets this process holds.
     blob = json.dumps(plan.as_job())
-    for leak in ("RALPH_RECORD_SEED", "coldkey", "seed", "private", "mnemonic"):
-        if leak.lower() in blob.lower():
-            raise RemoteRoundError(f"refusing to ship a job spec containing {leak!r}")
+    held = {"RALPH_RECORD_SEED": os.environ.get("RALPH_RECORD_SEED", ""),
+            "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
+            "SHADEFORM_API_KEY": os.environ.get("SHADEFORM_API_KEY", "")}
+    for name, val in held.items():
+        if val and len(val) >= 16 and val in blob:
+            raise RemoteRoundError(f"refusing to ship a job spec containing the value of {name}")
+    if "PRIVATE KEY" in blob or "mnemonic" in blob.lower():
+        raise RemoteRoundError("refusing to ship a job spec containing key material")
 
     name = f"ralph-round-{plan.round}-{int(time.time()) % 100000}"
     inst = provider.rent(spec, name)
