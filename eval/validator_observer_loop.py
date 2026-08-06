@@ -136,9 +136,13 @@ def _versions() -> dict:
         # THE EXAM'S CONTEXT CEILING AND THE RUNTIME THAT SETS IT. Both change which items are
         # scored, so both are part of the measurement. Omitting them would make an auditor who
         # re-derives the selection pick a different 72 items and report a false DIVERGED.
-        from .observer_round import MAX_PREFIX_CHARS
+        from .pool import MAX_PREFIX_TOKENS, PREFIX_TOKENIZER, PREFIX_TRUNCATION_SIDE
         from .runners import GGUFStudentRunner
-        out["max_prefix_chars"] = MAX_PREFIX_CHARS
+        out["max_prefix_tokens"] = MAX_PREFIX_TOKENS
+        out["prefix_tokenizer"] = PREFIX_TOKENIZER
+        out["prefix_truncation_side"] = PREFIX_TRUNCATION_SIDE
+        # The student's window is part of the measurement too: llama.cpp silently trades prompt
+        # length against `max_tokens`, so this decides how many step tokens a miner actually got.
         out["student_n_ctx"] = GGUFStudentRunner.N_CTX
     except Exception:
         pass

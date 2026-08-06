@@ -30,47 +30,45 @@ def _scored(mid, per_axis):
                   per_point=flat, gates_ok=True, per_axis=per_axis)
 
 
-def test_the_exam_cannot_contain_items_no_submission_can_read():
-    """THE EXAM IS BOUNDED BY THE WEAKEST ADMISSIBLE RUNTIME, not by the parent's.
+def test_the_exam_is_clamped_not_filtered():
+    """THE EXAM IS BOUNDED BY THE WEAKEST ADMISSIBLE RUNTIME — and by CLAMPING, never by dropping.
 
-    GGUF is the only format that can pass the bit tiers; it runs under llama.cpp, whose context
-    window RAISES rather than truncates:
+    GGUF is the only format that can pass the bit tiers; it runs under llama.cpp, whose window
+    RAISES rather than truncates, and a real round died mid-scoring on
+    `Requested tokens (5990) exceed context window of 4096`.
 
-        ValueError: Requested tokens (5990) exceed context window of 4096
+    The first fix filtered oversized items out by CHARACTER length. Measured on the real pool that
+    deleted 267 of 900 items and the ENTIRE en/deep slice — retention is aggregated worst-slice
+    over (observer x language x depth), and that slice is exactly where a cloned artifact is
+    weakest. A character bound is also non-monotonic in tokens: it binds hardest where characters
+    are least dense, i.e. on English, and barely at all on Chinese.
 
-    A real round died there after the identity canary had passed and the first miner was already
-    being scored. Setting an exam no legal submission can read is not a hard exam, it is an invalid
-    one — so oversized trajectories are never selectable.
-
-    Also asserts the part that is easy to get wrong: `item_indices` must remain indices into the
-    pool AS PASSED, because `pool_sha256` pins that pool and an auditor re-derives against it.
-    Filtering the list instead of the index set renumbers everything silently."""
-    from eval.steps import Trajectory
-    from eval.observer_round import MAX_PREFIX_CHARS, select_trajectories
+    So: clamp every prefix, keep every item and every stratum."""
+    from eval.pool import MAX_PREFIX_TOKENS, PREFIX_TRUNCATION_SIDE, clamp_prefixes
     from eval.runners import GGUFStudentRunner
+    from eval.steps import Trajectory
 
-    # the ceiling must leave room for the generated step AND the observer's continuation, even at
-    # the worst tokeniser ratio a multilingual corpus produces (CJK ~1 token per character)
-    assert MAX_PREFIX_CHARS + 256 + 128 < GGUFStudentRunner.N_CTX
+    assert MAX_PREFIX_TOKENS + 256 <= GGUFStudentRunner.N_CTX, \
+        "a clamped prefix plus a full-length step must still fit the student's window"
+    assert PREFIX_TRUNCATION_SIDE == "left", \
+        "these prefixes end where the step begins; right-truncation deletes what predicts it"
 
-    pool, oversized = [], set()
-    for i in range(200):
-        big = i % 5 == 0
-        if big:
-            oversized.add(i)
-        pool.append(Trajectory(
-            id=f"t{i}", prefix="x" * (MAX_PREFIX_CHARS + 500 if big else 200),
-            source=("samvaad" if i % 3 == 0 else "zh_x" if i % 3 == 1 else "en_x"),
-            index=i % 6, meta={}))
+    class _Tok:
+        truncation_side = "right"
 
-    sel, idx = select_trajectories(pool, "root", "nonce", 72)
-    assert idx, "nothing was selected"
-    assert not (set(idx) & oversized), \
-        f"an item longer than the student context window was put in the exam: {set(idx) & oversized}"
-    # indices still address the ORIGINAL pool
-    for j, t in zip(idx, sel):
-        assert pool[j] is t, "item_indices no longer index the pool as passed"
-    assert all(len(t.prefix) <= MAX_PREFIX_CHARS for t in sel)
+        def __call__(self, text, **kw):
+            return {"input_ids": list(range(len(text)))}
+
+        def decode(self, ids, **kw):
+            return "x" * len(ids)
+
+    long_t = Trajectory(id="a", prefix="y" * 9000, source="en_x", index=0, meta={})
+    short_t = Trajectory(id="b", prefix="short", source="zh_x", index=4, meta={})
+    out = clamp_prefixes([long_t, short_t], max_tokens=MAX_PREFIX_TOKENS, tok=_Tok())
+
+    assert len(out) == 2, "clamping must never drop an item — that is what deleted a whole slice"
+    assert len(long_t.prefix) == MAX_PREFIX_TOKENS
+    assert short_t.prefix == "short", "a prefix under the ceiling must be untouched"
 
 
 def test_the_incumbent_cannot_swap_its_bytes_between_rounds():

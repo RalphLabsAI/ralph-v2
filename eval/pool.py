@@ -67,7 +67,56 @@ class PoolSpec:
     def as_corpus_spec(self) -> str:
         parts = "+".join(f"{name}:{frac:.2f}" for name, frac in self.mix)
         langs = ",".join(f"{k}={v}" for k, v in sorted(self.languages.items()))
-        return f"{parts}@rev={self.revision}|dedup={self.dedup}|langs={langs}|n={self.n}"
+        # The clamp changes the bytes an index points at, so it belongs in the spec the record
+        # pins — an auditor rebuilding the pool without it gets different prefixes.
+        return (f"{parts}@rev={self.revision}|dedup={self.dedup}|langs={langs}|n={self.n}"
+                f"|maxprefix={MAX_PREFIX_TOKENS}@{PREFIX_TOKENIZER}|side={PREFIX_TRUNCATION_SIDE}")
+
+
+# THE EXAM'S CONTEXT CEILING. Set by the WEAKEST admissible runtime, not by the parent's: GGUF is
+# the only format that can pass the bit tiers, it runs under llama.cpp, and llama.cpp RAISES rather
+# than truncates past its window. A real round died mid-scoring on
+# `Requested tokens (5990) exceed context window of 4096`.
+#
+# CLAMPED, NOT FILTERED, and at BUILD time. Filtering by length deletes whole strata — measured on
+# the real pool, a 3,000-character bound removed 267 of 900 items and the entire en/deep slice,
+# which is precisely the axis a cloned artifact cannot fake. Clamping keeps every item and every
+# stratum, and costs only the head of the longest 7%.
+#
+# BUILD TIME, because five consumers read the prefix — the parent's generate, both of the
+# observer's `distributions` calls, the miner's generate, and `_freeze`. Clamping inside a runner
+# would hand them different K: the step would be conditioned on a clamped prefix while P_0 was
+# conditioned on the full one, and the KL would compare distributions over different conditions.
+# Doing it here also means `dump_pool` publishes exactly what the GPU saw.
+#
+# LEFT, because these prefixes end where the step begins. Right-truncation would delete the only
+# context that predicts the thing being generated.
+MAX_PREFIX_TOKENS = 4096
+PREFIX_TOKENIZER = "Qwen/Qwen3-8B"
+PREFIX_TRUNCATION_SIDE = "left"
+
+
+def clamp_prefixes(trajectories, max_tokens: int = MAX_PREFIX_TOKENS,
+                   tokenizer_id: str = PREFIX_TOKENIZER, tok=None):
+    """Left-clamp every prefix to `max_tokens`. Idempotent, and a no-op without a tokenizer.
+
+    Degrades to unclamped rather than crashing when transformers is absent: the pool is built in
+    CPU tests and on the orchestrator, neither of which needs a tokenizer to exercise the rest."""
+    if tok is None:
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(tokenizer_id)
+        except Exception:
+            return trajectories
+    tok.truncation_side = PREFIX_TRUNCATION_SIDE
+    for t in trajectories:
+        pre = getattr(t, "prefix", "") or ""
+        if not pre:
+            continue
+        ids = tok(pre, add_special_tokens=False)["input_ids"]
+        if len(ids) > max_tokens:
+            t.prefix = tok.decode(ids[-max_tokens:], skip_special_tokens=True)
+    return trajectories
 
 
 POOL_FIELDS = ("id", "source", "prefix", "step", "index", "meta")
@@ -148,6 +197,7 @@ def build_pool(n: int, mix=DEFAULT_MIX, max_steps: int = 2, revision: str = "mai
         want = max(1, round(n * frac))
         got = loader(name, want, max_steps)
         out.extend(got[:want])
+    out = clamp_prefixes(out)
     spec = PoolSpec(mix=tuple(mix), revision=revision, n=len(out))
     spec.languages = language_balance(out)
     return out, spec

@@ -20,20 +20,34 @@ from .axes.math_gsm import extract_answer
 class HFRunner:
     """Real inference via transformers. Lazy-imports so the harness runs without torch."""
 
-    # BATCH SIZE IS BOUNDED BY EAGER ATTENTION, NOT BY THROUGHPUT. `eager` is pinned for
-    # determinism (see ATTN_IMPLEMENTATION), and eager materialises the full
-    # batch x heads x q_len x k_len score matrix — quadratic in prompt length, linear in batch. At
-    # batch_size=8 a real round asked for a single 64.12 GiB allocation on an 80 GB H100 and died.
-    # That works out to ~8 GiB per sample, i.e. prefill over a very long prefix, so the ceiling is
-    # set by the LONGEST item in the pool rather than by the average.
+    # BATCH SIZE IS 1 BECAUSE OF CORRECTNESS, AND ONLY INCIDENTALLY BECAUSE OF MEMORY.
     #
-    # This value is pinned into every record (`_versions()` reads this default by name) because it
-    # changes the answer: measured spread across batch_size in {1,2,3,5,8} is 0.050 retention on an
-    # H100 — the dethrone margin itself. Lowering it is therefore a real decision and not a tuning
-    # knob, and it is safe to make now only because no round has ever published a number.
+    # `build_shared` generates the parent's step over ALL trajectories; `score_submission` and the
+    # identity canary generate over the USABLE subset only (MIN_TEACHER_EFFECT and the empty-step
+    # discards make that strictly smaller in the normal case). Left padding pads each item to the
+    # longest in ITS window — so at bs=2 a measured 32 of 64 trajectories land beside DIFFERENT
+    # neighbours in the two calls, get a different number of pad tokens, and decode differently.
+    # The identity canary therefore is NOT 1.000 by construction above bs=1, contrary to its own
+    # docstring: it can pass or fail depending on whether the neighbours happened to match, which
+    # is worse than failing outright. batch_invariance.py already measured that mechanism at
+    # 0.046-0.097 with the step text moving every time.
+    #
+    # And the fairness half a miner would hold us to: `GGUFStudentRunner.generate` runs one prompt
+    # at a time, unpadded, and every submission this round was GGUF. At bs>1 the REFERENCE answer
+    # is produced under padding that no submission experiences. At bs=1 both sides are unpadded and
+    # the paired comparison is like-for-like.
+    #
+    # Memory is the lesser reason, though it also binds: `eager` is pinned for determinism and
+    # materialises the full batch x heads x q_len x k_len score matrix — quadratic in prompt
+    # length, linear in batch. At batch_size=8 a real round asked for one 64.12 GiB allocation on
+    # an 80 GB H100 and died.
+    #
+    # Pinned into every record (`_versions()` reads this default BY NAME) because it changes the
+    # answer: measured spread across batch_size in {1,2,3,5,8} is 0.050 retention on an H100 — the
+    # dethrone margin itself. Safe to set now only because no round has ever published a number.
     def __init__(self, model_id: str, device: str = "auto", dtype: str = "bfloat16",
                  revision: str | None = None, name: str | None = None,
-                 trust_remote_code: bool = False, batch_size: int = 2,
+                 trust_remote_code: bool = False, batch_size: int = 1,
                  load_in_4bit: bool = False, load_in_8bit: bool = False):
         self.model_id = model_id
         self.revision = revision
@@ -361,7 +375,7 @@ class SafeStudentRunner(HFRunner):
     construction time (never reaches from_pretrained if a pickle/.py is present)."""
 
     def __init__(self, ckpt_dir: str, device: str = "auto", dtype: str = "bfloat16",
-                 name: str | None = None, batch_size: int = 8):
+                 name: str | None = None, batch_size: int = 1):
         from pathlib import Path
         from .gates import FORBIDDEN_FILES
         d = Path(ckpt_dir)
@@ -449,7 +463,13 @@ class GGUFStudentRunner:
     """
 
     N_THREADS = 8            # pinned: thread count changes reduction order, hence the output
-    N_CTX = 4096
+    # 8192, NOT 4096, AND THIS IS A FAIRNESS FIX. llama.cpp silently rewrites
+    # `max_tokens = n_ctx - len(prompt_tokens)` rather than erroring, so at n_ctx=4096 a miner with
+    # a 3,900-token prefix gets 196 step tokens where the parent got its full 256 — a
+    # prefix-length-dependent handicap on one side of a paired comparison, invisible in the record.
+    # 8192 clears the clamped 4096 prefix plus 256 step with slack, and sits far below the GGUF's
+    # native window so no RoPE scaling is triggered.
+    N_CTX = 8192
     N_BATCH = 512
 
     def __init__(self, ckpt_dir: str, name: str | None = None, backend=None):

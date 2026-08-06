@@ -32,17 +32,6 @@ from typing import Protocol, Sequence
 
 from .observer_kl import MIN_TEACHER_EFFECT, StepEffect, score_miner, step_effect
 
-# THE EXAM'S CONTEXT CEILING, in characters, and it is set by the WEAKEST admissible runtime rather
-# than by the parent's. GGUF is the only format that can pass the bit tiers; it runs under
-# llama.cpp, whose context window is a hard limit (`GGUFStudentRunner.N_CTX = 4096`) that raises
-# rather than truncates. Room is left for the generated step (`max_step_tokens`) and for the
-# observer's continuation to be appended on top of the prefix.
-#
-# CHARACTERS, NOT TOKENS: selection has to be re-derivable by an auditor without loading a
-# tokenizer, and the bound must hold for the worst ratio in a multilingual corpus — CJK approaches
-# one token per character where English is nearer a quarter. So this IS the token bound in the
-# worst case and is conservative everywhere else. Pinned into the record by `_versions()`.
-MAX_PREFIX_CHARS = 3000
 
 
 class Stepper(Protocol):
@@ -200,7 +189,17 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
     revision-pinned ordering."""
     import random as _r
 
-    # THE EXAM MUST BE ANSWERABLE BY EVERY LEGAL SUBMISSION FORMAT. GGUF is the only format that can
+    # THE EXAM IS CLAMPED AT POOL-BUILD TIME (eval/pool.py), not here. It used to be filtered here
+    # by CHARACTER length, which was wrong twice over: measured on the real pool it deleted 267 of
+    # 900 items and the ENTIRE en/deep slice — the anti-clone axis is multilingual x depth, so that
+    # pointed the one axis a cloned artifact cannot fake in exactly the wrong direction. And a
+    # character bound is non-monotonic in tokens: it kept a 2,183-char/2,010-token Hindi item and
+    # excluded a 3,198-char/975-token English one, because it binds hardest where characters are
+    # least dense. The justification for characters — "an auditor must re-derive selection without
+    # a tokenizer" — was answering a problem that does not exist: `dump_pool` publishes the prefix
+    # TEXT and `pool_sha256` binds it, so an auditor gets the same bytes and never tokenizes.
+    #
+    # THE EXAM MUST STILL BE ANSWERABLE BY EVERY LEGAL SUBMISSION FORMAT. GGUF is the only format that can
     # pass the bit tiers, it runs under llama.cpp, and llama.cpp has a HARD context window
     # (`GGUFStudentRunner.N_CTX`). A trajectory whose prefix exceeds it does not score a miner
     # badly — it raises, and the round dies for everyone:
@@ -219,18 +218,10 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
     # that. So the character bound IS the token bound in the worst case, and it is conservative
     # everywhere else. Observed real contexts this round were 68-398 tokens, so this excludes
     # almost nothing.
-    # ELIGIBILITY IS A SET OF INDICES, NOT A NEW POOL. `item_indices` in the signed record are
-    # indices INTO THE POOL AS PASSED, and an auditor re-derives them against `pool_sha256`.
-    # Filtering the list itself would renumber everything and quietly change what the published
-    # indices point at.
     total = len(pool)
     if total == 0:
         return [], []
-    eligible = {i for i, t in enumerate(pool)
-                if len(getattr(t, "prefix", "") or "") <= MAX_PREFIX_CHARS}
-    if not eligible:
-        return [], []
-    k = min(n, len(eligible))
+    k = min(n, total)
     rng = _r.Random(derive_seed(commit_root, round_nonce, tag))
 
     # Stratify by the FULL slice key the scorer uses, not just by language. score_miner drops any
@@ -243,14 +234,12 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
     # partition the aggregation will see.
     by_lang: dict = {}
     for i, t in enumerate(pool):
-        if i not in eligible:
-            continue
         lang = (getattr(t, "meta", None) or {}).get("lang") or _lang_of(t.source)
         depth = "deep" if getattr(t, "index", 0) >= 3 else "shallow"
         by_lang.setdefault((lang, depth), []).append(i)
 
     if len(by_lang) < 2:
-        idx = sorted(rng.sample(sorted(eligible), k))
+        idx = sorted(rng.sample(range(total), k))
         return [pool[i] for i in idx], idx
 
     # ARITHMETIC PRECONDITION. With S slices and a per-slice floor F, a draw of fewer than S*F
