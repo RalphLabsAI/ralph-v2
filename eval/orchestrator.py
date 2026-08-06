@@ -1047,11 +1047,26 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     # The prebuilt CUDA wheels stop at 0.2.66, which predates ternary (TQ1_0) — and ternary is a
     # live tier — so a source build is the only path. It needs nvcc, and the architecture is pinned
     # to 90 (Hopper/H100) because compiling for every architecture is what makes this slow.
+    # DISCOVER nvcc, DO NOT ASSUME ITS PATH. The first version hardcoded
+    # /usr/local/cuda-12.8/bin from the scaleway image and died on latitude/dallas with "No
+    # CMAKE_CUDA_COMPILER could be found" — every cloud lays CUDA out differently, and this code
+    # deliberately rents from whichever cloud is cheapest, so the image is never the same twice.
+    #
+    # AND IT FALLS BACK, which matters more than the discovery. A failed CUDA build must not kill
+    # the round: GPU offload is an OPTIMISATION (~17s -> ~2.8s per prompt on sub4) while the CPU
+    # wheel still scores correctly, only slower. Aborting a round because an optimisation would not
+    # compile is strictly worse than scoring slowly — and `student_backend` records which one
+    # actually ran, so a record never claims a speed it did not have.
     cuda_build = (
-        "(sudo -n apt-get install -y -q cuda-toolkit-12-8 >/dev/null 2>&1 || true) && "
-        "export PATH=/usr/local/cuda-12.8/bin:$PATH && "
+        "(sudo -n apt-get install -y -q cuda-toolkit >/dev/null 2>&1 || true); "
+        "NVCC=$(command -v nvcc || ls -1 /usr/local/cuda*/bin/nvcc 2>/dev/null | head -1); "
+        "if [ -n \"$NVCC\" ]; then "
+        "export CUDACXX=$NVCC; export PATH=$(dirname $NVCC):$PATH; "
         "CMAKE_ARGS='-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=90' "
-        ".venv/bin/pip install --no-cache-dir --no-binary llama-cpp-python llama-cpp-python && ")
+        ".venv/bin/pip install --no-cache-dir --no-binary llama-cpp-python llama-cpp-python "
+        "|| .venv/bin/pip install --no-cache-dir llama-cpp-python; "
+        "else echo 'no nvcc on this image - CPU wheel, scoring will be slower'; "
+        ".venv/bin/pip install --no-cache-dir llama-cpp-python; fi && ")
     _ssh_stream(inst, spec, f"cd {remote_dir} && python3 -m venv .venv 2>/dev/null; "
                             f"{torch_cmd}"
                             f".venv/bin/pip install transformers safetensors datasets "
