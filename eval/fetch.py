@@ -196,6 +196,21 @@ def _hf_list(repo: str, rev: str) -> list:
 
 
 def _hf_download(repo: str, rev: str, name: str, out_path: str) -> None:
+    """HARDLINK OUT OF THE CACHE, DO NOT COPY.
+
+    `hf_hub_download` already wrote the bytes into the HF cache, and `shutil.copyfile` then wrote
+    them again — so every artifact cost TWICE its size on a disk that also has to hold the parent,
+    the CUDA wheels and up to the 60 GB fetch ceiling. Round 1 attempt 8 fetched 29.6 GB of miner
+    artifacts, which is 59.2 GB stored, plus ~16 GB of parent and ~10 GB of wheels: ~85 GB on a box
+    with a 100 GB root disk, and it died moments after the parent loaded.
+
+    A hardlink is the same bytes under a second name — one inode, one copy, and identical for every
+    reader. Nothing here ever mutates a downloaded file (it is hashed and then read), so sharing
+    with the cache is safe. Falls back to copying when the cache is on another filesystem, which is
+    the only case `os.link` refuses."""
     from huggingface_hub import hf_hub_download
     p = hf_hub_download(repo, name, revision=rev)
-    shutil.copyfile(p, out_path)
+    try:
+        os.link(p, out_path)
+    except OSError:
+        shutil.copyfile(p, out_path)

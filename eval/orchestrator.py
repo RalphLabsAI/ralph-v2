@@ -814,6 +814,13 @@ def _run_on(inst, plan, provider, spec, job_path, work_dir, repo_dir, remote_dir
         return {"record": rec, "pool_blob": pool_blob, "summary": summary,
                 "instance": inst, "cost": inst.price_per_hour * (time.time() - t0) / 3600.0}
     finally:
+        # THE POST-MORTEM HAS TO HAPPEN BEFORE THE BODY IS DESTROYED. Teardown is correct and
+        # non-negotiable, but it also deletes the only machine that knows why the round died —
+        # attempt 8 ended with `ssh exit 255` and nothing else, which says the far end vanished and
+        # nothing about why. Disk, memory, the GPU and the kernel ring buffer are four cheap
+        # questions, and asking them costs seconds against a rental we are about to stop paying for.
+        if sys.exc_info()[0] is not None:
+            _capture_diagnostics(inst, spec, w)
         # ALWAYS. A leaked instance bills until somebody notices, and the process that leaked it is
         # by definition the one that already went wrong. `destroy` verifies rather than assumes:
         # the first version of it used the wrong HTTP verb and would have failed silently here.
@@ -835,6 +842,35 @@ def _remaining(inst: Instance, default_s: float) -> float:
     if not inst.kill_at:
         return default_s
     return max(1.0, min(default_s, inst.kill_at - time.time()))
+
+
+def _capture_diagnostics(inst: Instance, spec: GpuSpec, w) -> None:
+    """Ask the dying box the four questions, best-effort, on a short leash.
+
+    Every one of the eight round-1 failures was a seam rather than the mechanism, and the recurring
+    shape is "works from the dev box, breaks where it runs". The box IS the evidence, so a teardown
+    with no post-mortem converts a diagnosable failure into a guess — which is how attempt 8 ended
+    with a bare `ssh exit 255`.
+
+    Short timeout and everything swallowed: this runs while an exception is already propagating,
+    on a host that has just proved it may be unreachable, and it must never replace the real error
+    with its own."""
+    probes = (
+        ("disk", "df -h / /home 2>/dev/null | head -5"),
+        ("memory", "free -g 2>/dev/null | head -3"),
+        ("gpu", "nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader "
+                "2>/dev/null"),
+        ("kernel", "(dmesg 2>/dev/null || sudo -n dmesg 2>/dev/null) | tail -12"),
+    )
+    w("  post-mortem on the box before teardown:\n")
+    for label, cmd in probes:
+        try:
+            out = _ssh(inst, spec, cmd, timeout=25)
+        except Exception as e:
+            out = f"({type(e).__name__}: {str(e)[:80]})"
+        for line in (out or "(no output)").strip().splitlines()[:12]:
+            w(f"    {label:7} {line}\n")
+    _flush(w)
 
 
 def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, w) -> dict:
