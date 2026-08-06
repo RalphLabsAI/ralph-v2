@@ -30,6 +30,49 @@ def _scored(mid, per_axis):
                   per_point=flat, gates_ok=True, per_axis=per_axis)
 
 
+def test_the_exam_cannot_contain_items_no_submission_can_read():
+    """THE EXAM IS BOUNDED BY THE WEAKEST ADMISSIBLE RUNTIME, not by the parent's.
+
+    GGUF is the only format that can pass the bit tiers; it runs under llama.cpp, whose context
+    window RAISES rather than truncates:
+
+        ValueError: Requested tokens (5990) exceed context window of 4096
+
+    A real round died there after the identity canary had passed and the first miner was already
+    being scored. Setting an exam no legal submission can read is not a hard exam, it is an invalid
+    one — so oversized trajectories are never selectable.
+
+    Also asserts the part that is easy to get wrong: `item_indices` must remain indices into the
+    pool AS PASSED, because `pool_sha256` pins that pool and an auditor re-derives against it.
+    Filtering the list instead of the index set renumbers everything silently."""
+    from eval.steps import Trajectory
+    from eval.observer_round import MAX_PREFIX_CHARS, select_trajectories
+    from eval.runners import GGUFStudentRunner
+
+    # the ceiling must leave room for the generated step AND the observer's continuation, even at
+    # the worst tokeniser ratio a multilingual corpus produces (CJK ~1 token per character)
+    assert MAX_PREFIX_CHARS + 256 + 128 < GGUFStudentRunner.N_CTX
+
+    pool, oversized = [], set()
+    for i in range(200):
+        big = i % 5 == 0
+        if big:
+            oversized.add(i)
+        pool.append(Trajectory(
+            id=f"t{i}", prefix="x" * (MAX_PREFIX_CHARS + 500 if big else 200),
+            source=("samvaad" if i % 3 == 0 else "zh_x" if i % 3 == 1 else "en_x"),
+            index=i % 6, meta={}))
+
+    sel, idx = select_trajectories(pool, "root", "nonce", 72)
+    assert idx, "nothing was selected"
+    assert not (set(idx) & oversized), \
+        f"an item longer than the student context window was put in the exam: {set(idx) & oversized}"
+    # indices still address the ORIGINAL pool
+    for j, t in zip(idx, sel):
+        assert pool[j] is t, "item_indices no longer index the pool as passed"
+    assert all(len(t.prefix) <= MAX_PREFIX_CHARS for t in sel)
+
+
 def test_the_incumbent_cannot_swap_its_bytes_between_rounds():
     """THE KING CONTROLS ITS OWN REPO. A challenger's artifact is pinned to the content hash it
     revealed at commit time, but the incumbent used to be refetched with `expect_hash=""` — from a

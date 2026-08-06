@@ -32,6 +32,18 @@ from typing import Protocol, Sequence
 
 from .observer_kl import MIN_TEACHER_EFFECT, StepEffect, score_miner, step_effect
 
+# THE EXAM'S CONTEXT CEILING, in characters, and it is set by the WEAKEST admissible runtime rather
+# than by the parent's. GGUF is the only format that can pass the bit tiers; it runs under
+# llama.cpp, whose context window is a hard limit (`GGUFStudentRunner.N_CTX = 4096`) that raises
+# rather than truncates. Room is left for the generated step (`max_step_tokens`) and for the
+# observer's continuation to be appended on top of the prefix.
+#
+# CHARACTERS, NOT TOKENS: selection has to be re-derivable by an auditor without loading a
+# tokenizer, and the bound must hold for the worst ratio in a multilingual corpus — CJK approaches
+# one token per character where English is nearer a quarter. So this IS the token bound in the
+# worst case and is conservative everywhere else. Pinned into the record by `_versions()`.
+MAX_PREFIX_CHARS = 3000
+
 
 class Stepper(Protocol):
     """Produces one step K -> K+1. The parent and every miner satisfy this."""
@@ -187,10 +199,38 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
     the corpus spec that produced the pool — an index is only meaningful against a known,
     revision-pinned ordering."""
     import random as _r
+
+    # THE EXAM MUST BE ANSWERABLE BY EVERY LEGAL SUBMISSION FORMAT. GGUF is the only format that can
+    # pass the bit tiers, it runs under llama.cpp, and llama.cpp has a HARD context window
+    # (`GGUFStudentRunner.N_CTX`). A trajectory whose prefix exceeds it does not score a miner
+    # badly — it raises, and the round dies for everyone:
+    #
+    #     ValueError: Requested tokens (5990) exceed context window of 4096
+    #
+    # That is a validator bug wearing a miner's clothes. Setting an exam that no admissible
+    # submission can read is not a hard exam, it is an invalid one, so oversized items are excluded
+    # from SELECTION rather than left to fail. Filtering here (not in the pool) keeps `pool_sha256`
+    # and the published indices meaningful: the pool is unchanged and an auditor re-deriving the
+    # selection applies the identical, pinned bound.
+    #
+    # BOUNDED IN CHARACTERS, not tokens, and deliberately. Selection must be reproducible by an
+    # auditor without loading a tokenizer, and the bound has to hold for the worst tokeniser ratio
+    # in the corpus — CJK approaches one token per character, where English is nearer a quarter of
+    # that. So the character bound IS the token bound in the worst case, and it is conservative
+    # everywhere else. Observed real contexts this round were 68-398 tokens, so this excludes
+    # almost nothing.
+    # ELIGIBILITY IS A SET OF INDICES, NOT A NEW POOL. `item_indices` in the signed record are
+    # indices INTO THE POOL AS PASSED, and an auditor re-derives them against `pool_sha256`.
+    # Filtering the list itself would renumber everything and quietly change what the published
+    # indices point at.
     total = len(pool)
     if total == 0:
         return [], []
-    k = min(n, total)
+    eligible = {i for i, t in enumerate(pool)
+                if len(getattr(t, "prefix", "") or "") <= MAX_PREFIX_CHARS}
+    if not eligible:
+        return [], []
+    k = min(n, len(eligible))
     rng = _r.Random(derive_seed(commit_root, round_nonce, tag))
 
     # Stratify by the FULL slice key the scorer uses, not just by language. score_miner drops any
@@ -203,12 +243,14 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
     # partition the aggregation will see.
     by_lang: dict = {}
     for i, t in enumerate(pool):
+        if i not in eligible:
+            continue
         lang = (getattr(t, "meta", None) or {}).get("lang") or _lang_of(t.source)
         depth = "deep" if getattr(t, "index", 0) >= 3 else "shallow"
         by_lang.setdefault((lang, depth), []).append(i)
 
     if len(by_lang) < 2:
-        idx = sorted(rng.sample(range(total), k))
+        idx = sorted(rng.sample(sorted(eligible), k))
         return [pool[i] for i in idx], idx
 
     # ARITHMETIC PRECONDITION. With S slices and a per-slice floor F, a draw of fewer than S*F

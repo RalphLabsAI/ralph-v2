@@ -133,6 +133,13 @@ def _versions() -> dict:
         # plausible number.
         import inspect
         out["batch_size"] = inspect.signature(HFRunner.__init__).parameters["batch_size"].default
+        # THE EXAM'S CONTEXT CEILING AND THE RUNTIME THAT SETS IT. Both change which items are
+        # scored, so both are part of the measurement. Omitting them would make an auditor who
+        # re-derives the selection pick a different 72 items and report a false DIVERGED.
+        from .observer_round import MAX_PREFIX_CHARS
+        from .runners import GGUFStudentRunner
+        out["max_prefix_chars"] = MAX_PREFIX_CHARS
+        out["student_n_ctx"] = GGUFStudentRunner.N_CTX
     except Exception:
         pass
     return out
@@ -171,6 +178,11 @@ class ObserverRoundOutcome:
     kings_before: dict = field(default_factory=dict)
     events: list = field(default_factory=list)
     scores: dict = field(default_factory=dict)
+
+
+def c_hotkey_of(sub) -> str:
+    """The miner behind a Submission, for rejection records."""
+    return getattr(sub, "miner", "") or ""
 
 
 def run_observer_round(
@@ -298,7 +310,16 @@ def run_observer_round(
     for n, (sub, runner, art_uri) in enumerate(subs, 1):
         _tick("submission", f"[{n}/{len(subs)}] {sub.miner[:12]}… tier={sub.tier}", force=True)
         registry[sub.model_id] = runner
-        ms = score_submission(shared, runner, observer, max_step_tokens=max_step_tokens)
+        # ONE MINER'S MODEL MUST NEVER TAKE THE ROUND DOWN — the third time this shape has bitten:
+        # a miner-controlled tier hit a bare dict lookup, an artifact that cleared every gate failed
+        # to load, and now a runtime raised mid-generation. Whatever the cause, the blast radius has
+        # to be one submission. The reason is recorded against that miner rather than swallowed.
+        try:
+            ms = score_submission(shared, runner, observer, max_step_tokens=max_step_tokens)
+        except Exception as e:
+            out.rejected.append((c_hotkey_of(sub), [f"scoring raised {type(e).__name__}: "
+                                                    f"{str(e)[:200]}"]))
+            continue
         ok, reasons = True, list(ms.reasons)
         if canary is not None and ms.score > 0:
             c_ok, c_info = canary(sub, runner)
