@@ -93,6 +93,17 @@ footer{margin-top:26px;padding-top:16px;border-top:1px solid var(--line);
        color:var(--fg-3);font-size:12.5px;max-width:78ch}
 code{font-family:var(--mono);font-size:12px;background:var(--line-2);padding:1px 5px;border-radius:2px}
 a{color:var(--brand)}
+.live{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-top:13px;padding:10px 12px;
+      border:1px solid var(--line);border-radius:2px;background:color-mix(in srgb,var(--brand) 7%,transparent);
+      font-family:var(--mono);font-size:12px}
+.live b{color:var(--fg);font-weight:600}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--brand);flex:none;align-self:center}
+@media (prefers-reduced-motion:no-preference){.live-dot{animation:pulse 2.4s ease-in-out infinite}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.live-detail{color:var(--fg-2);word-break:break-all}
+.live-t{color:var(--fg-3);margin-left:auto;white-space:nowrap;font-variant-numeric:tabular-nums}
+.step{font-family:var(--mono);font-size:11px;border:1px solid var(--line);border-radius:2px;
+      padding:3px 7px;color:var(--fg-2);white-space:nowrap}
 </style>
 
 <div class="wrap">
@@ -136,6 +147,8 @@ const ago = s => { s = Math.max(0, s);
 // R1/R2: switch on state; `value` is ONLY read inside the measured branch. An unrecognised state
 // renders as unmeasured, never falls through to printing a value that may not be there.
 const MEASURED = new Set(['MEASURED','WITHHELD','STALE']);
+// Phrased as observations, never verdicts: `intake` is logged when intake BEGINS.
+const HANDLING = {fetch:'downloading', hash:'hashing', intake:'in intake', submission:'being scored'};
 function val(node, fmt = v => v) { return node && MEASURED.has(node.state) ? fmt(node.value) : null; }
 function voidBox(node, label) {
   const st = node && node.state ? node.state : 'UNKNOWN';
@@ -194,6 +207,11 @@ function render(d) {
       <div class="meter"><i style="width:${pct.toFixed(1)}%"></i></div>
       <div class="legend"><span>${el === null ? '—' : ago(el)} in this stage</span>
         <span>budget ${bud === null ? '—' : ago(bud)}</span></div>
+      ${(() => { const sv = val(r.substage); return sv
+          ? `<div class="live"><span class="live-dot"></span><b>${esc(sv.stage)}</b>
+               <span class="live-detail">${esc(sv.detail)}</span>
+               <span class="live-t">+${sv.remote_elapsed_s.toFixed(0)}s on the box · seen ${ago(now - sv.seen_at)} ago</span></div>`
+          : voidBox(r.substage, 'no live activity'); })()}
       <dl class="kv">
         <dt>Rental</dt><dd>${(val(d.rental, v => v.map(x => esc(x.name) + ' · ' + esc(x.status)).join('<br>')) || '—') || 'none'}</dd>
       </dl>
@@ -215,11 +233,14 @@ function render(d) {
   const t = document.getElementById('miners');
   if (nMiners === null) { t.outerHTML = `<div id="miners">${voidBox(miners, 'submissions')}</div>`; }
   else {
-    t.innerHTML = `<thead><tr><th>Hotkey</th><th>Tier</th><th>Artifact</th><th>Outcome</th></tr></thead>
+    t.innerHTML = `<thead><tr><th>Hotkey</th><th>Tier</th><th>Artifact</th><th>This round</th><th>Outcome</th></tr></thead>
       <tbody>${miners.value.map(m => `<tr>
         <td class="hk">${esc(m.hotkey.slice(0, 12))}…</td>
         <td><span class="tier">${esc(m.tier)}</span></td>
         <td class="uri">${esc(m.artifact_uri || '—')}</td>
+        <td>${val(m.handling)
+              ? `<span class="step">${esc(HANDLING[val(m.handling).step] || val(m.handling).step)}</span>`
+              : '<span class="pend">—</span>'}</td>
         <td>${val(m.outcome) === null
               ? `<span class="pend" title="${esc(m.outcome.because || '')}">not yet scored</span>`
               : esc(val(m.outcome))}</td></tr>`).join('')}</tbody>`;

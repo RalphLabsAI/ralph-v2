@@ -125,6 +125,11 @@ GRAMMAR = (
 
 _OWNER_RE = re.compile(r"eval[./](run_orchestrated|run_round)\b")
 
+# `[progress +   292s] generate Qwen/Qwen3-8B 8/72 @256 tok` — emitted by eval/progress.py on the
+# RENTED box and streamed into this log. The elapsed figure is the remote's own clock, so it is
+# carried as a number the remote reported, never as one this box can extrapolate from.
+_PROGRESS_RE = re.compile(r"\[progress \+\s*(\d+)s\]\s+(\S+)\s*(.*)$")
+
 
 # ---------------------------------------------------------------------------------------------
 # Frozen observations. `classify` is pure over these, which is what lets a forty-minute budget be
@@ -183,6 +188,10 @@ class LogView:
     claims_live: frozenset = frozenset()
     claims_dead: frozenset = frozenset()
     claims_stale: frozenset = frozenset()
+    # The remote scorer's own heartbeat lines from THIS run's slice, newest last:
+    # (elapsed_s, stage, detail). This is the only view of what a round is actually DOING —
+    # the milestone says "scoring", these say which of eight artifacts is being fetched.
+    progress: tuple = ()
     trusted: bool = False
     note: str = ""
 
@@ -390,6 +399,13 @@ def read_log(path: str, unit: UnitView) -> LogView:
     dead = _claims(head)
     stale = frozenset() if fresh else _claims(cur)
 
+    prog: list = []
+    if fresh:
+        for raw in cur.split("\n"):
+            mm = _PROGRESS_RE.search(raw)
+            if mm:
+                prog.append((float(mm.group(1)), mm.group(2).strip(), mm.group(3).strip()))
+
     milestone, line = "", ""
     if fresh:
         # EXACTLY two spaces. Streamed remote output is four-space ("    | ", "    · ") and is
@@ -405,7 +421,7 @@ def read_log(path: str, unit: UnitView) -> LogView:
                 break
     return LogView(mtime=st.st_mtime, inode=st.st_ino, banner_pid=bpid, milestone=milestone,
                    line=line, claims_live=live, claims_dead=dead, claims_stale=stale,
-                   trusted=True)
+                   progress=tuple(prog[-400:]), trusted=True)
 
 
 def read_rentals(provider):

@@ -149,9 +149,23 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
         # items writes nothing for minutes at a time and is entirely healthy — a fixed 120 s here
         # stamped `expired` on a live round, which is the same false-stale mistake as a false kill,
         # and it teaches a reader to ignore the one flag that matters.
+        # WHAT THE ROUND IS ACTUALLY DOING. The milestone says "scoring" for the entire expensive
+        # leg; these are the scorer's own heartbeats from the rented box — which of eight artifacts
+        # is downloading, which miner is in intake, how far through generation. Without it a miner
+        # watching a live round sees one unchanging word for forty minutes.
+        #
+        # `remote_elapsed_s` is the REMOTE's clock and `seen_at` is ours. Both are published because
+        # they answer different questions, and neither may be interpolated: a renderer that animates
+        # a counter is inventing precision the writer never claimed.
+        last = log.progress[-1] if log.progress else None
+        sub = (m({"stage": last[1], "detail": last[2][:120],
+                  "remote_elapsed_s": last[0], "seen_at": log.mtime})
+               if last else
+               unmeasured("this attempt has not reached the streamed scoring leg yet"))
         rnd = _section(log.mtime, budget, now,
                        in_flight=m(True),
                        stage=m(log.milestone),
+                       substage=sub,
                        # Published as an observation with its own timestamp, never as something a
                        # renderer may animate: it is a duration measured at `as_of`, not a clock.
                        stage_elapsed_s=m(round(elapsed, 1)),
@@ -181,13 +195,34 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
                             state="UNKNOWN")
         cohort = miners
     else:
+        # WHAT THE ROUND HAS DONE TO EACH SUBMISSION, so far, from the scorer's own heartbeats.
+        # The progress lines carry a TRUNCATED hotkey ("5ERWJp4StMcQ…"), so matching is by prefix.
+        handled: dict = {}
+        for elapsed, stage, detail in log.progress:
+            if stage not in ("fetch", "hash", "intake", "submission"):
+                continue
+            for c in commitments:
+                hk = str(c.get("hotkey", ""))
+                if hk and hk[:12] in detail:
+                    handled[hk] = (stage, elapsed)
+
         rows = []
         for c in commitments:
+            hk = str(c.get("hotkey", ""))
+            step = handled.get(hk)
             rows.append({
-                "hotkey": c.get("hotkey"),
+                "hotkey": hk,
                 "tier": c.get("tier"),
                 "artifact_uri": c.get("artifact_uri"),
                 "seen": m(True),
+                # OBSERVED, NOT CONCLUDED. `intake` is logged when intake BEGINS, so this says what
+                # the round was last seen doing with these bytes — never that they passed. The gates
+                # decide acceptance, and only a published record can report that.
+                "handling": (m({"step": step[0], "remote_elapsed_s": step[1]})
+                             if step else
+                             unmeasured("this round has not reached this submission yet"
+                                        if in_flight else
+                                        "no round is currently handling this submission")),
                 # Intake runs on the rented GPU, so acceptance is only knowable once a round has
                 # scored. Saying "accepted" here would be predicting the gates, not reporting them.
                 "outcome": (unmeasured("no round has completed, so this submission has not been "

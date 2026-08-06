@@ -163,6 +163,73 @@ def test_a_quiet_but_healthy_round_is_not_marked_stale():
     assert stale["round"].get("expired") is True
 
 
+_PROGRESS = (
+    (30.0, 'pool', '900 trajectories'),
+    (112.0, 'fetch', '[1/8] 5ERWJp4StMcQ… hf://Jordun01/qwen3-8b-sn40-tern-mix-tB@8428903e'),
+    (140.0, 'hash', 'Jordun01/qwen3-8b-sn40-tern-mix-tB 4.1 GB'),
+    (197.0, 'intake', '5ERWJp4StMcQ… tier=ternary'),
+    (269.0, 'generate', 'Qwen/Qwen3-8B 8/72 ctx=3910 @256 tok'),
+)
+
+
+def _live(progress=_PROGRESS):
+    return LogView(mtime=NOW - 20, milestone='scoring', banner_pid=4242, trusted=True,
+                   progress=progress)
+
+
+def test_a_live_round_shows_what_it_is_actually_doing():
+    """"scoring" is one word for the entire expensive leg. A miner watching a live round needs to
+    see which of eight artifacts is downloading and how far generation has got, or the page looks
+    frozen for forty minutes while the GPU is busy."""
+    doc = _build(unit=_unit(running=True), log=_live())
+    sub = doc['round']['substage']
+    assert sub['state'] == 'MEASURED', sub
+    assert sub['value']['stage'] == 'generate'
+    assert '8/72' in sub['value']['detail']
+    # both clocks, because they answer different questions and neither may be extrapolated
+    assert sub['value']['remote_elapsed_s'] == 269.0
+    assert sub['value']['seen_at'] == NOW - 20
+
+
+def test_a_submission_shows_how_far_the_round_has_got_with_it():
+    """The scorer names a truncated hotkey in its heartbeats; matching is by prefix so a miner can
+    find their own row and see their artifact was fetched, hashed, and entered intake."""
+    doc = _build(unit=_unit(running=True), log=_live(),
+                 commitments=[{'hotkey': '5ERWJp4StMcQQBNgxxxxxxxx', 'tier': 'ternary',
+                               'artifact_uri': 'hf://Jordun01/x@1'},
+                              {'hotkey': '5ZZZneverTouchedYetxxxxx', 'tier': 'sub4',
+                               'artifact_uri': 'hf://other/y@1'}])
+    rows = doc['chain']['miners']['value']
+    assert rows[0]['handling']['state'] == 'MEASURED'
+    assert rows[0]['handling']['value']['step'] == 'intake'
+    # the one the round has not reached says so, rather than silently looking identical
+    assert rows[1]['handling']['state'] == 'NOT_YET_MEASURED'
+    assert 'not reached' in rows[1]['handling']['because']
+
+
+def test_being_intaken_is_never_reported_as_being_accepted():
+    """`intake` is logged when intake BEGINS. The gates decide acceptance and only a published
+    record can report it — the single most tempting false claim on this page, because a miner
+    watching their artifact get fetched will read any positive word as 'I passed'."""
+    doc = _build(unit=_unit(running=True), log=_live(),
+                 commitments=[{'hotkey': '5ERWJp4StMcQQBNgxxxxxxxx', 'tier': 'ternary',
+                               'artifact_uri': 'hf://Jordun01/x@1'}])
+    row = doc['chain']['miners']['value'][0]
+    assert row['outcome']['state'] == 'NOT_YET_MEASURED', row['outcome']
+    assert 'value' not in row['outcome']
+    blob = json.dumps(row).lower()
+    for word in ('accepted', 'passed', 'approved', 'valid'):
+        assert word not in blob, f'the row implies {word!r} from a log line that only means started'
+
+
+def test_substage_is_absent_before_the_scoring_leg():
+    doc = _build(unit=_unit(running=True),
+                 log=LogView(mtime=NOW - 20, milestone='installing', banner_pid=4242,
+                             trusted=True, progress=()))
+    assert doc['round']['substage']['state'] == 'NOT_YET_MEASURED'
+    assert 'value' not in doc['round']['substage']
+
+
 def test_every_section_dates_itself():
     doc = _build()
     for name in ("validator", "round", "chain", "trail"):
