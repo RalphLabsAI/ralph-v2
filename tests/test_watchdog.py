@@ -231,6 +231,30 @@ def test_protected_and_stray_are_reported_never_killed():
     assert not any("epago" in r or "miner-m19" in r for r in v.report), v.report
 
 
+def test_a_protected_entry_can_be_a_prefix():
+    """`m4-h6-*` boxes carry a timestamp in the name (`m4-h6-quant-20260806-131754`), so an
+    exact-name list protects the three that exist today and none minted tomorrow. The failure mode
+    of a stale entry here is destroying somebody else's H200, so the match has to outlive the
+    names. `*` only ever WIDENS protection — it can never select something for destruction."""
+    from eval.watchdog import PROTECTED, is_protected
+
+    assert "m4-h6-*" in PROTECTED
+    assert is_protected("m4-h6-quant-20260806-131754", PROTECTED)
+    assert is_protected("m4-h6-anything-minted-later", PROTECTED)
+    assert is_protected("epago-4090", PROTECTED), "exact entries still match exactly"
+    assert not is_protected("epago-4090-lookalike", PROTECTED), \
+        "an exact entry must not silently become a prefix"
+    assert not is_protected("ralph-round-1-1", PROTECTED), "our own mint is never protected"
+    assert not is_protected("", PROTECTED)
+
+    # and end to end: a protected prefix is neither destroyed nor reported as a stray
+    v = classify(NOW, _unit(running=False), [],
+                 _log(NOW - 3600), [_inst("m4-h6-quant-20260806-131754", "i-h", NOW - 9 * 3600)],
+                 _cfg(), {})
+    assert not v.destroy, [d.name for d in v.destroy]
+    assert not any("m4-h6" in r for r in v.report), v.report
+
+
 def test_the_ceiling_needs_no_log_and_no_process():
     v = classify(NOW, _unit(running=False), [], _log(NOW),
                  [_inst("ralph-round-1-1", "i-1", NOW - RENTAL_CEILING_S - 60)], _cfg(),

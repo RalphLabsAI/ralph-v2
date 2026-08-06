@@ -82,7 +82,27 @@ MINT_PREFIX = "ralph-round-"
 # NEVER DESTROYED, NEVER ALARMED. `ralph-v2-miner-m19` is a live miner's box and `epago-4090` is a
 # different project; both sit on this same account. This list is the reason `sweep()` is scoped to
 # the names we mint rather than to `ralph-`, which matches the miner box.
-PROTECTED = ("epago-4090", "ralph-v2-miner-m19")
+#
+# An entry ending in `*` is a PREFIX. `m4-h6-*` needs that: those boxes are named with a timestamp
+# (`m4-h6-quant-20260806-131754`), so an exact-name list protects the three that exist today and
+# none of the ones minted tomorrow — and the failure mode of a stale entry here is destroying
+# somebody else's H200. Not ours, explicitly hands-off, and nothing in this repo mints that name.
+PROTECTED = ("epago-4090", "ralph-v2-miner-m19", "m4-h6-*")
+
+
+def is_protected(name: str, protected) -> bool:
+    """Exact match, or prefix match for entries ending in `*`.
+
+    Every caller went through `name in cfg.protected` before this existed, which is why the whole
+    list had to be exact names."""
+    name = str(name or "")
+    for p in protected:
+        if p.endswith("*"):
+            if name.startswith(p[:-1]):
+                return True
+        elif name == p:
+            return True
+    return False
 
 RUN_BANNER = "=== ralph round start "
 
@@ -449,7 +469,7 @@ def classify(now: float, unit: UnitView, owners: list, log: LogView, rentals, cf
     """PURE. No network, no clock, no /proc, no filesystem — everything it reasons about was frozen
     by the readers above. That is what makes a 2.75-hour ceiling testable in a millisecond and what
     makes `replay` able to reproduce a verdict exactly from a recorded line."""
-    protected = set(cfg.protected)
+    protected = tuple(cfg.protected)
     alarms: list = []
     report: list = []
 
@@ -466,10 +486,10 @@ def classify(now: float, unit: UnitView, owners: list, log: LogView, rentals, cf
     else:
         mint = [r for r in rentals
                 if str(r.get("name", "")).startswith(MINT_PREFIX)
-                and str(r.get("name", "")) not in protected]
+                and not is_protected(r.get("name", ""), protected)]
         strays = [r for r in rentals
                   if not str(r.get("name", "")).startswith(MINT_PREFIX)
-                  and str(r.get("name", "")) not in protected]
+                  and not is_protected(r.get("name", ""), protected)]
 
     def _t(r) -> Target:
         return Target(id=str(r.get("id", "")), name=str(r.get("name", "")),
@@ -722,7 +742,7 @@ def act(v: Verdict, cfg: WatchdogConfig, provider, out=sys.stdout, now=time.time
         # legitimately started, and sweep() would take its GPU. The prefix and protected-name
         # guard is re-checked immediately before the call rather than inherited, because this
         # process holds a key that can create and delete.
-        if not d.name.startswith(MINT_PREFIX) or d.name in cfg.protected:
+        if not d.name.startswith(MINT_PREFIX) or is_protected(d.name, cfg.protected):
             w(f"  REFUSED  {d.name} is not a name this system mints — not destroying it\n")
             continue
         w(f"  DESTROY  {d.name} ({d.id[:12]}) up {d.age / 60:.0f} min, ~${d.cost:.2f} spent\n")
@@ -916,7 +936,7 @@ def status(cfg: WatchdogConfig, provider, out=sys.stdout, now=None) -> int:
             name = str(r.get("name", ""))
             t = Target(id=str(r.get("id", "")), name=name, age=instance_age_s(r, now),
                        rate=float(r.get("hourly_price", 0) or 0) / 100.0)
-            if name in cfg.protected:
+            if is_protected(name, cfg.protected):
                 tag = "protected"
             elif not name.startswith(MINT_PREFIX):
                 tag = "stray"
