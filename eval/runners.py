@@ -66,6 +66,11 @@ class HFRunner:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        # A COLD BOX DOWNLOADS 16 GB HERE, and nothing downstream of `from_pretrained` reports
+        # anything the orchestrator can see. Announced on both sides so the silence detector reads
+        # a slow download as a slow download.
+        from .progress import tick
+        tick("load", self.model_id, force=True)
         kw = {"trust_remote_code": self._trust}
         if self.ATTN_IMPLEMENTATION:
             kw["attn_implementation"] = self.ATTN_IMPLEMENTATION
@@ -93,6 +98,7 @@ class HFRunner:
             self.model_id, dtype=getattr(torch, self._dtype), device_map=self._device, **kw
         )
         self._model.eval()
+        tick("loaded", self.model_id, force=True)
 
     def _gen_config(self, max_new_tokens: int):
         """A VALIDATOR-OWNED decode config, fully specified.
@@ -198,10 +204,14 @@ class HFRunner:
     def generate(self, prompts: Sequence[str], max_new_tokens: int = 512) -> list[str]:
         self._load()
         import torch
+        from .progress import tick
 
         texts = [self._render(p) for p in prompts]
         outs: list[str] = []
         for i in range(0, len(texts), self._batch_size):
+            # The batch loop is the only seam inside a `generate` call, and one round's worth of
+            # them is minutes of GPU with nothing else to say for itself.
+            tick("generate", f"{self.name} {i}/{len(texts)} @{max_new_tokens} tok")
             batch = texts[i:i + self._batch_size]
             enc = self._tok(batch, return_tensors="pt", padding=True, truncation=False).to(self._model.device)
             with torch.no_grad():
