@@ -146,7 +146,14 @@ class GpuSpec:
     # THE HARD CEILING ON A RENTAL, and it must stay under whatever supervises this process
     # (currently systemd's TimeoutStartSec=10800). Whoever's deadline fires first decides whether
     # the instance gets destroyed or leaked, so it has to be ours.
-    max_hours: float = 2.5
+    # 4.5 h, RAISED FROM 2.5 ONCE THE WORK WAS MEASURED. A ceiling shorter than the job it bounds
+    # is not a safety guard, it is a guarantee of failure: ten miners at ~19 min each is 3.2 h of
+    # scoring plus ~25 min of head, and 2.5 h killed a healthy round at about miner seven.
+    #
+    # The number comes from measurement, not comfort: 72 prompts x ~16 s on a GPU shared with the
+    # resident parent and observer. An isolated benchmark said 7.9 s and was wrong for the same
+    # reason a 12-token prompt was wrong earlier — it measured the part without the contention.
+    max_hours: float = 4.5
     # ...and the ceiling that actually fires, on every remote step. See SILENCE_S.
     silence_s: float = SILENCE_S
     max_price_per_hour: float = 0.0  # 0 = no cap

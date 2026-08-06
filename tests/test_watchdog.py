@@ -400,7 +400,13 @@ def test_the_budget_ladder_is_ordered():
     g = {n: b for n, b, _ in GRAMMAR}
     assert g["installing"] > INSTALL_SILENCE_S
     assert g["scoring"] > SILENCE_S
-    assert STALE_S < GpuSpec().max_hours * 3600 < RUN_CEILING_S < RENTAL_CEILING_S < 10800
+    # The supervisor's own timeout, from deploy/ralph-validator.service.d/40-timeout.conf. It is
+    # named rather than inlined because the whole ladder is only meaningful relative to it: whoever
+    # kills the process first decides whether the rental is destroyed or abandoned, and that must
+    # always be us. Raised to 6 h with max_hours when ten miners were measured at ~3.2 h of scoring.
+    SUPERVISOR_TIMEOUT_S = 21600
+    assert (STALE_S < GpuSpec().max_hours * 3600 < RUN_CEILING_S < RENTAL_CEILING_S
+            < SUPERVISOR_TIMEOUT_S)
 
 
 def test_the_watchdog_mirrors_the_defaults_it_cannot_import():

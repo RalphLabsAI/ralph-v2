@@ -178,9 +178,15 @@ def test_the_budgets_are_ordered_against_the_supervisor():
     """Whoever's deadline fires first decides whether the instance is destroyed or abandoned, so
     ours has to fire first. systemd's TimeoutStartSec is 10800s; the spec's ceiling must sit under
     it, and the silence budget under that."""
+    SUPERVISOR_TIMEOUT_S = 21600      # systemd TimeoutStartSec on ralph-validator.service (6 h)
     spec = GpuSpec()
-    assert spec.max_hours * 3600 < 10800, "the supervisor would kill us before we can tear down"
+    assert spec.max_hours * 3600 < SUPERVISOR_TIMEOUT_S, \
+        "the supervisor would kill us before we can tear down"
     assert spec.silence_s == SILENCE_S < spec.max_hours * 3600
+    # and the watchdog must never be tighter than the rental it is watching
+    from eval.watchdog import RENTAL_CEILING_S, RUN_CEILING_S
+    assert spec.max_hours * 3600 < RUN_CEILING_S < RENTAL_CEILING_S < SUPERVISOR_TIMEOUT_S, \
+        "a watchdog ceiling below the rental's destroys healthy long rounds"
 
 
 def test_the_ceiling_is_the_rentals_not_the_steps():
