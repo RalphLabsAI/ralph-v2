@@ -523,9 +523,23 @@ class GGUFStudentRunner:
 
     def generate(self, prompts, max_new_tokens: int = 512) -> list[str]:
         """Greedy continuation per prompt. Same contract as HFRunner.generate."""
+        from .progress import tick
+
         llm = self._load()
         out = []
-        for p in prompts:
+        for n, p in enumerate(prompts, 1):
+            # THE MINER LEG IS THE LONGEST SILENT BLOCK IN THE ROUND, and until this line it was
+            # completely silent. `HFRunner.generate` ticks per batch; this path — one prompt at a
+            # time under llama.cpp, on CPU, over prefixes up to the context ceiling — did not, and
+            # `score_submission` only ticks AFTER this call returns. So a legitimately long
+            # submission looked identical to a hang, and the orchestrator's 20-minute silence
+            # budget killed a healthy round at $2.75.
+            #
+            # That is precisely the failure eval/progress.py's own docstring warns about: a silence
+            # timeout over a silent-by-design scorer is not a safety net, it is a way to kill the
+            # rounds that were going to succeed. Instrumenting the fast path and forgetting the
+            # slow one is how you build exactly that.
+            tick("student", f"{self.name} {n}/{len(prompts)} @{max_new_tokens} tok")
             r = llm(p, max_tokens=int(max_new_tokens), temperature=0.0, top_k=1, top_p=1.0,
                     repeat_penalty=1.0, echo=False)
             try:
