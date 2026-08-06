@@ -144,6 +144,12 @@ def _versions() -> dict:
         # The student's window is part of the measurement too: llama.cpp silently trades prompt
         # length against `max_tokens`, so this decides how many step tokens a miner actually got.
         out["student_n_ctx"] = GGUFStudentRunner.N_CTX
+        out["student_n_threads"] = GGUFStudentRunner.N_THREADS
+        # WHERE THE SUBMISSIONS RAN. The parent's device is pinned and an absent one is fatal;
+        # the students' was invisible. llama.cpp on CPU and on CUDA do not emit identical tokens,
+        # so this is part of the measurement, and it is read from llama.cpp's capability flag
+        # rather than from config — the CPU-only wheel accepts `n_gpu_layers` and ignores it.
+        out["student_backend"] = GGUFStudentRunner.backend()
     except Exception:
         pass
     return out
