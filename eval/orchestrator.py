@@ -153,7 +153,15 @@ class GpuSpec:
     # The number comes from measurement, not comfort: 72 prompts x ~16 s on a GPU shared with the
     # resident parent and observer. An isolated benchmark said 7.9 s and was wrong for the same
     # reason a 12-token prompt was wrong earlier — it measured the part without the contention.
-    max_hours: float = 4.5
+    # 8 h, and this is the THIRD raise today because I kept sizing it from a part rather than the
+    # whole. Measured in flight, per miner: ~17 s/prompt of student generation (72 prompts) PLUS 72
+    # observer forward passes on top = 31.7 min. Ten miners is 5.3 h; 4.5 h killed a healthy round
+    # at about miner seven, exactly as 2.5 h had.
+    #
+    # Sized with real margin on purpose. A ceiling is a guard against a RUNAWAY, not a schedule —
+    # tuning it to the happy path means every slower-than-expected round dies at 90%, which has now
+    # happened twice and cost more than the headroom ever will. 8 h at $3.30 caps a runaway at $26.
+    max_hours: float = 8.0
     # ...and the ceiling that actually fires, on every remote step. See SILENCE_S.
     silence_s: float = SILENCE_S
     max_price_per_hour: float = 0.0  # 0 = no cap

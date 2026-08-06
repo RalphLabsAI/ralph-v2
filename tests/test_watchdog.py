@@ -177,7 +177,11 @@ def test_the_growing_head_is_out_of_jurisdiction_even_with_a_corpse_present():
 
 def test_a_corpse_does_not_arm_a_kill_against_the_live_round():
     """One 5-hour orphan plus one healthy claimed rental: the healthy one must never be touched."""
-    rentals = [_inst("ralph-round-9-9", "i-corpse", NOW - 5 * 3600),
+    # AGES DERIVED FROM THE CEILING, never hardcoded. A literal "5 hours" was overdue when the
+    # ceiling was 2.75 h and silently stopped being overdue when it moved to 8.25 h — the test kept
+    # passing its first assertion and lost the second. Same failure as the hardcoded supervisor
+    # timeout: a constant in a test that tracks a constant in the code will drift apart.
+    rentals = [_inst("ralph-round-9-9", "i-corpse", NOW - (RENTAL_CEILING_S + 3600)),
                _inst("ralph-round-10-1", "i-live", NOW - 300)]
     latches = {}
     classify(NOW - POLL_S, _unit(), [_owner()], _log(NOW - 10, "scoring", live=["i-live"]),
@@ -404,7 +408,7 @@ def test_the_budget_ladder_is_ordered():
     # named rather than inlined because the whole ladder is only meaningful relative to it: whoever
     # kills the process first decides whether the rental is destroyed or abandoned, and that must
     # always be us. Raised to 6 h with max_hours when ten miners were measured at ~3.2 h of scoring.
-    SUPERVISOR_TIMEOUT_S = 21600
+    SUPERVISOR_TIMEOUT_S = 36000
     assert (STALE_S < GpuSpec().max_hours * 3600 < RUN_CEILING_S < RENTAL_CEILING_S
             < SUPERVISOR_TIMEOUT_S)
 

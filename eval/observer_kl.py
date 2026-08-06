@@ -157,6 +157,10 @@ class MinerScore:
     # (slice_key, StepEffect) in the same order. The key is what makes the aggregate recomputable
     # from the raw measurements alone.
     keyed_effects: list = field(default_factory=list)
+    # The miner's generated steps, kept so the record can freeze them WITHOUT a second generation
+    # pass. Re-generating doubled the most expensive leg of the round and gave greedy decode a
+    # second chance to diverge from the numbers actually scored.
+    steps: list = field(default_factory=list)
     reasons: list = field(default_factory=list)
 
     def as_dict(self) -> dict:

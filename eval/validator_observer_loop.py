@@ -49,11 +49,21 @@ def _pool_sha(trajectory_pool) -> str:
         return ""
 
 
-def _freeze(runner, usable, max_step_tokens: int) -> list:
-    """Re-emit this model's steps as literal text for the record, so an audit is a pure forward
-    pass over recorded strings instead of a reproduction of batched greedy generation — the
-    noisiest part of the round. The manifest's artifact_uri lets an auditor optionally re-generate
-    and spot-check that these strings are what the model really emits."""
+def _freeze(ms, runner, usable, max_step_tokens: int) -> list:
+    """The model's steps as literal text for the record, so an audit is a pure forward pass over
+    recorded strings rather than a reproduction of greedy generation — the noisiest part of the
+    round.
+
+    TAKEN FROM THE SCORED RUN, NOT REGENERATED. This used to call `generate()` a second time over
+    the identical prompts, which doubled the most expensive leg of the round: measured in flight, a
+    ternary submission spent ~17 s per prompt and did all 72 twice. Worse than the cost, the record
+    then held text from a DIFFERENT generation than the one that produced the score — and greedy
+    decode is only reproducible while nothing shifts. The scored steps are the honest ones.
+
+    The fallback regenerates only when a runner predates the change and returns no steps."""
+    steps = list(getattr(ms, "steps", None) or [])
+    if steps:
+        return steps
     try:
         return list(runner.generate([x.prefix for x in usable], max_step_tokens))
     except Exception:
@@ -346,7 +356,7 @@ def run_observer_round(
         _b = d_bits.get(sub.model_id)
         s.code_bits = float(getattr(_b, "code_bits", 0.0) or 0.0)
         s.container_bits = float(getattr(_b, "container_bits", 0.0) or 0.0)
-        s.steps = _freeze(runner, usable, max_step_tokens)
+        s.steps = _freeze(ms, runner, usable, max_step_tokens)
         s.effects = _effects(ms)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
@@ -388,7 +398,7 @@ def run_observer_round(
                 king_scored.effects = _effects(kms)
                 # the incumbent's steps must be frozen too, or L2 can re-derive only one side of
                 # a paired comparison — and the dethrone margin is the number that moves emission
-                king_scored.steps = _freeze(kr, usable, max_step_tokens)
+                king_scored.steps = _freeze(kms, kr, usable, max_step_tokens)
                 scored[f"{king.model_id}#incumbent"] = king_scored
         ev = tournament.consider(t.name, by_tier.get(t.name, []), king_scored)
         # A crown has to remember WHERE ITS BYTES ARE. Tournament.consider() mints a King from the

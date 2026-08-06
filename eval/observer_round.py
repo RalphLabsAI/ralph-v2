@@ -154,7 +154,12 @@ def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: O
         eff = step_effect(s.p_parent, p_miner, s.p_base, min_teacher_effect=0.0)
         eff.d_teacher = s.d_parent          # the shared, miner-independent value
         samples.append((s.slice_key, eff))
-    return score_miner(samples, alpha=alpha, beta=beta)
+    ms = score_miner(samples, alpha=alpha, beta=beta)
+    # HAND THE STEPS BACK. `_freeze` used to call generate() again over the identical prompts just
+    # to record this text — half the round's most expensive leg, recomputing what we already had,
+    # and a second opportunity for greedy decode to disagree with the scored run.
+    ms.steps = list(miner_steps)
+    return ms
 
 
 def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,

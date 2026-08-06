@@ -69,10 +69,10 @@ GRACE_S = 180.0           # API list lag plus the microseconds between rent() re
                           # claim reaching disk
 TEARDOWN_S = 480.0        # > destroy()'s worst case: 3 x (60s POST + 3s + 60s GET) = 380s
 STALE_S = 2400.0          # the fallback budget for a milestone the grammar does not recognise
-RENTAL_CEILING_S = 17100.0 # GpuSpec.max_hours*3600 = 16200, + 900 slack, still under the
+RENTAL_CEILING_S = 29700.0 # GpuSpec.max_hours*3600 = 16200, + 900 slack, still under the
                            # unit's TimeoutStartSec. Raised with max_hours: a watchdog ceiling
                            # below the rental's would destroy every healthy long round.
-RUN_CEILING_S = 16800.0    # report-only: a wedged head or tail, which costs $0/hr
+RUN_CEILING_S = 29400.0    # report-only: a wedged head or tail, which costs $0/hr
 STRAY_ALARM_S = 4 * 3600.0
 DEADLINE_S = 900.0        # this process's own budget. A watchdog that can hang is the joke that
                           # writes itself.

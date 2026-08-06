@@ -178,7 +178,7 @@ def test_the_budgets_are_ordered_against_the_supervisor():
     """Whoever's deadline fires first decides whether the instance is destroyed or abandoned, so
     ours has to fire first. systemd's TimeoutStartSec is 10800s; the spec's ceiling must sit under
     it, and the silence budget under that."""
-    SUPERVISOR_TIMEOUT_S = 21600      # systemd TimeoutStartSec on ralph-validator.service (6 h)
+    SUPERVISOR_TIMEOUT_S = 36000      # systemd TimeoutStartSec on ralph-validator.service (10 h)
     spec = GpuSpec()
     assert spec.max_hours * 3600 < SUPERVISOR_TIMEOUT_S, \
         "the supervisor would kill us before we can tear down"
