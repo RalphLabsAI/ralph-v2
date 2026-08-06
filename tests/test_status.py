@@ -207,6 +207,25 @@ def test_a_submission_shows_how_far_the_round_has_got_with_it():
     assert 'not reached' in rows[1]['handling']['because']
 
 
+def test_a_rejected_submission_stops_reading_as_in_progress():
+    """The round announced 11 accepted artifacts and then scored 10, and for the whole expensive
+    leg nothing said which miner fell out. `intake` is a step the round ENTERS, so a rejected
+    submission's last word was "intake" — indistinguishable from one still being worked on, for
+    the next two hours. `rejected` is the only terminal step the live page can show, and the miner
+    it concerns is the one who most needs it."""
+    prog = _PROGRESS + ((201.0, 'rejected', '5ERWJp4StMcQ… bit budget exceeded: 4.7 > 4.0'),)
+    doc = _build(unit=_unit(running=True), log=_live(prog),
+                 commitments=[{'hotkey': '5ERWJp4StMcQQBNgxxxxxxxx', 'tier': 'ternary',
+                               'artifact_uri': 'hf://Jordun01/x@1'}])
+    row = doc['chain']['miners']['value'][0]
+    assert row['handling']['state'] == 'MEASURED', row['handling']
+    assert row['handling']['value']['step'] == 'rejected', row['handling']['value']
+    # and it must WIN over the earlier intake line rather than being ordered away
+    assert row['handling']['value']['remote_elapsed_s'] == 201.0
+    # rejection is still not an OUTCOME — only a published record can report that
+    assert row['outcome']['state'] != 'MEASURED', row['outcome']
+
+
 def test_being_intaken_is_never_reported_as_being_accepted():
     """`intake` is logged when intake BEGINS. The gates decide acceptance and only a published
     record can report it — the single most tempting false claim on this page, because a miner

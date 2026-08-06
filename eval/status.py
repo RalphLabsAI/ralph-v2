@@ -199,7 +199,11 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
         # The progress lines carry a TRUNCATED hotkey ("5ERWJp4StMcQ…"), so matching is by prefix.
         handled: dict = {}
         for elapsed, stage, detail in log.progress:
-            if stage not in ("fetch", "hash", "intake", "submission"):
+            # `rejected` is the only TERMINAL step here, and it is the one a miner most needs to
+            # see. Without it the dashboard's last word on a rejected submission is `intake`, which
+            # reads as "still being worked on" for the rest of the round — the round announced 11
+            # accepted artifacts and then scored 10, and nothing said which miner fell out or why.
+            if stage not in ("fetch", "hash", "intake", "submission", "rejected"):
                 continue
             for c in commitments:
                 hk = str(c.get("hotkey", ""))

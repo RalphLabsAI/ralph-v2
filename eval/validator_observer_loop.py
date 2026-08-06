@@ -244,6 +244,7 @@ def run_observer_round(
         if c.tier not in tier_budgets:
             out.rejected.append((c.hotkey, [f"tier {c.tier!r} is not being scored this round "
                                             f"(running: {sorted(tier_budgets)})"]))
+            _tick("rejected", f"{c.hotkey[:12]}… tier {c.tier!r} not scored this round", force=True)
             continue
         # intake re-hashes the whole artifact to check commit-reveal; on a multi-GB checkpoint
         # that is minutes of pure I/O with nothing else happening.
@@ -253,6 +254,7 @@ def run_observer_round(
                    committed_value=c.committed_value)
         if not d.accepted:
             out.rejected.append((c.hotkey, d.reasons))
+            _tick("rejected", f"{c.hotkey[:12]}… {'; '.join(d.reasons)[:120]}", force=True)
             continue
         d_root[d.content_hash] = getattr(d, "manifest_root", "")
         # carry the MEASURED bit budget forward so intelligence density is derivable from the
@@ -276,6 +278,7 @@ def run_observer_round(
         except Exception as e:
             out.rejected.append((c.hotkey, [f"artifact passed the gates but could not be loaded: "
                                             f"{type(e).__name__}: {e}"]))
+            _tick("rejected", f"{c.hotkey[:12]}… could not load: {type(e).__name__}", force=True)
             continue
         subs.append((sub, runner, c.artifact_uri))
         out.accepted.append(c.hotkey)
@@ -326,6 +329,15 @@ def run_observer_round(
         return out
 
     # 5. score each submission: one generation + one observer pass per usable sample
+    #
+    # THE COUNT GAP MUST BE VISIBLE. Intake ticked 11 accepted artifacts and the scoring loop then
+    # announced `[1/10]`, and nothing in between said where the eleventh went. The reason WAS
+    # recorded against that miner in `out.rejected`, so the record is honest — but the record only
+    # exists after publish, which means for the whole expensive leg the operator is watching a
+    # number they cannot account for. Every rejection now ticks, and the two totals are stated
+    # together here so the arithmetic closes in the log itself.
+    _tick("scoring", f"{len(subs)} of {len(committed)} committed "
+                     f"({len(out.rejected)} rejected)", force=True)
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
     for n, (sub, runner, art_uri) in enumerate(subs, 1):
