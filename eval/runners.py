@@ -488,6 +488,7 @@ class GGUFStudentRunner:
     # prefix-length-dependent handicap on one side of a paired comparison, invisible in the record.
     # 8192 clears the clamped 4096 prefix plus 256 step with slack, and sits far below the GGUF's
     # native window so no RoPE scaling is triggered.
+    N_GPU_LAYERS = -1        # all layers; see _load. Pinned into the record via backend().
     N_CTX = 8192
     N_BATCH = 512
 
@@ -517,8 +518,18 @@ class GGUFStudentRunner:
             self._llm = self._backend(self.path)
             return self._llm
         from llama_cpp import Llama       # local import: nothing else here needs llama.cpp
+        # OFFLOAD EVERY LAYER. Measured on a real submission: 7.9s/prompt on GPU regardless of
+        # prefix length, against 11-27s on CPU where prefill dominates. Ten miners go from ~3.5 h —
+        # which does not fit the 2.5 h rental ceiling — to 1.59 h, and the cost stops depending on
+        # which items the nonce happened to draw.
+        #
+        # -1 is a REQUEST, not a guarantee: on a CPU-only build llama.cpp accepts it and ignores
+        # it. `backend()` reports what actually happened and `_versions()` records it, because CPU
+        # and GPU llama.cpp do not emit identical tokens — a crown measured one way is not
+        # comparable with one defended the other.
         self._llm = Llama(model_path=self.path, n_ctx=self.N_CTX, n_threads=self.N_THREADS,
-                          n_batch=self.N_BATCH, logits_all=False, verbose=False, seed=0)
+                          n_batch=self.N_BATCH, n_gpu_layers=self.N_GPU_LAYERS,
+                          logits_all=False, verbose=False, seed=0)
         return self._llm
 
     def generate(self, prompts, max_new_tokens: int = 512) -> list[str]:

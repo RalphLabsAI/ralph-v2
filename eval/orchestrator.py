@@ -1021,10 +1021,27 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     # build back by accident.
     torch_cmd = (f".venv/bin/pip install --index-url {index} torch && " if index
                  else ".venv/bin/pip install torch && ")
+    # LLAMA.CPP MUST BE BUILT WITH CUDA, AND THERE IS NO WHEEL FOR IT.
+    #
+    # Miners submit GGUF — it is the only format that can pass the bit tiers — and the pip wheel is
+    # compiled CPU-only, where `n_gpu_layers` is accepted and silently ignored. Measured: on CPU a
+    # prompt costs 11-27s depending on prefix length, so ten miners need ~3.5 h against a 2.5 h
+    # rental ceiling. The round CANNOT FINISH. On GPU it is a flat 7.9s regardless of prefix, so
+    # ten miners take 1.59 h and the cost stops depending on which items the nonce drew.
+    #
+    # The prebuilt CUDA wheels stop at 0.2.66, which predates ternary (TQ1_0) — and ternary is a
+    # live tier — so a source build is the only path. It needs nvcc, and the architecture is pinned
+    # to 90 (Hopper/H100) because compiling for every architecture is what makes this slow.
+    cuda_build = (
+        "(sudo -n apt-get install -y -q cuda-toolkit-12-8 >/dev/null 2>&1 || true) && "
+        "export PATH=/usr/local/cuda-12.8/bin:$PATH && "
+        "CMAKE_ARGS='-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=90' "
+        ".venv/bin/pip install --no-cache-dir --no-binary llama-cpp-python llama-cpp-python && ")
     _ssh_stream(inst, spec, f"cd {remote_dir} && python3 -m venv .venv 2>/dev/null; "
                             f"{torch_cmd}"
                             f".venv/bin/pip install transformers safetensors datasets "
-                            f"huggingface_hub pynacl accelerate llama-cpp-python",
+                            f"huggingface_hub pynacl accelerate && "
+                            f"{cuda_build} true",
                 w, what="the remote install", silence_s=INSTALL_SILENCE_S,
                 hard_s=INSTALL_HARD_S, prefix="    · ")
 
