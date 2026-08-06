@@ -20,9 +20,20 @@ from .axes.math_gsm import extract_answer
 class HFRunner:
     """Real inference via transformers. Lazy-imports so the harness runs without torch."""
 
+    # BATCH SIZE IS BOUNDED BY EAGER ATTENTION, NOT BY THROUGHPUT. `eager` is pinned for
+    # determinism (see ATTN_IMPLEMENTATION), and eager materialises the full
+    # batch x heads x q_len x k_len score matrix — quadratic in prompt length, linear in batch. At
+    # batch_size=8 a real round asked for a single 64.12 GiB allocation on an 80 GB H100 and died.
+    # That works out to ~8 GiB per sample, i.e. prefill over a very long prefix, so the ceiling is
+    # set by the LONGEST item in the pool rather than by the average.
+    #
+    # This value is pinned into every record (`_versions()` reads this default by name) because it
+    # changes the answer: measured spread across batch_size in {1,2,3,5,8} is 0.050 retention on an
+    # H100 — the dethrone margin itself. Lowering it is therefore a real decision and not a tuning
+    # knob, and it is safe to make now only because no round has ever published a number.
     def __init__(self, model_id: str, device: str = "auto", dtype: str = "bfloat16",
                  revision: str | None = None, name: str | None = None,
-                 trust_remote_code: bool = False, batch_size: int = 8,
+                 trust_remote_code: bool = False, batch_size: int = 2,
                  load_in_4bit: bool = False, load_in_8bit: bool = False):
         self.model_id = model_id
         self.revision = revision
@@ -209,11 +220,15 @@ class HFRunner:
         texts = [self._render(p) for p in prompts]
         outs: list[str] = []
         for i in range(0, len(texts), self._batch_size):
-            # The batch loop is the only seam inside a `generate` call, and one round's worth of
-            # them is minutes of GPU with nothing else to say for itself.
-            tick("generate", f"{self.name} {i}/{len(texts)} @{max_new_tokens} tok")
             batch = texts[i:i + self._batch_size]
             enc = self._tok(batch, return_tensors="pt", padding=True, truncation=False).to(self._model.device)
+            # THE CONTEXT LENGTH IS REPORTED, not just the item index. Eager attention allocates
+            # batch x heads x ctx x ctx, so an OOM is a fact about the LONGEST prompt in the pool
+            # and the log needs to say which one — otherwise the next failure is another guess.
+            # The batch loop is also the only seam inside a `generate` call, and one round's worth
+            # of them is minutes of GPU with nothing else to say for itself.
+            ctx = int(enc["input_ids"].shape[1])
+            tick("generate", f"{self.name} {i}/{len(texts)} ctx={ctx} @{max_new_tokens} tok")
             with torch.no_grad():
                 # validator-owned decode: the miner's generation_config.json cannot influence
                 # scoring (see _gen_config — hashed is not frozen).

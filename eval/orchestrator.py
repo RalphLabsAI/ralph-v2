@@ -1049,6 +1049,10 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
         _ssh(inst, spec, f"umask 077 && mkdir -p {remote_dir} && cat > {remote_dir}/.hf_read",
              timeout=60, stdin=read_tok)
         env = f"HF_TOKEN=$(cat {remote_dir}/.hf_read) "
+    # Eager attention allocates one enormous contiguous score matrix per batch; the default caching
+    # allocator fragments around it and then fails a request the card could physically satisfy.
+    # This does not change any number — only whether the allocation succeeds.
+    env += "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
     # NO `| tail`. A pipeline's exit status is the LAST command's, so piping the scorer through
     # tail made every remote crash exit 0 — _ssh saw success, and the operator's first sign of a
     # failed round was `scp failed` on a record that was never written. A file-transfer error is a
