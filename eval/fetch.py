@@ -125,6 +125,7 @@ def fetch(uri: str, dest_root: str, expect_hash: str = "", lister=None,
     The hash is checked HERE as well as at intake. Intake does it because commit-reveal is its job;
     doing it at the door means a mismatched artifact never reaches the loader at all."""
     from .identity import content_hash
+    from .progress import tick
 
     files = plan(uri, lister=lister, max_bytes=max_bytes)
     _, repo, rev = parse_uri(uri)
@@ -136,10 +137,16 @@ def fetch(uri: str, dest_root: str, expect_hash: str = "", lister=None,
 
     got = 0
     dl = downloader or _hf_download
-    for name, size in files:
+    for i, (name, size) in enumerate(files, 1):
+        # A tick per FILE, before the download rather than after it. This is the only progress the
+        # orchestrator's silence detector sees during an artifact fetch that may run to 60 GB, and
+        # reporting a file after it lands would mean the slowest shard in the repo is silent for
+        # exactly as long as it takes.
+        tick("download", f"{repo} [{i}/{len(files)}] {name.split('/')[-1]} "
+                         f"{(size or 0) / 1024 ** 2:.0f} MB")
+        out = os.path.join(dest, name.split("/")[-1])
         # flatten: the artifact is a directory of weight files, and honouring nested paths is
         # how a traversal turns into a write outside dest
-        out = os.path.join(dest, name.split("/")[-1])
         dl(repo, rev, name, out)
         actual = os.path.getsize(out)
         got += actual
@@ -149,6 +156,7 @@ def fetch(uri: str, dest_root: str, expect_hash: str = "", lister=None,
                                f"advertised sizes are a miner-controlled hint, not a promise")
 
     res = FetchResult(path=dest, files=len(files), bytes=got)
+    tick("hash", f"{repo} {got / 1024 ** 3:.1f} GB", force=True)
     res.content_hash = content_hash(dest)
     if expect_hash and res.content_hash != expect_hash:
         shutil.rmtree(dest, ignore_errors=True)

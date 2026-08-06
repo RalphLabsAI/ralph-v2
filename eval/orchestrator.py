@@ -29,18 +29,94 @@ available" would silently make the crown a function of the spot market. `require
 a HARD gate: the wrong hardware aborts the round rather than scoring on it. Renting the cheapest
 available GPU is the correct behaviour for a training job and the wrong behaviour for a referee.
 
-TEARDOWN IS IN A `finally`, AND SO IS A DEADLINE. A leaked instance bills until someone notices.
-Every rental carries a `kill_at` the provider-side sweep enforces, in case this process dies between
-renting and destroying.
+TEARDOWN IS IN A `finally`, AND A `finally` IS NOT ENOUGH. This is the most expensive lesson in the
+module. Round 1 attempt 7 reached `scoring…` and stopped: nothing streamed the remote scorer, so
+nothing could tell a slow round from a dead one, and the first deadline to fire was systemd's
+`TimeoutStartSec=10800`. SIGTERM does not raise in Python — it terminates the process outright — so
+the `finally` below never ran, the H100 was never destroyed, and it billed at $3.30/hr until a human
+noticed 226 minutes later. ~$12.50 for a round that produced nothing. Three things come out of that:
+
+  * A ROUND THAT STOPS TALKING IS STUCK. The scorer is streamed, not awaited, and twenty minutes of
+    silence kills it (`SILENCE_S`) — with `eval/progress.py` on the far end so silence is a real
+    signal rather than an artefact of nobody having printed anything.
+  * OUR DEADLINE MUST BEAT THE SUPERVISOR'S. Every remote step is bounded well inside
+    `spec.max_hours`, so the process that ends a stuck round is this one, which can tear down,
+    rather than an external killer, which cannot.
+  * A SIGNAL HAS TO BECOME AN EXCEPTION. `_teardown_on_signal` turns SIGTERM/SIGINT into a raise so
+    the `finally` runs anyway, because the day it matters is the day something else kills us.
+
+Belt and braces on top: `sweep()` at the head of the next round is the backstop for a process that
+dies where even a handler cannot run (SIGKILL, power loss).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import queue
+import signal
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
+
+# THE SILENCE BUDGET. Twenty minutes with nothing on the wire from the scorer. Sized against the
+# slowest step that legitimately reports at one point only — a checkpoint download on a cold box —
+# with room to spare, because the cost of being wrong in one direction is a killed healthy round
+# and in the other is $3.30 an hour.
+SILENCE_S = 1200.0
+
+# THE HEARTBEAT, and it is what makes an EXTERNAL watchdog possible at all. `SILENCE_S` measures
+# bytes on the PIPE; `eval/watchdog.py` measures bytes in the LOG, and those are not the same fact.
+# They diverge on a perfectly healthy round in two ways: `max_lines` stops `_emit` dead after 5000
+# lines while the reader thread keeps resetting the silence clock, and a `\r`-only tqdm bar only
+# reaches `_emit` once per 2000 characters. Either one freezes the log's mtime for the rest of the
+# leg while the round is working — which from outside is indistinguishable from attempt 7, and
+# would have the watchdog SIGTERM the first round that ever got deep enough into scoring to trip
+# it. So the stream writes a line on a timer regardless of how much the far end said.
+HEARTBEAT_S = 300.0
+
+# THE INSTALL LEG'S BUDGETS, NAMED BECAUSE eval/watchdog.py IMPORTS THEM. pip reports per package,
+# not per megabyte, so a single 2.5 GB torch wheel on a slow link is legitimately quiet for a long
+# time — this leg gets a looser silence budget than the scorer on purpose. If you tune it, the
+# external watchdog re-tunes with it; a literal here and a copy over there is a rule that drifts
+# silently and ends with two components holding contradictory definitions of "stuck".
+INSTALL_SILENCE_S = 1800.0
+INSTALL_HARD_S = 2400.0
+
+# EPHEMERAL HOSTS GET NO known_hosts. Providers recycle IPs: scaleway handed us 51.159.162.43 twice
+# with different host keys, and `accept-new` correctly refuses a CHANGED key — so the second rental
+# at a reused IP failed after the GPU was paid for, and every stale entry would poison the next
+# reuse forever. Pinning buys nothing here anyway: we have no prior key for a box that did not exist
+# a minute ago. What makes this safe is the trust model, not the host key — the box gets no write
+# credentials, and everything it returns is audited before our key touches it.
+#
+# THE KEEPALIVES ARE NOT COSMETIC. ssh's default behaviour on a half-open TCP is to wait forever,
+# which is indistinguishable from a working round and is one of the two ways attempt 7 could have
+# gone quiet. Six missed 30-second probes ends the connection in ~3 minutes and turns a dead network
+# into a nonzero exit status, which the code above already knows how to handle.
+_SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+             "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=15",
+             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=6"]
+
+
+def instance_age_s(inst: dict, now: float) -> float:
+    """How long a provider instance has been up, from its own `created_at`.
+
+    FAILS TO +INF, NEVER TO 0. This feeds decisions about destroying things that cost money, and
+    the safe assumption when a timestamp cannot be parsed — a null, a reformatted field, a provider
+    that renames it — is that the instance is OLD. Returning 0.0 makes a leak permanently
+    un-overdue and prints "$0.00 spent" next to an H100 that has been billing all night."""
+    raw = str(inst.get("created_at", "") or "")
+    if not raw:
+        return float("inf")
+    try:
+        from datetime import datetime
+        return now - datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return float("inf")
 
 
 @dataclass
@@ -54,6 +130,11 @@ class Instance:
     instance_type: str = ""
     price_per_hour: float = 0.0
     status: str = ""
+    # THE RENTAL'S DEADLINE, as a wall-clock stamp rather than a per-step budget. Per-step budgets
+    # add up: rent + wait + rsync + a 40-minute install + a 2.5-hour score is over three hours, and
+    # three hours is when the supervisor kills us without teardown. Every step clamps to what is
+    # left of this, so the total is what is actually bounded.
+    kill_at: float = 0.0
 
 
 @dataclass
@@ -62,8 +143,19 @@ class GpuSpec:
     gpu_type: str = "H100"
     require_gpu: str = "NVIDIA H100 PCIe"
     cloud: str = ""                  # "" = any, but see require_gpu — the NAME is what binds
+    # THE HARD CEILING ON A RENTAL, and it must stay under whatever supervises this process
+    # (currently systemd's TimeoutStartSec=10800). Whoever's deadline fires first decides whether
+    # the instance gets destroyed or leaked, so it has to be ours.
     max_hours: float = 2.5
+    # ...and the ceiling that actually fires, on every remote step. See SILENCE_S.
+    silence_s: float = SILENCE_S
     max_price_per_hour: float = 0.0  # 0 = no cap
+    # THE PROVIDER-SIDE BACKSTOP, in hours past our own ceiling. Everything else in this module
+    # bounds a rental by running code on this box: `kill_at` needs the process, the `finally` needs
+    # an exception, the watchdog needs the box to be up. All three die together when the box does,
+    # and a leak with nobody watching is unbounded — the incident was ended by a human noticing.
+    # `auto_delete` is enforced by Shadeform, so it is the only bound that survives that.
+    provider_deadline_slack_h: float = 0.5
     ssh_key: str = "/root/.ssh/id_bitzic"
 
 
@@ -71,9 +163,13 @@ class Provider:
     """Rent / wait / destroy. A protocol so the whole flow is testable without spending money."""
 
     def rent(self, spec: GpuSpec, name: str) -> Instance: ...
-    def wait_ready(self, inst: Instance, timeout_s: float = 900) -> Instance: ...
+    # `out` is part of the protocol, not an implementation detail: this call blocks for up to
+    # fifteen minutes with the meter running, and a provider that cannot say so leaves the
+    # single most expensive silent gap in the round.
+    def wait_ready(self, inst: Instance, timeout_s: float = 900, out=None) -> Instance: ...
     def destroy(self, inst: Instance) -> None: ...
     def list_active(self) -> list: ...
+    def list_all(self) -> list: ...
 
 
 class ShadeformProvider(Provider):
@@ -145,19 +241,54 @@ class ShadeformProvider(Provider):
         regions = [a for a in best.get("availability", []) if a.get("available")]
         if not regions:
             raise RuntimeError("no available region for the selected instance type")
+        rate = best.get("hourly_price", 0) / 100.0
         body = {"cloud": best["cloud"], "region": regions[0]["region"],
                 "shade_instance_type": best["shade_instance_type"], "shade_cloud": True,
                 "name": name}
         if self.ssh_key_id:
             body["ssh_key_id"] = self.ssh_key_id
+        # THE ONE BOUND THAT SURVIVES THIS BOX DYING. Shadeform enforces both thresholds itself, so
+        # unlike `kill_at`, the `finally`, and the watchdog — all of which need something here to be
+        # alive — this one holds through a SIGKILL, an OOM, a panic, a reboot, or the orchestrator
+        # being reclaimed entirely. That was the largest uncovered risk in the design: with nothing
+        # off-box watching, a leak is bounded only by a human noticing, which last time took 226
+        # minutes. Set LOOSER than every local deadline so it never pre-empts a legitimate round,
+        # and paired with a spend cap because a date is the wrong unit for the thing being risked.
+        hours = spec.max_hours + spec.provider_deadline_slack_h
+        body["auto_delete"] = {
+            "date_threshold": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime(time.time() + hours * 3600.0)),
+            "spend_threshold": f"{max(1.0, rate * hours):.2f}",
+        }
+        # Self-describing ownership: the account is shared with a live miner box and other
+        # projects, and an instance that cannot say whose it is has to be reasoned about by name.
+        body["tags"] = ["ralph-v2", f"round-{name.split('-')[2] if name.count('-') >= 2 else '?'}",
+                        f"host-{os.uname().nodename[:16]}"]
         got = self._api("POST", "/instances/create", body)
-        return Instance(id=str(got.get("id", "")), cloud=best["cloud"],
+        inst = Instance(id=str(got.get("id", "")), cloud=best["cloud"],
                         region=regions[0]["region"],
                         instance_type=best["shade_instance_type"],
-                        price_per_hour=best.get("hourly_price", 0) / 100.0, status="pending")
+                        price_per_hour=rate, status="pending")
+        # VERIFIED, NOT ASSUMED — this module's own lesson, learned when destroy() used the wrong
+        # HTTP verb and reported success. A silently-ignored auto_delete is worse than none,
+        # because the whole point is that it is the guarantee nobody is around to check.
+        try:
+            got_ad = (self._api("GET", f"/instances/{inst.id}/info") or {}).get("auto_delete")
+        except Exception:
+            got_ad = None
+        if not got_ad or not got_ad.get("date_threshold"):
+            sys.stdout.write(
+                f"  WARNING the provider did not record an auto_delete deadline on {inst.id[:12]} "
+                f"— if this box dies holding it, nothing off-box will stop the billing\n")
+        return inst
 
-    def wait_ready(self, inst: Instance, timeout_s: float = 900) -> Instance:
-        deadline = time.time() + timeout_s
+    def wait_ready(self, inst: Instance, timeout_s: float = 900, out=None) -> Instance:
+        """`out` IS NOT DEBUG NOISE. This loop is up to fifteen minutes long, the meter is already
+        running, and until it reported one line at the end it was the single most expensive silent
+        gap in the round — the most expensive place in the whole flow to be unable to tell a slow
+        provider from a dead one. A line per poll turns a 900-second hole into a 15-second one."""
+        t0 = time.time()
+        deadline = t0 + timeout_s
         while time.time() < deadline:
             info = self._api("GET", f"/instances/{inst.id}/info")
             inst.status = info.get("status", "unknown")
@@ -168,6 +299,10 @@ class ShadeformProvider(Provider):
                 return inst
             if inst.status in ("error", "deleted"):
                 raise RuntimeError(f"instance {inst.id} entered status {inst.status}")
+            if out is not None:
+                out.write(f"    · waiting for {inst.id[:12]} ({inst.status}) "
+                          f"{time.time() - t0:.0f}s\n")
+                _flush(out.write)
             time.sleep(15)
         raise RuntimeError(f"instance {inst.id} not ready within {timeout_s:.0f}s")
 
@@ -193,18 +328,36 @@ class ShadeformProvider(Provider):
                 if "Expecting value" not in str(e) and "204" not in str(e):
                     last = e
             time.sleep(3)
-            if not any(str(i.get("id", "")) == inst.id for i in self.list_active()):
+            # AGAINST list_all, NOT list_active — see below. Verifying teardown against a view that
+            # hides `error` instances means an instance that merely flipped to `error` passes this
+            # check, we print "destroyed", and it goes on billing.
+            if not any(str(i.get("id", "")) == inst.id for i in self.list_all()):
                 return
         raise RuntimeError(
             f"instance {inst.id} is STILL ACTIVE after three delete attempts — it is billing right "
             f"now, go and kill it in the console" + (f" (last error: {last})" if last else ""))
 
     def list_active(self) -> list:
+        """What is RENTABLE-adjacent: healthy instances only. Correct for deciding where to rent.
+
+        Do not use it to answer a money question — see `list_all`."""
         r = self._api("GET", "/instances")
         return [i for i in r.get("instances", [])
                 if str(i.get("status", "")).lower() not in ("deleted", "error")]
 
-    def sweep(self, prefix: str = "ralph-round-", out=sys.stdout) -> list:
+    def list_all(self) -> list:
+        """Everything the account holds that is not deleted — INCLUDING `status == "error"`.
+
+        The distinction is worth a method because it is worth money. `list_active` drops errored
+        instances, which is right when choosing where to rent and wrong for every question of the
+        form "is anything still billing": an instance that flipped to `error` still exists, still
+        costs, and — until this existed — passed `destroy()`'s own verification, so the orchestrator
+        announced a teardown that had not happened. Money questions use this one."""
+        r = self._api("GET", "/instances")
+        return [i for i in r.get("instances", [])
+                if str(i.get("status", "")).lower() != "deleted"]
+
+    def sweep(self, prefix: str = "ralph-round-", out=sys.stdout, min_age_s: float = 0.0) -> list:
         """Kill anything we named that is still up. The backstop for a process that died between
         renting and destroying — which is exactly how the bug above was found.
 
@@ -213,14 +366,28 @@ class ShadeformProvider(Provider):
         and which matches `ralph-v2-miner-m19`, a live miner box on this same account that this
         code has no business touching. A sweep that kills someone else's running work is a far
         worse failure than the leak it exists to prevent, so the prefix must match what we create
-        rather than what we are called."""
+        rather than what we are called.
+
+        AND SCOPED BY AGE. This runs at the head of a round, before `rent()`, and it used to be
+        age-blind — so starting a round while another was still scoring destroyed the live one's
+        GPU mid-round. That was survivable while rounds were started by hand one at a time and
+        stops being survivable the moment the timer is enabled. Callers pass a `min_age_s` past
+        every legitimate round's ceiling; anything younger than that may still belong to somebody,
+        and `eval/watchdog.py` — which polls every five minutes and knows which rentals the running
+        round has CLAIMED — does the fast cleanup this was overreaching to do."""
         killed = []
-        for i in self.list_active():
+        now = time.time()
+        for i in self.list_all():
             name = str(i.get("name", ""))
             if not name.startswith(prefix):
                 continue
+            age = instance_age_s(i, now)
+            if age < min_age_s:
+                out.write(f"  leaving {name} alone ({age / 60:.0f} min old, under the "
+                          f"{min_age_s / 60:.0f} min floor) — it may be a live round\n")
+                continue
             iid = str(i.get("id", ""))
-            out.write(f"  sweeping orphan {name} ({iid[:12]})\n")
+            out.write(f"  sweeping orphan {name} ({iid[:12]}, {age / 60:.0f} min old)\n")
             self.destroy(Instance(id=iid))
             killed.append(name)
         return killed
@@ -254,19 +421,14 @@ class RemoteRoundError(RuntimeError):
 
 
 def _ssh(inst: Instance, spec: GpuSpec, cmd: str, timeout: int = 3600, stdin: str = "") -> str:
-    """`stdin` exists so a secret can reach the box WITHOUT appearing in argv — the remote process
+    """A SHORT remote command, awaited. Anything that can run for minutes goes through
+    `_ssh_stream` instead — a wall-clock timeout on a long step is exactly the bug that burned an
+    H100 for 226 minutes.
+
+    `stdin` exists so a secret can reach the box WITHOUT appearing in argv — the remote process
     table is readable by any co-tenant, and argv lands verbatim in the exception text below."""
     r = subprocess.run(
-        ["ssh", "-i", spec.ssh_key, "-p", str(inst.ssh_port),
-         # EPHEMERAL HOSTS GET NO known_hosts. Providers recycle IPs: scaleway handed us
-         # 51.159.162.43 twice with different host keys, and `accept-new` correctly refuses a
-         # CHANGED key — so the second rental at a reused IP failed after the GPU was paid for,
-         # and every stale entry would poison the next reuse forever. Pinning buys nothing here
-         # anyway: we have no prior key for a box that did not exist a minute ago. What makes
-         # this safe is the trust model, not the host key — the box gets no write credentials,
-         # and everything it returns is audited before our key touches it.
-         "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-         "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=15",
+        ["ssh", "-i", spec.ssh_key, "-p", str(inst.ssh_port), *_SSH_OPTS,
          f"{inst.ssh_user}@{inst.ip}", cmd],
         input=stdin if stdin else None,
         capture_output=True, text=True, timeout=timeout)
@@ -276,14 +438,221 @@ def _ssh(inst: Instance, spec: GpuSpec, cmd: str, timeout: int = 3600, stdin: st
     return r.stdout
 
 
-def _scp(spec: GpuSpec, inst: Instance, src: str, dst: str, to_remote: bool = True) -> None:
+def _flush(w) -> None:
+    """Flush the stream behind a bound `.write`. Unlovely, and load-bearing: the watchers that
+    decide a round is alive read the log's MTIME, so output that sits in a buffer is a round that
+    reads as hung. The runner is handed a `write` and not the stream, hence `__self__`."""
+    s = getattr(w, "__self__", None)
+    if s is not None and hasattr(s, "flush"):
+        try:
+            s.flush()
+        except Exception:
+            pass
+
+
+class _Out:
+    """A stream-shaped view of a bare `write` callable, so a helper that wants `out.write(...)` can
+    be handed the runner's `w` without every caller threading the real stream through."""
+
+    def __init__(self, w):
+        self._w = w
+
+    def write(self, s: str) -> None:
+        self._w(s)
+
+    def flush(self) -> None:
+        _flush(self._w)
+
+
+def _stream_until_silent(proc, silence_s: float, hard_s: float, w, what: str,
+                         prefix: str = "    | ", max_lines: int = 5000,
+                         heartbeat_s: float = HEARTBEAT_S) -> str:
+    """Drain `proc`'s merged output, echo it live, and kill it when it stops arriving.
+
+    Split out from `_ssh_stream` because it is the whole safety property and it must be testable
+    without renting anything: point it at any Popen and it behaves identically.
+
+    LIVENESS IS MEASURED IN BYTES, NOT LINES. `readline` would block for the entire duration of a
+    `tqdm` bar or an `hf_hub_download` — they separate updates with \\r and emit no \\n until they
+    finish — so a line-based detector would read a perfectly healthy 16 GB checkpoint download as
+    twenty minutes of silence. Any byte off the pipe proves the far end is alive; lines are only
+    how it gets displayed.
+
+    Two budgets, both real: `silence_s` catches the round that stopped working, `hard_s` catches
+    the round that is still working and can no longer be afforded. `heartbeat_s` is neither — it
+    guarantees the LOG advances even when this function has decided to stop echoing, so that an
+    external watcher measuring mtime and this function measuring the pipe agree about liveness.
+    """
+    q: queue.Queue = queue.Queue()
+
+    def _reader():
+        try:
+            while True:
+                b = proc.stdout.read(65536)     # bufsize=0: one read syscall, returns what is there
+                if not b:
+                    break
+                q.put(b)
+        except Exception:
+            pass
+        finally:
+            q.put(None)
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    tail: deque = deque(maxlen=400)      # the caller only ever displays the end of this
+    pending, echoed = "", 0
+    t0 = last = last_write = time.monotonic()
+    done = False
+
+    def _emit(line: str) -> None:
+        # `last_write` ADVANCES ONLY WHEN SOMETHING REACHES THE LOG. Setting it on every call —
+        # including the suppressed ones past `max_lines` — silently disarms the heartbeat in
+        # exactly the case it exists for: a chatty remote whose output we have stopped echoing,
+        # where the file's mtime freezes while the round is working perfectly.
+        nonlocal echoed, last_write
+        echoed += 1
+        if echoed <= max_lines:
+            tail.append(line)
+            w(f"{prefix}{line}\n")
+            _flush(w)
+            last_write = time.monotonic()
+        elif echoed == max_lines + 1:
+            w(f"{prefix}… further output suppressed after {max_lines} lines "
+              f"(the heartbeat continues)\n")
+            _flush(w)
+            last_write = time.monotonic()
+
+    while not done:
+        try:
+            # The poll interval keeps the hard deadline responsive AND keeps the main thread in an
+            # interruptible wait, which is what lets `_teardown_on_signal` land at all.
+            chunk = q.get(timeout=5.0)
+        except queue.Empty:
+            chunk = b""
+        if chunk is None:
+            done = True
+        elif chunk:
+            last = time.monotonic()
+            pending += chunk.decode("utf-8", "replace")
+            while True:
+                i = pending.find("\n")
+                if i < 0:
+                    break
+                _emit(pending[:i].rstrip("\r"))
+                pending = pending[i + 1:]
+            # A \r-only progress bar never terminates a line; flush it in bounded pieces so the log
+            # shows movement instead of holding a megabyte hostage until the download ends.
+            while len(pending) > 2000:
+                _emit(pending[:2000])
+                pending = pending[2000:]
+
+        now = time.monotonic()
+        # THE HEARTBEAT GOES BEFORE THE SILENCE CHECK, and it writes with `w` directly rather than
+        # through `_emit` — the whole point is that it survives `_emit`'s own suppression cap.
+        if not done and now - last_write >= heartbeat_s:
+            w(f"{prefix}[heartbeat] {what}: {now - t0:.0f}s in, "
+              f"last byte {now - last:.0f}s ago, {echoed} lines\n")
+            _flush(w)
+            last_write = now
+        if not done and now - last > silence_s:
+            _kill(proc)
+            raise RemoteRoundError(
+                f"{what} produced no output for {(now - last) / 60:.1f} min — a round that stops "
+                f"talking is stuck, and a stuck round on a rented GPU is only ever more expensive. "
+                f"Killed; the instance is being destroyed. Last output:\n" +
+                "".join(f"    | {l}\n" for l in list(tail)[-10:]))
+        if not done and now - t0 > hard_s:
+            _kill(proc)
+            raise RemoteRoundError(
+                f"{what} exceeded its {hard_s / 3600:.1f} h ceiling (still producing output). "
+                f"Killed; the instance is being destroyed.")
+
+    if pending.strip():
+        _emit(pending.rstrip("\r\n"))
+    try:
+        rc = proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        _kill(proc)
+        raise RemoteRoundError(f"{what} closed its output but would not exit")
+    if rc != 0:
+        raise RemoteRoundError(f"{what} failed ({rc}). Last output:\n" +
+                               "".join(f"    | {l}\n" for l in list(tail)[-25:]))
+    return "\n".join(tail)
+
+
+def _kill(proc) -> None:
+    """Kill the LOCAL ssh. The remote process outlives it — there is no TTY to hang up — and that
+    is deliberately not chased: teardown is what stops the billing, it runs in the `finally`
+    directly above every caller, and a second ssh into a box that just went unreachable is the one
+    call most likely to hang next."""
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+
+
+def _ssh_stream(inst: Instance, spec: GpuSpec, cmd: str, w, what: str,
+                silence_s: float = 0.0, hard_s: float = 0.0, prefix: str = "    | ",
+                heartbeat_s: float = HEARTBEAT_S) -> str:
+    """`_ssh` for the steps that take minutes: the output is watched as it arrives rather than
+    collected at the end, so the round can be ended while it is still cheap to end it."""
+    # CLAMPED TO WHAT IS LEFT OF THE RENTAL, never just to this step's own budget — see
+    # Instance.kill_at. A step that starts with ten minutes left on the clock gets ten minutes.
+    hard = hard_s or spec.max_hours * 3600.0
+    if inst.kill_at:
+        hard = min(hard, max(0.0, inst.kill_at - time.time()))
+    proc = subprocess.Popen(
+        ["ssh", "-i", spec.ssh_key, "-p", str(inst.ssh_port), *_SSH_OPTS,
+         f"{inst.ssh_user}@{inst.ip}", cmd],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    try:
+        return _stream_until_silent(proc, silence_s or spec.silence_s, hard, w, what,
+                                    prefix=prefix, heartbeat_s=heartbeat_s)
+    finally:
+        if proc.poll() is None:
+            _kill(proc)
+
+
+@contextlib.contextmanager
+def _teardown_on_signal():
+    """Turn SIGTERM/SIGINT into an exception so the `finally` that destroys the rental RUNS.
+
+    THIS IS THE $12.50 LINE. Python's default SIGTERM disposition terminates the interpreter
+    outright — no unwinding, no `finally`, no teardown — so when systemd's TimeoutStartSec fired on
+    attempt 7 the H100 was simply abandoned mid-round and billed until a human noticed. Every
+    deadline in this module is now set to fire before an external one does, but that ordering is an
+    argument and this is a guarantee: whatever kills us, we get to destroy the instance first.
+
+    A best-effort install. Off the main thread `signal.signal` raises, and a runner under test has
+    nothing to tear down anyway."""
+    def _raise(signum, _frame):
+        raise RemoteRoundError(f"signal {signum} — ending the round so the rental can be destroyed")
+
+    prev = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            prev[sig] = signal.signal(sig, _raise)
+        except (ValueError, OSError, AttributeError):
+            pass
+    try:
+        yield
+    finally:
+        for sig, handler in prev.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+
+
+def _scp(spec: GpuSpec, inst: Instance, src: str, dst: str, to_remote: bool = True,
+         timeout: float = 1800) -> None:
     a = f"{inst.ssh_user}@{inst.ip}:{dst}" if to_remote else src
     b = dst if to_remote else f"{inst.ssh_user}@{inst.ip}:{src}"
-    args = ["scp", "-i", spec.ssh_key, "-P", str(inst.ssh_port), "-r",
-            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "LogLevel=ERROR"]
+    args = ["scp", "-i", spec.ssh_key, "-P", str(inst.ssh_port), "-r", *_SSH_OPTS]
     args += [src, a] if to_remote else [b, dst]
-    r = subprocess.run(args, capture_output=True, text=True, timeout=1800)
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RemoteRoundError(f"scp failed: {r.stderr[-500:]}")
 
@@ -380,21 +749,50 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
     # and left an H100 billing at $3.30/hr with no teardown. There is no server-side TTL to fall
     # back on, so the guarantee has to be "the next round cleans up the last one's corpse", which
     # is what v1's helper did at the top of every command for the same reason.
+    #
+    # THE AGE FLOOR IS THE POINT. Age-blind, this destroyed the GPU of any round already in flight
+    # — fine while rounds were started one at a time by hand, fatal the moment the timer is on. The
+    # floor sits past every legitimate round's ceiling, so what it reaps is only ever a corpse.
     try:
-        swept = provider.sweep(out=out) if hasattr(provider, "sweep") else []
+        swept = (provider.sweep(out=out, min_age_s=spec.max_hours * 3600.0 + 900.0)
+                 if hasattr(provider, "sweep") else [])
         if swept:
             w(f"  swept {len(swept)} orphaned instance(s) from a previous run\n")
     except Exception as e:
         w(f"  WARNING orphan sweep failed: {e} — check the provider console\n")
 
     name = f"ralph-round-{plan.round}-{int(time.time()) % 100000}"
-    inst = provider.rent(spec, name)
-    w(f"  rented {inst.id} {inst.instance_type} @ ${inst.price_per_hour:.2f}/hr "
-      f"({inst.cloud}/{inst.region})\n")
-    t0 = time.time()
+    # The handler goes on BEFORE the money starts, so that from here to the `finally` there is no
+    # signal that can take the rental with it. The window between `rent` returning and entering the
+    # `try` is a few microseconds of Python, and `sweep()` covers even that.
+    with _teardown_on_signal():
+        # THE CLAIM IS WRITTEN BEFORE THE POST, and the name is the whole reason. `rent()` learns
+        # the instance id only from the create response, so a create that SUCCEEDS server-side and
+        # times out client-side leaves a correctly-named H100 billing whose id nobody ever knew —
+        # unfindable in the log, unattributable by any watcher. The name is the only claim that
+        # survives that, so it goes to disk first.
+        w(f"  renting {name}…\n")
+        _flush(w)
+        inst = provider.rent(spec, name)
+        # The clock starts the moment the meter does, not when the first remote step does.
+        inst.kill_at = time.time() + spec.max_hours * 3600.0
+        w(f"  rented {inst.id} {inst.instance_type} @ ${inst.price_per_hour:.2f}/hr "
+          f"({inst.cloud}/{inst.region}) — ceiling {spec.max_hours:.1f} h "
+          f"(~${inst.price_per_hour * spec.max_hours:.2f} worst case), "
+          f"silence limit {spec.silence_s / 60:.0f} min\n")
+        _flush(w)
+        t0 = time.time()
+        return _run_on(inst, plan, provider, spec, job_path, work_dir, repo_dir, remote_dir,
+                       runner, w, t0)
+
+
+def _run_on(inst, plan, provider, spec, job_path, work_dir, repo_dir, remote_dir,
+            runner, w, t0) -> dict:
+    """The rented half, split out only so the signal handler above wraps `rent` itself."""
     try:
-        inst = provider.wait_ready(inst)
+        inst = provider.wait_ready(inst, out=_Out(w))
         w(f"  ready at {inst.ip} after {time.time() - t0:.0f}s\n")
+        _flush(w)
         run = runner or _default_runner
         summary = run(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, w)
         rec_path = os.path.join(work_dir, "record.json")
@@ -427,17 +825,34 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
             w(f"  WARNING could not destroy {inst.id}: {e} — CHECK THE PROVIDER CONSOLE\n")
 
 
+def _remaining(inst: Instance, default_s: float) -> float:
+    """`default_s`, or what is left of the rental, whichever is smaller.
+
+    The awaited steps — the ssh mkdir, the rsync, the scps — are 6300 seconds of structural wall
+    clock between them, all of it INSIDE the rental and none of it previously bounded by anything.
+    Only the streamed steps clamped to `kill_at`, so "max_hours bounds the rented leg" was true of
+    the expensive part and false of the rest."""
+    if not inst.kill_at:
+        return default_s
+    return max(1.0, min(default_s, inst.kill_at - time.time()))
+
+
 def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, w) -> dict:
     """Push the repo, install, score, pull the artifacts back. Replaceable for tests."""
-    w("  pushing repo…\n")
-    _ssh(inst, spec, f"mkdir -p {remote_dir} && rm -rf {remote_dir}/eval")
+    # NAMED SUB-STEPS, because "pushing repo…" covered three calls with a combined structural
+    # ceiling of 6300 s and an external watcher cannot tell which one it is sitting in.
+    w("  pushing repo: mkdir…\n")
+    _flush(w)
+    _ssh(inst, spec, f"mkdir -p {remote_dir} && rm -rf {remote_dir}/eval",
+         timeout=int(_remaining(inst, 3600)))
+    w("  pushing repo: rsync…\n")
+    _flush(w)
     # HOME-RELATIVE, because the rented box is not our box. It logs in as `shadeform`, not root,
     # and /workspace is either absent or root-owned there — `mkdir -p /workspace/ralph-v2` failed
     # with Permission denied after the GPU was already rented and paid for. The one directory a
     # login user can always write is their own home.
     subprocess.run(["rsync", "-az", "-e",
-                    f"ssh -i {spec.ssh_key} -p {inst.ssh_port} -o StrictHostKeyChecking=no "
-                    f"-o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+                    f"ssh -i {spec.ssh_key} -p {inst.ssh_port} " + " ".join(_SSH_OPTS),
                     # EXPLICIT SECRET EXCLUSIONS. The list used to be runs/ and .git/ only, which
                     # kept .env off the box by accident (it is not in the repo dir) rather than on
                     # purpose. An operator who ever drops a .env or a wallet beside the code would
@@ -447,13 +862,29 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
                     "--exclude", "wallets/", "--exclude", ".venv/", "--exclude", "__pycache__/",
                     "--exclude", ".hf_read", "--exclude", "*.pem",
                     f"{repo_dir}/",
-                    f"{inst.ssh_user}@{inst.ip}:ralph-v2/"], check=True, timeout=900)
-    _scp(spec, inst, job_path, f"{remote_dir}/job.json", to_remote=True)
+                    f"{inst.ssh_user}@{inst.ip}:ralph-v2/"],
+                   check=True, timeout=_remaining(inst, 900))
+    w("  pushing repo: job.json…\n")
+    _flush(w)
+    _scp(spec, inst, job_path, f"{remote_dir}/job.json", to_remote=True,
+         timeout=_remaining(inst, 1800))
 
     w("  installing…\n")
-    _ssh(inst, spec, f"cd {remote_dir} && python3 -m venv .venv 2>/dev/null; "
-                     f".venv/bin/pip -q install torch transformers safetensors datasets "
-                     f"huggingface_hub pynacl accelerate llama-cpp-python 2>&1 | tail -2", timeout=2400)
+    # STREAMED, NOT AWAITED, and for two reasons beyond the silence budget. `-q` plus `| tail -2`
+    # meant this step produced nothing for up to forty minutes AND — the same bug called out on the
+    # scorer below — reported a failed install as success, because a pipeline exits with the status
+    # of `tail`. So a broken wheel surfaced later as an unexplained scoring crash. Without the pipe
+    # pip talks (one line per package; it draws no progress bars when stdout is not a TTY), which
+    # is both the liveness signal and a readable install log.
+    # A LOOSER SILENCE BUDGET HERE, ON PURPOSE. pip reports per package, not per megabyte, so a
+    # single 2.5 GB torch wheel on a slow link is legitimately quiet for a long time — and unlike
+    # the scorer this leg has a real wall-clock ceiling to fall back on. 40 minutes of install is
+    # ~$2.20 and bounded; a false kill costs the whole round.
+    _ssh_stream(inst, spec, f"cd {remote_dir} && python3 -m venv .venv 2>/dev/null; "
+                            f".venv/bin/pip install torch transformers safetensors datasets "
+                            f"huggingface_hub pynacl accelerate llama-cpp-python",
+                w, what="the remote install", silence_s=INSTALL_SILENCE_S,
+                hard_s=INSTALL_HARD_S, prefix="    · ")
 
     w("  scoring (this is the expensive part)…\n")
     # THE WRITE TOKEN NEVER GOES TO THE RENTED BOX, and the fallback that sent it was the single
@@ -480,12 +911,18 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     # tail made every remote crash exit 0 — _ssh saw success, and the operator's first sign of a
     # failed round was `scp failed` on a record that was never written. A file-transfer error is a
     # terrible way to report that scoring died.
-    out_txt = _ssh(inst, spec, f"cd {remote_dir} && {env}.venv/bin/python -u -m eval.score_job "
-                               f"job.json out/", timeout=10800)
-    for line in out_txt.strip().splitlines()[-12:]:
-        w(f"    | {line}\n")
+    #
+    # AND NO WALL-CLOCK WAIT. This one line is what the 226-minute hang was: `_ssh(timeout=10800)`
+    # says "give the scorer three hours and tell me how it went", which turns "the far end went
+    # quiet" into "bill an H100 until somebody notices". It is watched now — `eval/progress.py`
+    # ticks on the far side, `_stream_until_silent` ends the round twenty minutes after those ticks
+    # stop, and the `finally` above destroys the instance on the way out.
+    _ssh_stream(inst, spec, f"cd {remote_dir} && {env}.venv/bin/python -u -m eval.score_job "
+                            f"job.json out/", w, what="the remote scorer")
 
     w("  pulling results…\n")
+    _flush(w)
     for f in ("record.json", "pool.jsonl", "summary.json"):
-        _scp(spec, inst, f"{remote_dir}/out/{f}", os.path.join(work_dir, f), to_remote=False)
+        _scp(spec, inst, f"{remote_dir}/out/{f}", os.path.join(work_dir, f), to_remote=False,
+             timeout=_remaining(inst, 1800))
     return json.loads(open(os.path.join(work_dir, "summary.json")).read())

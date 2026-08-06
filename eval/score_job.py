@@ -32,19 +32,24 @@ def score(job: dict, out_dir: str) -> dict:
     from .koth import Tier, Tournament
     from .parent import PARENTS
     from .pool import build_pool, check_balance, dump_pool
+    from .progress import tick
     from .runners import HFRunner, student_runner
     from .validator_observer_loop import CommittedSubmission, run_observer_round
 
     os.makedirs(out_dir, exist_ok=True)
     spec = PARENTS[job["parent_key"]]
 
-    print(f"  pool ({job['pool_size']} trajectories)…", flush=True)
+    # EVERY STAGE BOUNDARY IS ANNOUNCED. The orchestrator kills this process after twenty minutes
+    # of silence, and it is right to: the alternative is the 226-minute hang. But that makes each
+    # of these lines part of the contract rather than decoration — a stage added below without a
+    # tick is a stage that reads as a hang the first time it runs slowly.
+    tick("pool", f"{job['pool_size']} trajectories", force=True)
     pool, pspec = build_pool(int(job["pool_size"]))
     ok, why = check_balance(pool)
     if not ok:
         raise SystemExit(f"pool refused: {why}")
 
-    print(f"  parent {spec.name}…", flush=True)
+    tick("parent", spec.name, force=True)
     parent = HFRunner(spec.name)
     observers = {o: HFRunner(o) for o in job["observers"]}
 
@@ -64,7 +69,11 @@ def score(job: dict, out_dir: str) -> dict:
     fetch_dir_for = resolver(os.path.join(out_dir, "artifacts"), reveals=reveals, log=fetch_log)
 
     committed, skipped = [], []
-    for c in job["committed"]:
+    for n, c in enumerate(job["committed"], 1):
+        # THE LONGEST SILENT STRETCH IN THE ROUND used to be here: a miner may ship up to the 60 GB
+        # ceiling and the fetch reports per file, so the hotkey is named before the bytes move.
+        tick("fetch", f"[{n}/{len(job['committed'])}] {c['hotkey'][:12]}… "
+                      f"{c.get('artifact_uri', '')[:48]}", force=True)
         d = fetch_dir_for(c["hotkey"], c.get("artifact_uri", ""))
         if not d:
             skipped.append((c["hotkey"], "artifact could not be fetched"))
@@ -91,6 +100,7 @@ def score(job: dict, out_dir: str) -> dict:
     for tier, k in (job.get("kings") or {}).items():
         r = Reign(**k)
         tournament.kings[tier] = r.as_king()
+        tick("fetch king", f"{tier} {r.artifact_uri[:48]}", force=True)
         kd = fetch_dir_for(f"king:{tier}", r.artifact_uri)
         if kd:
             try:
@@ -103,6 +113,7 @@ def score(job: dict, out_dir: str) -> dict:
         else:
             skipped.append((f"king:{tier}", f"incumbent artifact not fetchable: {r.artifact_uri}"))
 
+    tick("round", f"{len(committed)} accepted, {len(skipped)} skipped", force=True)
     out = run_observer_round(
         int(job["round"]), job["commit_root"], job["round_nonce"], committed, pool, parent,
         observers, tiers, budgets, tournament,

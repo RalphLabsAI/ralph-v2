@@ -1,0 +1,34 @@
+[Unit]
+Description=Ralph v2 watchdog — is the round making PROGRESS, or only existing?
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/workspace/ralph-v2
+# NO EnvironmentFile, deliberately. This process runs unattended every five minutes and needs the
+# Shadeform key and a work dir — nothing else. Sourcing the round's .env would hand HF_TOKEN (which
+# can rewrite the published round trail) and RALPH_RECORD_SEED (the signing key) to a monitor that
+# has no use for either.
+Environment=RALPH_WORK_DIR=/workspace/ralph-v2-work
+# ARMING ORDER. The rung that cannot false-positive is on from minute one — it is the one that
+# would have saved the $12.50. The rung that CAN false-positive is observed first: it prints what
+# it would have done and changes nothing, until a real round has been watched end to end.
+Environment=RALPH_WATCHDOG_ACT=1
+Environment=RALPH_WATCHDOG_HUNG_ACT=0
+ExecStart=/workspace/ralph-v2/.venv/bin/python -u -m eval.watchdog once
+# SIZED AGAINST AN ACTING PASS, NOT AN OBSERVING ONE. A pass that acts is a SIGTERM plus up to 480s
+# waiting for the round's own teardown plus destroy()'s 380s retry loop plus a 90s verify. A short
+# timeout here would kill the watchdog mid-destroy and abandon the very instance it was rescuing —
+# the incident, one level up.
+TimeoutStartSec=1200
+# exit 1 = it acted, exit 3 = degraded. Neither is a unit failure, and leaving this permanently
+# `failed` would poison `systemctl --failed`, the operator's cheapest health probe.
+SuccessExitStatus=1 3
+# NOT append:/var/log/ralph-validator.log. Writing there would advance the very mtime this process
+# exists to measure, so every check would pass forever by the act of looking.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

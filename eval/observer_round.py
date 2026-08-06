@@ -68,12 +68,17 @@ def build_shared(trajectories, parent: Stepper, observer: Observer, observer_nam
     Samples whose PARENT step barely moves the observer are marked unusable here, before any
     miner is involved — the discard decision must never depend on a miner's output, or a miner
     could bury its hard samples by emitting bland steps."""
+    from .progress import tick
+
     trajectories = list(trajectories)
     if not trajectories:
         return []
     steps = parent.generate([t.prefix for t in trajectories], max_step_tokens)
     out: list[SharedSample] = []
-    for t, parent_step in zip(trajectories, steps):
+    for n, (t, parent_step) in enumerate(zip(trajectories, steps), 1):
+        # Two observer passes and a continuation per sample, none of them batched. This is the
+        # miner-independent four-fifths of the round and the second-longest silent block in it.
+        tick("shared", f"{n}/{len(trajectories)}")
         s = SharedSample(traj_id=t.id, prefix=t.prefix, parent_step=parent_step,
                          slice_key=_slice_key(t, observer_name))
         if not parent_step.strip():
@@ -125,6 +130,8 @@ def _lang_of(source: str) -> str:
 def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: Observer,
                      max_step_tokens: int = 256, alpha: float = 1.0, beta: float = 1.0):
     """Per-miner half: one batched generation, then one observer pass per usable sample."""
+    from .progress import tick
+
     usable = [s for s in shared if s.usable]
     if not usable:
         from .observer_kl import MinerScore
@@ -133,7 +140,8 @@ def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: O
         return ms
     miner_steps = miner.generate([s.prefix for s in usable], max_step_tokens)
     samples: list[tuple[str, StepEffect]] = []
-    for s, a_step in zip(usable, miner_steps):
+    for n, (s, a_step) in enumerate(zip(usable, miner_steps), 1):
+        tick("score", f"{getattr(miner, 'name', '?')} {n}/{len(usable)}")
         if not a_step.strip():
             # an empty step is inert by definition — score it, never discard it, or "say
             # nothing" becomes a way to dodge hard samples

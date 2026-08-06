@@ -30,6 +30,7 @@ from .gates import TierBudget, degeneracy_flags
 from .intake import intake
 from .koth import MIN_CROWN_LB, Scored, Submission, Tier, Tournament
 from .observer_round import build_shared, pick_observer, score_submission, select_trajectories
+from .progress import tick as _tick
 from .round_record import RoundRecord, build_round_record
 
 
@@ -211,6 +212,9 @@ def run_observer_round(
             out.rejected.append((c.hotkey, [f"tier {c.tier!r} is not being scored this round "
                                             f"(running: {sorted(tier_budgets)})"]))
             continue
+        # intake re-hashes the whole artifact to check commit-reveal; on a multi-GB checkpoint
+        # that is minutes of pure I/O with nothing else happening.
+        _tick("intake", f"{c.hotkey[:12]}… tier={c.tier}", force=True)
         d = intake(c.ckpt_dir, tier_budgets[c.tier], ledger, c.hotkey, c.coldkey,
                    c.bond_posted, revealed_hash=c.revealed_hash, salt=c.salt,
                    committed_value=c.committed_value)
@@ -255,6 +259,7 @@ def run_observer_round(
     out.corpus_spec = corpus_spec
 
     # 3. shared rollouts — the miner-independent four-fifths of the work, once per round
+    _tick("shared rollouts", f"{len(trajectories)} items, observer {obs_name}", force=True)
     shared = build_shared(trajectories, parent, observer, obs_name,
                           max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens)
     usable = [s for s in shared if s.usable]
@@ -267,6 +272,7 @@ def run_observer_round(
     #    it is a lottery a miner wins by resubmitting, so it is measured before any scoring and
     #    published either way.
     probe = usable[0]
+    _tick("noise floor", f"{len(usable)} usable samples", force=True)
     noise = measure_noise(observer, probe.prefix + "\n" + probe.parent_step, probe.continuation,
                           repeats=3)
     out.noise = noise.as_dict()
@@ -277,6 +283,7 @@ def run_observer_round(
     #     there, while an A100 and an L40S returned exactly 1.0 on the same code. A validator that
     #     cannot reproduce the identity is unfit to rank anyone, so this ABORTS the round rather
     #     than annotating it.
+    _tick("identity canary", force=True)
     id_ok, id_info = identity_check(shared, parent, observer, max_step_tokens=max_step_tokens)
     out.identity = id_info
     if not id_ok:
@@ -288,7 +295,8 @@ def run_observer_round(
     # 5. score each submission: one generation + one observer pass per usable sample
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
-    for sub, runner, art_uri in subs:
+    for n, (sub, runner, art_uri) in enumerate(subs, 1):
+        _tick("submission", f"[{n}/{len(subs)}] {sub.miner[:12]}… tier={sub.tier}", force=True)
         registry[sub.model_id] = runner
         ms = score_submission(shared, runner, observer, max_step_tokens=max_step_tokens)
         ok, reasons = True, list(ms.reasons)
@@ -323,6 +331,7 @@ def run_observer_round(
                                    "king": king.model_id, "reason": "king unavailable"})
                 tournament.kings[t.name].reign += 1
                 continue
+            _tick("incumbent re-score", f"tier {t.name} king {king.model_id[:12]}…", force=True)
             kms = score_submission(shared, kr, observer, max_step_tokens=max_step_tokens)
             if kms.score <= MIN_CROWN_LB or kms.reasons:
                 out.events.append({"tier": t.name, "round": round_no, "action": "vacate",

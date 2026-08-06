@@ -1,0 +1,15 @@
+[Unit]
+Description=Poll the Ralph v2 watchdog
+
+[Timer]
+# BOOT COVERAGE COMES FROM THIS LINE. A rented instance survives a reboot and every in-process
+# guard does not, so the first pass after boot is the one that matters most.
+OnBootSec=2min
+# OnUnitActiveSec (fixed cadence), not OnUnitInactiveSec: an acting pass can take ten minutes, and
+# the next observation must not be pushed out by however long the last one took. Five minutes is
+# $0.28 of exposure per poll at $3.30/hr.
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
