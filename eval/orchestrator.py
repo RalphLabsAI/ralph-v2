@@ -195,6 +195,11 @@ class ShadeformProvider(Provider):
 
     API = "https://api.shadeform.ai/v1"
 
+    # How hard `destroy` tries, and how long it waits for the API to admit the instance is gone.
+    # These are separate on purpose — see `destroy`. Tests shrink VERIFY_S; nothing else should.
+    DESTROY_POSTS = 3
+    DESTROY_VERIFY_S = 120.0
+
     def __init__(self, key_file: str = "/root/.shadeform_api_key", ssh_key_id: str = ""):
         self.key_file = key_file
         self.ssh_key_id = ssh_key_id or os.environ.get("SHADEFORM_SSH_KEY_ID", "")
@@ -344,24 +349,55 @@ class ShadeformProvider(Provider):
         The second half is the same lesson publish.py learned: a write whose return value you trust
         is a write you have not verified. So the instance is re-listed afterwards, and a failure to
         disappear is raised rather than assumed away. The empty body on success is expected and is
-        NOT an error."""
+        NOT an error.
+
+        Third lesson, 2026-08-06: **deletion is accepted long before it is visible.** This used to
+        give the API ~9s (three attempts, 3s apart) to stop listing the instance, and killing the
+        idle keepalive box blew straight through that — the POST worked, the box really did go, and
+        `destroy` still raised STILL ACTIVE. A false leak alarm is not a harmless one: it fires
+        inside teardown, it makes the round look like it failed after it succeeded, and it sends
+        whoever reads it hunting an instance that is already dead — or, worse, into the console to
+        delete "the leak" by hand, next to boxes that are not ours.
+
+        So the retry budget and the patience budget are now separate things. We POST a few times
+        (the write can genuinely be dropped), but we wait out `VERIFY_S` for the list to catch up,
+        and only a still-present instance at the END of that window is an alarm."""
+        POSTS = self.DESTROY_POSTS
+        VERIFY_S = self.DESTROY_VERIFY_S
+
         last = None
-        for _ in range(3):
-            try:
-                self._api("POST", f"/instances/{inst.id}/delete")
-            except Exception as e:
-                # success returns an empty body, which the JSON decode reports as a value error
-                if "Expecting value" not in str(e) and "204" not in str(e):
-                    last = e
-            time.sleep(3)
+        deadline = time.monotonic() + VERIFY_S
+        posts = 0
+        delay = 3.0
+        while True:
+            if posts < POSTS:
+                posts += 1
+                try:
+                    self._api("POST", f"/instances/{inst.id}/delete")
+                except Exception as e:
+                    # success returns an empty body, which the JSON decode reports as a value error
+                    if "Expecting value" not in str(e) and "204" not in str(e):
+                        last = e
             # AGAINST list_all, NOT list_active — see below. Verifying teardown against a view that
             # hides `error` instances means an instance that merely flipped to `error` passes this
             # check, we print "destroyed", and it goes on billing.
-            if not any(str(i.get("id", "")) == inst.id for i in self.list_all()):
+            try:
+                gone = not any(str(i.get("id", "")) == inst.id for i in self.list_all())
+            except Exception as e:
+                # a listing failure is not evidence of anything; keep waiting rather than
+                # concluding either way
+                last, gone = e, False
+            if gone:
                 return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 1.5, 15.0)
+
         raise RuntimeError(
-            f"instance {inst.id} is STILL ACTIVE after three delete attempts — it is billing right "
-            f"now, go and kill it in the console" + (f" (last error: {last})" if last else ""))
+            f"instance {inst.id} is STILL ACTIVE {VERIFY_S:.0f}s after {posts} delete attempts — it "
+            f"is billing right now, go and kill it in the console"
+            + (f" (last error: {last})" if last else ""))
 
     def list_active(self) -> list:
         """What is RENTABLE-adjacent: healthy instances only. Correct for deciding where to rent.

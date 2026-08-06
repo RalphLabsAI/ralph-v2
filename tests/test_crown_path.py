@@ -4102,6 +4102,8 @@ def test_orchestrator_audits_its_own_scorer_before_signing():
         from eval.orchestrator import ShadeformProvider
 
         class _Stubborn(ShadeformProvider):
+            DESTROY_VERIFY_S = 0.05  # the real budget is 120s; don't sleep it in a test
+
             def __init__(self):
                 self.calls = []
 
@@ -4121,6 +4123,40 @@ def test_orchestrator_audits_its_own_scorer_before_signing():
         except RuntimeError as e:
             assert "STILL ACTIVE" in str(e), e
         assert all(m == "POST" for m, p_ in sp.calls if p_.endswith("/delete")), sp.calls
+
+        # ---- 5c. BUT A SLOW LIST IS NOT A LEAK. Deletion is accepted long before it is visible:
+        #          killing the idle keepalive box POSTed fine, the box really went, and destroy()
+        #          still raised STILL ACTIVE because it gave the listing ~9s to catch up. A false
+        #          leak alarm fires inside teardown, makes a round that succeeded look failed, and
+        #          sends whoever reads it into the console to hand-delete "the leak" — next to
+        #          instances that are not ours. Patience and retries are separate budgets now.
+        class _SlowList(ShadeformProvider):
+            """Reports the instance as present for the first few listings, then drops it."""
+
+            DESTROY_VERIFY_S = 30.0
+
+            def __init__(self):
+                self.lists, self.deletes = 0, 0
+
+            def _key(self):
+                return "k"
+
+            def _api(self, method, path, body=None):
+                if path == "/instances":
+                    self.lists += 1
+                    if self.lists <= 4:
+                        return {"instances": [{"id": "i-9", "name": "ralph-x",
+                                               "status": "active"}]}
+                    return {"instances": []}
+                if path.endswith("/delete"):
+                    self.deletes += 1
+                return {}
+
+        sp2 = _SlowList()
+        sp2.destroy(Instance(id="i-9"))  # must NOT raise
+        assert sp2.lists > 4, "destroy gave up before the listing caught up"
+        assert sp2.deletes <= _SlowList.DESTROY_POSTS, (
+            f"destroy kept POSTing while merely waiting ({sp2.deletes} deletes)")
 
         # ---- 6. AND NO SECRET EVER REACHES THE JOB SPEC, asserted rather than assumed: the spec
         #         is written to disk and copied to somebody else's machine.

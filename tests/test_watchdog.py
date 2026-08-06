@@ -550,8 +550,22 @@ def test_a_recorded_acting_pass_replays_to_the_same_verdict():
         cfg = _cfg(work_dir=d, log_path=_real_log(d, _CRASHED))
         r = [_inst("ralph-round-8-69408", "22222222-2222-2222-2222-222222222222", NOW - 3600)]
         p = _FakeProvider(r)
-        W.once(cfg, p, out=io.StringIO(), now=NOW - POLL_S)
-        W.once(cfg, p, out=io.StringIO(), now=NOW)
+        # This is the only test that drives the full `once` path, so it is the only one that reads
+        # THIS BOX — and it read whatever was happening on it. With a real round live, `read_unit`
+        # returned that round's pid, its stdout inode did not match our temp log, and `observe`
+        # correctly marked the log untrusted: verdict STARTING, not ORPHAN. The watchdog was right
+        # and the test was wrong, but it failed only while a round was running, so it read as a
+        # regression in whatever had just been edited. Stub the two readers that describe the
+        # MACHINE; leave `read_log` real, because a hand-built log fixture can be the inverse of
+        # what the real reader emits and that is the mistake this suite exists to avoid.
+        _ru, _ro = W.read_unit, W.read_owners
+        W.read_unit = lambda _unit_name: _unit(running=False)
+        W.read_owners = lambda: []
+        try:
+            W.once(cfg, p, out=io.StringIO(), now=NOW - POLL_S)
+            W.once(cfg, p, out=io.StringIO(), now=NOW)
+        finally:
+            W.read_unit, W.read_owners = _ru, _ro
         events = os.path.join(d, "watchdog-events.jsonl")
         lines = [json.loads(x) for x in open(events)]
         assert lines[-1]["verdict"]["state"] == "ORPHAN", lines[-1]["verdict"]["state"]
