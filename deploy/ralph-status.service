@@ -12,7 +12,11 @@ WorkingDirectory=/workspace/ralph-v2
 EnvironmentFile=/workspace/ralph-v2/.env
 Environment=BT_LOGGING_INFO=0
 Environment=BT_LOGGING_DEBUG=0
-ExecStart=/workspace/ralph-v2/.venv/bin/python -u -m eval.status
+# --publish pushes the snapshot to the public dataset repo. It is a SEPARATE repo from the round
+# trail on purpose: every put is a commit, and a snapshot a minute is ~500k commits a year, which
+# would bury the trail's history — and that history is the audit surface.
+ExecStart=/workspace/ralph-v2/.venv/bin/python -u -m eval.status --publish
+Environment=RALPH_STATUS_REPO=RalphLabsAI/ralph-v2-status
 # A chain read can be slow; the snapshot is worth nothing if it wedges the box.
 TimeoutStartSec=300
 StandardOutput=journal

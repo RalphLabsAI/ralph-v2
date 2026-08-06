@@ -36,7 +36,25 @@ class Config:
     wallet: str = "ralph"
     hotkey: str = "owner"
     parent_key: str = "qwen3-8b"
-    observers: tuple = ("HuggingFaceTB/SmolLM2-1.7B-Instruct", "google/gemma-2-2b-it")
+    # THREE UNGATED OBSERVERS, AND UNGATED IS THE LOAD-BEARING WORD.
+    #
+    # google/gemma-2-2b-it is GATED: a rented box with no credentials gets a 401 and the round dies
+    # — which is exactly what happened once the nonce finally drew it, fifteen attempts in, because
+    # until then it kept drawing the ungated one. A dependency that fails only on some draws is
+    # worse than one that always fails.
+    #
+    # The fix is not to drop to a single observer. The observer is drawn from the round nonce
+    # PRECISELY so it cannot be pre-fitted; with one candidate that draw is a constant and a miner
+    # tunes against a known judge. Two candidates is one bit. Three is ~1.6, from three unrelated
+    # pretraining lineages (HuggingFaceTB / Microsoft / AllenAI), none sharing the parent's Qwen
+    # family — `preflight` rejects an observer that does.
+    #
+    # And the security dividend: with nothing gated, the rented box needs NO Hugging Face
+    # credential at all. HF_TOKEN_READ existed only to reach gemma; the box that scores the round
+    # can now hold literally no secret.
+    observers: tuple = ("HuggingFaceTB/SmolLM2-1.7B-Instruct",
+                        "microsoft/Phi-3-mini-4k-instruct",
+                        "allenai/OLMo-2-1124-7B-Instruct")
     records_repo: str = "RalphLabsAI/ralph-v2-rounds"
     tiers: tuple = ("ternary", "sub4")
     n_items: int = 72
@@ -58,6 +76,8 @@ class Config:
             records_repo=e("RALPH_HF_REPO", "RalphLabsAI/ralph-v2-rounds"),
             n_items=int(e("RALPH_N_ITEMS", "72")), pool_size=int(e("RALPH_POOL_SIZE", "900")),
             work_dir=e("RALPH_WORK_DIR", "/workspace/ralph-v2-work"),
+            observers=tuple(x.strip() for x in e("RALPH_OBSERVERS", "").split(",") if x.strip())
+                      or cls.observers,
             gpu_type=e("RALPH_GPU_TYPE", "H100"), require_gpu=e("RALPH_REQUIRE_GPU", ""),
             max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
 
@@ -82,6 +102,23 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
            and o.split("/")[0] == PARENTS[cfg.parent_key].name.split("/")[0]]
     if fam:
         bad.append(f"observers {fam} share the parent's family — they are not independent")
+    # EVERY OBSERVER MUST BE ANONYMOUSLY READABLE, checked BEFORE a cent is spent. The rented box
+    # holds no Hugging Face credential, so a gated model is a 401 seventeen minutes into a round —
+    # and only on the draws that pick it, which is how gemma-2-2b-it survived fourteen attempts
+    # before killing one. One HEAD request each is a rounding error against a $3.30/hr rental.
+    import urllib.error
+    import urllib.request
+    for o in cfg.observers:
+        try:
+            req = urllib.request.Request(
+                f"https://huggingface.co/{o}/resolve/main/config.json", method="HEAD")
+            urllib.request.urlopen(req, timeout=20)
+        except urllib.error.HTTPError as e:
+            bad.append(f"observer {o} is not anonymously readable (HTTP {e.code}) — the scoring box "
+                       f"carries no HF credential, so this round would die when the nonce drew it")
+        except Exception as e:
+            warn.append(f"could not verify observer {o} is reachable ({type(e).__name__})")
+
     try:
         from .orchestrator import ShadeformProvider
         ShadeformProvider()._key()
