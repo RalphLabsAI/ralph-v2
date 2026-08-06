@@ -1,0 +1,22 @@
+[Unit]
+Description=Ralph v2 status snapshot — what miners are allowed to know
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/workspace/ralph-v2
+# It needs HF_TOKEN to publish and the chain config to read commitments. It must NEVER get
+# RALPH_RECORD_SEED: this process signs nothing, and a snapshot writer holding the signing key is
+# the split-validator design undone for the sake of a dashboard.
+EnvironmentFile=/workspace/ralph-v2/.env
+Environment=BT_LOGGING_INFO=0
+Environment=BT_LOGGING_DEBUG=0
+ExecStart=/workspace/ralph-v2/.venv/bin/python -u -m eval.status
+# A chain read can be slow; the snapshot is worth nothing if it wedges the box.
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,246 @@
+<title>Ralph · netuid 40 · validator status</title>
+<style>
+:root{
+  --ink:#10151d; --ink-2:#1a212c; --line:#e2e6ee; --line-2:#eef1f6;
+  --bg:#f7f8fb; --card:#ffffff;
+  --fg:#131923; --fg-2:#4c5566; --fg-3:#79839a;
+  --brand:#3056c9;           /* Ralph logo blue — the existing brand, not a new one */
+  --flight:#a4681a;          /* in-flight amber, semantic, never used as accent */
+  --ok:#1f7a52; --bad:#b03a30;
+  --void:#8b93a7;            /* the colour of a thing that has not been measured */
+  --mono:ui-monospace,"SF Mono",Menlo,"JetBrains Mono",monospace;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{ --bg:#0c1016; --card:#131924; --line:#242d3c; --line-2:#1b2331;
+         --fg:#e7ecf5; --fg-2:#a3adc0; --fg-3:#6f7b91;
+         --brand:#7093ee; --flight:#d59b45; --ok:#4cb98a; --bad:#e0736a; --void:#69738a; }
+}
+:root[data-theme="dark"]{ --bg:#0c1016; --card:#131924; --line:#242d3c; --line-2:#1b2331;
+  --fg:#e7ecf5; --fg-2:#a3adc0; --fg-3:#6f7b91;
+  --brand:#7093ee; --flight:#d59b45; --ok:#4cb98a; --bad:#e0736a; --void:#69738a; }
+:root[data-theme="light"]{ --bg:#f7f8fb; --card:#ffffff; --line:#e2e6ee; --line-2:#eef1f6;
+  --fg:#131923; --fg-2:#4c5566; --fg-3:#79839a;
+  --brand:#3056c9; --flight:#a4681a; --ok:#1f7a52; --bad:#b03a30; --void:#8b93a7; }
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+     font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 20px 72px}
+h1,h2{text-wrap:balance;margin:0}
+.eyebrow{font:600 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--fg-3)}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ---- masthead: the headline fact, stated plainly ---- */
+header{border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:26px}
+.mast{display:flex;flex-wrap:wrap;gap:16px;align-items:baseline;justify-content:space-between}
+h1{font-size:23px;font-weight:640;letter-spacing:-.01em}
+h1 small{display:block;font:400 13px/1.5 var(--sans);color:var(--fg-2);margin-top:5px;max-width:62ch}
+.gen{font:400 12px/1.6 var(--mono);color:var(--fg-3);text-align:right;white-space:nowrap}
+
+/* ---- state rail ---- */
+.rail{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0 0}
+.chip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);
+      background:var(--card);border-radius:2px;padding:6px 11px;
+      font:500 12px/1 var(--sans)}
+.chip b{font-family:var(--mono);font-weight:600}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--fg-3);flex:none}
+.dot.on{background:var(--flight);box-shadow:0 0 0 3px color-mix(in srgb,var(--flight) 22%,transparent)}
+.dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
+
+/* ---- panels ---- */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:22px}
+@media (max-width:820px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:3px;padding:18px 18px 16px}
+.panel h2{font-size:13px;font-weight:640;letter-spacing:.01em;margin-bottom:14px;
+          display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.panel h2 span{font:400 11px/1 var(--mono);color:var(--fg-3);letter-spacing:.05em}
+
+/* ---- the stage meter ---- */
+.stage{font:600 19px/1.2 var(--mono);letter-spacing:-.01em}
+.meter{height:5px;background:var(--line-2);border-radius:99px;margin:12px 0 8px;overflow:hidden}
+.meter i{display:block;height:100%;background:var(--flight);border-radius:99px;transition:width .4s}
+.legend{display:flex;justify-content:space-between;font:400 12px/1 var(--mono);color:var(--fg-2)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin-top:14px;
+    font-size:13px;align-items:baseline}
+.kv dt{color:var(--fg-3);font:500 11px/1.6 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+.kv dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums;word-break:break-all}
+
+/* ---- THE UNMEASURED TREATMENT ----
+   The whole reason this page exists. A quantity that has never been measured is not a dash and
+   is not a zero: it is a sentence saying why. Hatched border so it reads as deliberately empty
+   rather than as a value that failed to load. */
+.void{border:1px dashed var(--void);border-radius:2px;padding:9px 11px;
+      background:repeating-linear-gradient(135deg,transparent 0 6px,
+                 color-mix(in srgb,var(--void) 7%,transparent) 6px 12px);
+      color:var(--fg-2);font-size:12.5px;line-height:1.45}
+.void b{display:block;font:600 10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+        color:var(--void);margin-bottom:5px}
+
+/* ---- miners ---- */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font:600 10px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;
+   color:var(--fg-3);padding:0 8px 8px 0;border-bottom:1px solid var(--line)}
+td{padding:8px 8px 8px 0;border-bottom:1px solid var(--line-2);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.hk{font-family:var(--mono);font-size:12px}
+.tier{display:inline-block;font:600 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+      border:1px solid var(--line);border-radius:2px;padding:4px 6px;color:var(--fg-2)}
+.uri{font-family:var(--mono);font-size:11.5px;color:var(--fg-3);word-break:break-all}
+.pend{font:500 11px/1 var(--mono);color:var(--void);letter-spacing:.04em}
+.scroll{overflow-x:auto}
+footer{margin-top:26px;padding-top:16px;border-top:1px solid var(--line);
+       color:var(--fg-3);font-size:12.5px;max-width:78ch}
+code{font-family:var(--mono);font-size:12px;background:var(--line-2);padding:1px 5px;border-radius:2px}
+a{color:var(--brand)}
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="mast">
+      <h1 id="head">Loading…
+        <small id="sub"></small>
+      </h1>
+      <div class="gen" id="gen"></div>
+    </div>
+    <div class="rail" id="rail"></div>
+  </header>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Round in flight <span id="rnd-as-of"></span></h2>
+      <div id="rnd"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Scoring <span>what a completed round measures</span></h2>
+      <div id="trail"></div>
+    </section>
+  </div>
+
+  <section class="panel" style="margin-top:18px">
+    <h2>Submissions <span id="cohort"></span></h2>
+    <div class="scroll"><table id="miners"></table></div>
+  </section>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const SNAPSHOT = /*__SNAPSHOT__*/null;
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ago = s => { s = Math.max(0, s);
+  return s < 90 ? `${s.toFixed(0)}s` : s < 5400 ? `${(s/60).toFixed(0)} min` : `${(s/3600).toFixed(1)} h`; };
+
+// R1/R2: switch on state; `value` is ONLY read inside the measured branch. An unrecognised state
+// renders as unmeasured, never falls through to printing a value that may not be there.
+const MEASURED = new Set(['MEASURED','WITHHELD','STALE']);
+function val(node, fmt = v => v) { return node && MEASURED.has(node.state) ? fmt(node.value) : null; }
+function voidBox(node, label) {
+  const st = node && node.state ? node.state : 'UNKNOWN';
+  const why = node && node.because ? node.because : 'no reason was recorded';
+  return `<div class="void"><b>${esc(label || st.replace(/_/g,' '))}</b>${esc(why)}</div>`;
+}
+function cell(node, label, fmt) {
+  const v = val(node, fmt);
+  return v === null ? voidBox(node, label) : v;
+}
+
+function render(d) {
+  const now = Date.now() / 1000;
+  const age = now - d.generated_at;
+  const dead = age > d.stale_after_s;
+
+  const rounds = val(d.trail.rounds_published);
+  const miners = d.chain.miners;
+  const nMiners = val(miners, v => v.length);
+  const inFlight = val(d.round.in_flight) === true;
+
+  // The headline is the honest one: submissions are real, rounds are not.
+  document.getElementById('head').firstChild.textContent =
+    `${nMiners === null ? '—' : nMiners} submissions · ${rounds === null ? '—' : rounds} rounds completed`;
+  document.getElementById('sub').textContent = dead
+    ? 'The orchestrator has stopped reporting. Everything below is the last thing it said, not the current state.'
+    : (rounds === 0
+        ? 'Nothing has been scored yet. Every measurement below is absent because it has not been taken — not because it is zero.'
+        : 'Live validator state for netuid 40.');
+  document.getElementById('gen').innerHTML =
+    `snapshot ${ago(age)} old<br>netuid ${d.netuid} · ${esc(d.schema)}`;
+
+  // ---- state rail ----
+  const wd = d.validator.watchdog, live = val(d.validator.writes_to_chain);
+  const alarms = val(d.validator.alarms, v => v) || [];
+  const rail = [
+    `<span class="chip"><i class="dot ${dead ? 'bad' : 'ok'}"></i>orchestrator <b>${dead ? 'silent' : 'reporting'}</b></span>`,
+    `<span class="chip"><i class="dot ${val(wd) ? 'ok' : ''}"></i>watchdog <b>${esc(val(wd) || 'unknown')}</b></span>`,
+    `<span class="chip"><i class="dot ${inFlight ? 'on' : ''}"></i>round <b>${inFlight ? 'in flight' : 'idle'}</b></span>`,
+    `<span class="chip"><i class="dot ${live ? 'on' : ''}"></i>chain writes <b>${live === null ? '?' : live ? 'live' : 'dry'}</b></span>`,
+  ];
+  if (alarms.length) rail.push(`<span class="chip"><i class="dot bad"></i>alarms <b>${esc(alarms.join(', '))}</b></span>`);
+  document.getElementById('rail').innerHTML = rail.join('');
+
+  // ---- round in flight ----
+  const r = d.round, stage = val(r.stage);
+  document.getElementById('rnd-as-of').textContent =
+    r.expired ? 'past its budget' : (inFlight ? 'live' : '');
+  if (!inFlight || stage === null) {
+    document.getElementById('rnd').innerHTML = cell(r.stage, 'no round in flight');
+  } else {
+    const el = val(r.stage_elapsed_s), bud = val(r.stage_budget_s);
+    const pct = (el !== null && bud) ? Math.min(100, 100 * el / bud) : 0;
+    document.getElementById('rnd').innerHTML = `
+      <div class="stage">${esc(stage)}</div>
+      <div class="meter"><i style="width:${pct.toFixed(1)}%"></i></div>
+      <div class="legend"><span>${el === null ? '—' : ago(el)} in this stage</span>
+        <span>budget ${bud === null ? '—' : ago(bud)}</span></div>
+      <dl class="kv">
+        <dt>Rental</dt><dd>${(val(d.rental, v => v.map(x => esc(x.name) + ' · ' + esc(x.status)).join('<br>')) || '—') || 'none'}</dd>
+      </dl>
+      <div style="margin-top:14px">${voidBox(r.exam, 'exam withheld')}</div>`;
+  }
+
+  // ---- what a completed round measures ----
+  document.getElementById('trail').innerHTML =
+    `<dl class="kv"><dt>Rounds published</dt><dd>${rounds === null ? '—' : rounds}</dd></dl>
+     <div style="display:grid;gap:10px;margin-top:14px">
+       ${cell(d.trail.crowns, 'crowns · not yet measured')}
+       ${cell(d.trail.weights, 'weights · not yet measured')}
+     </div>`;
+
+  // ---- submissions ----
+  const coh = val(d.chain.cohort);
+  document.getElementById('cohort').textContent = coh
+    ? Object.entries(coh.by_tier).map(([k, v]) => `${v} ${k}`).join(' · ') : '';
+  const t = document.getElementById('miners');
+  if (nMiners === null) { t.outerHTML = `<div id="miners">${voidBox(miners, 'submissions')}</div>`; }
+  else {
+    t.innerHTML = `<thead><tr><th>Hotkey</th><th>Tier</th><th>Artifact</th><th>Outcome</th></tr></thead>
+      <tbody>${miners.value.map(m => `<tr>
+        <td class="hk">${esc(m.hotkey.slice(0, 12))}…</td>
+        <td><span class="tier">${esc(m.tier)}</span></td>
+        <td class="uri">${esc(m.artifact_uri || '—')}</td>
+        <td>${val(m.outcome) === null
+              ? `<span class="pend" title="${esc(m.outcome.because || '')}">not yet scored</span>`
+              : esc(val(m.outcome))}</td></tr>`).join('')}</tbody>`;
+  }
+
+  document.getElementById('foot').innerHTML =
+    `A value is shown only where it was measured. Where a measurement has not been taken, this page
+     prints the reason instead of a number — a <code>0.00</code> in a score column reads as "I scored
+     zero", which is a different and false claim. The round's exam (which items are scored, and which
+     observer judges them) is withheld while a round is in flight, because it derives from the
+     round nonce and disclosing it early would let a submission be fitted to it.`;
+}
+
+async function boot() {
+  let d = SNAPSHOT;
+  try {
+    const res = await fetch('./status.json', { cache: 'no-store' });
+    if (res.ok) d = await res.json();
+  } catch (e) { /* published snapshot only — fall back to what was baked in */ }
+  if (d) render(d);
+}
+boot();
+setInterval(boot, 30000);
+</script>

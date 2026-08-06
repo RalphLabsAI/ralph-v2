@@ -145,7 +145,11 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
     else:
         budget, _why = budget_for(log.milestone, 2400.0)
         elapsed = now - max(log.mtime, getattr(unit, "start_t", 0) or 0)
-        rnd = _section(log.mtime, 120.0, now,
+        # THE SECTION'S FRESHNESS IS THE STAGE'S BUDGET, not a flat number. A round generating 72
+        # items writes nothing for minutes at a time and is entirely healthy — a fixed 120 s here
+        # stamped `expired` on a live round, which is the same false-stale mistake as a false kill,
+        # and it teaches a reader to ignore the one flag that matters.
+        rnd = _section(log.mtime, budget, now,
                        in_flight=m(True),
                        stage=m(log.milestone),
                        # Published as an observation with its own timestamp, never as something a

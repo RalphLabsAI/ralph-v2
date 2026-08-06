@@ -147,6 +147,22 @@ def test_the_writer_stamps_expired_because_only_it_knows_the_age_at_push_time():
     assert "expired" not in fresh["validator"]
 
 
+def test_a_quiet_but_healthy_round_is_not_marked_stale():
+    """A round generating 72 items writes nothing for minutes and is entirely healthy. Stamping
+    `expired` on it is the false-stale twin of a false kill: it teaches a reader to ignore the one
+    flag that means something. The section's freshness is the STAGE's budget."""
+    log = LogView(mtime=NOW - 400, milestone="scoring", banner_pid=4242, trusted=True)
+    doc = _build(unit=_unit(running=True), log=log)
+    assert "expired" not in doc["round"], doc["round"]
+    assert doc["round"]["max_age_s"] > 400
+
+    # ...and it IS marked once the stage is genuinely past its budget
+    stale = _build(unit=_unit(running=True),
+                   log=LogView(mtime=NOW - 9000, milestone="scoring", banner_pid=4242,
+                               trusted=True))
+    assert stale["round"].get("expired") is True
+
+
 def test_every_section_dates_itself():
     doc = _build()
     for name in ("validator", "round", "chain", "trail"):
