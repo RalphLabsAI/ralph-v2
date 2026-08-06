@@ -693,6 +693,19 @@ def verify_returned_record(rec, plan: RoundPlan, pool, spec: GpuSpec, summary: d
 
     # 2. HARDWARE. The GPU model is inside the measurement (see the module header).
     got_gpu = ((rec.manifest or {}).get("versions") or {}).get("gpu") or summary.get("gpu") or ""
+    # AN ABSENT DEVICE IS ALWAYS FATAL, INDEPENDENT OF `require_gpu`. `_gpu_name()` returns "" when
+    # torch cannot see a GPU, and the pin below is skipped on the FIRST round by design — the round
+    # whose whole job is to learn the device name. So the two rules combined said: on the one round
+    # that establishes the hardware, any hardware will do. That is not hypothetical. A cu130 torch
+    # against a CUDA 12.8 driver makes `is_available()` False, `device_map="auto"` falls back to
+    # CPU, and the round scores an 8B parent on 12 cores — slowly, and correctly enough that the
+    # identity canary PASSES, because CPU inference is perfectly deterministic. It would have been
+    # signed, published and crowned, and nothing downstream would ever have said otherwise.
+    if not got_gpu:
+        bad.append("the record names no GPU at all, which means torch could not see one and the "
+                   "round was scored on CPU. A crown measured on CPU is not comparable with one "
+                   "defended on an H100, and the identity canary cannot catch it because CPU "
+                   "inference is deterministic")
     if spec.require_gpu and got_gpu != spec.require_gpu:
         bad.append(f"scored on {got_gpu or '(unknown)'} but this subnet's records are pinned to "
                    f"{spec.require_gpu} — a crown scored on other hardware is not comparable with "
@@ -873,6 +886,28 @@ def _run_on(inst, plan, provider, spec, job_path, work_dir, repo_dir, remote_dir
             w(f"  WARNING could not destroy {inst.id}: {e} — CHECK THE PROVIDER CONSOLE\n")
 
 
+# The torch wheel indexes, newest first. A driver reporting CUDA X.Y can run any build up to X.Y
+# and none above it, so the rule is "the newest wheel not newer than the driver".
+_TORCH_WHEELS = ((13.0, "cu130"), (12.8, "cu128"), (12.6, "cu126"), (12.4, "cu124"),
+                 (12.1, "cu121"), (11.8, "cu118"))
+
+
+def _torch_index(driver_cuda: str) -> str:
+    """The pytorch wheel index this host's driver can actually run, or "" to let pip decide.
+
+    Returning "" on an unparseable version is deliberate: guessing a CUDA build from no information
+    is how you get a torch that cannot see the GPU, and `score_job._assert_gpu` will refuse the
+    round in seconds either way. Better a loud refusal than a quiet wrong wheel."""
+    try:
+        want = float(".".join(driver_cuda.strip().split(".")[:2]))
+    except Exception:
+        return ""
+    for ver, tag in _TORCH_WHEELS:
+        if want >= ver:
+            return f"https://download.pytorch.org/whl/{tag}"
+    return ""
+
+
 def _remaining(inst: Instance, default_s: float) -> float:
     """`default_s`, or what is left of the rental, whichever is smaller.
 
@@ -953,6 +988,22 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     _scp(spec, inst, job_path, f"{remote_dir}/job.json", to_remote=True,
          timeout=_remaining(inst, 1800))
 
+    # WHICH TORCH THE DRIVER CAN ACTUALLY RUN. `pip install torch` takes the newest build, which
+    # in August 2026 is cu130 — and these boxes ship driver 570.x, i.e. CUDA 12.8. The mismatch does
+    # not raise: `torch.cuda.is_available()` simply returns False, `device_map="auto"` places the
+    # parent on CPU, and the round is ~10x slower and unusable. Asking the box which CUDA its
+    # driver speaks costs one ssh and removes an entire class of silent failure.
+    cuda = ""
+    try:
+        cuda = _ssh(inst, spec,
+                    "nvidia-smi | sed -n 's/.*CUDA Version: *\\([0-9][0-9.]*\\).*/\\1/p' | head -1",
+                    timeout=60).strip()
+    except Exception as e:
+        w(f"  WARNING could not read the driver's CUDA version ({e}); using pip's default torch\n")
+    index = _torch_index(cuda)
+    w(f"  driver speaks CUDA {cuda or '?'} -> torch wheel {index or 'pypi default'}\n")
+    _flush(w)
+
     w("  installing…\n")
     # STREAMED, NOT AWAITED, and for two reasons beyond the silence budget. `-q` plus `| tail -2`
     # meant this step produced nothing for up to forty minutes AND — the same bug called out on the
@@ -964,8 +1015,15 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     # single 2.5 GB torch wheel on a slow link is legitimately quiet for a long time — and unlike
     # the scorer this leg has a real wall-clock ceiling to fall back on. 40 minutes of install is
     # ~$2.20 and bounded; a false kill costs the whole round.
+    # TORCH FIRST, FROM ITS OWN INDEX, then everything else from PyPI. `--index-url` REPLACES PyPI
+    # rather than adding to it, so a single combined command would fail to find transformers; and
+    # `--extra-index-url` leaves the resolver free to pick either, which is how you get the newest
+    # build back by accident.
+    torch_cmd = (f".venv/bin/pip install --index-url {index} torch && " if index
+                 else ".venv/bin/pip install torch && ")
     _ssh_stream(inst, spec, f"cd {remote_dir} && python3 -m venv .venv 2>/dev/null; "
-                            f".venv/bin/pip install torch transformers safetensors datasets "
+                            f"{torch_cmd}"
+                            f".venv/bin/pip install transformers safetensors datasets "
                             f"huggingface_hub pynacl accelerate llama-cpp-python",
                 w, what="the remote install", silence_s=INSTALL_SILENCE_S,
                 hard_s=INSTALL_HARD_S, prefix="    · ")

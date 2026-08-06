@@ -706,6 +706,45 @@ def test_a_fetched_file_is_a_real_file_not_a_dangling_pointer():
             "hardlink expected: one inode, one copy on disk"
 
 
+def test_a_record_naming_no_gpu_is_rejected_even_with_no_pin():
+    """THE HOLE THIS CLOSES. `_gpu_name()` returns "" when torch cannot see a GPU, and the
+    `require_gpu` pin is skipped on the FIRST round by design — the round whose job is to learn the
+    device name. Together those said: on the one round that establishes the hardware, any hardware
+    will do. A cu130 torch on a CUDA 12.8 driver makes is_available() False, device_map="auto"
+    falls back to CPU, and CPU inference is PERFECTLY DETERMINISTIC — so the identity canary passes
+    and nothing downstream ever objects. Observed live on 2026-08-06."""
+    from eval.orchestrator import GpuSpec, verify_returned_record
+
+    class _Rec:
+        manifest = {"versions": {"gpu": ""}, "identity": {"score": 1.0}}
+        signature = ""
+
+        def __getattr__(self, k):
+            return ""
+
+    bad = verify_returned_record(_Rec(), _Plan(), None, GpuSpec(require_gpu=""), {"gpu": ""})
+    assert any("scored on CPU" in b for b in bad), bad
+
+
+class _Plan:
+    round = ""
+    commit_root = ""
+    round_nonce = ""
+    prev_anchor = ""
+
+
+def test_the_torch_wheel_never_outruns_the_driver():
+    """A driver reporting CUDA X.Y runs any build up to X.Y and none above it. Picking the newest
+    wheel regardless is what put an 8B parent on 12 CPU cores for 23 minutes."""
+    from eval.orchestrator import _torch_index
+
+    assert _torch_index("12.8").endswith("cu128")
+    assert _torch_index("13.0").endswith("cu130")
+    assert _torch_index("12.2").endswith("cu121"), "picked a wheel newer than the driver"
+    # An unknown driver must NOT be guessed at — score_job refuses in seconds instead.
+    assert _torch_index("") == "" and _torch_index("nonsense") == ""
+
+
 def test_the_run_banner_is_one_string_in_both_modules():
     """The watchdog's attribution collapses to the bannerless state if these ever diverge, and the
     bannerless state is the one where nothing in the log can be attributed to anyone."""

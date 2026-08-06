@@ -37,6 +37,18 @@ def score(job: dict, out_dir: str) -> dict:
     from .validator_observer_loop import CommittedSubmission, run_observer_round
 
     os.makedirs(out_dir, exist_ok=True)
+
+    # FAIL IN SECONDS, NOT IN HOURS. Everything below assumes a GPU, and nothing below CHECKS —
+    # `device_map="auto"` silently places the parent on CPU when torch cannot see the device, and
+    # the round then does the whole job correctly and uselessly: 900 trajectories built, 30 GB of
+    # artifacts fetched, an 8B model generating on 12 cores at roughly a tenth the speed, and a
+    # result the orchestrator rejects at the end. Observed on a rented H100 whose driver (CUDA 12.8)
+    # was older than the torch build pip chose (cu130).
+    #
+    # This is also the only place that can tell the difference cheaply. Downstream, CPU inference
+    # looks BETTER than GPU: it is perfectly deterministic, so the identity canary passes.
+    _assert_gpu()
+
     spec = PARENTS[job["parent_key"]]
 
     # EVERY STAGE BOUNDARY IS ANNOUNCED. The orchestrator kills this process after twenty minutes
@@ -147,6 +159,37 @@ def score(job: dict, out_dir: str) -> dict:
     with open(os.path.join(out_dir, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=1)
     return summary
+
+
+def _assert_gpu() -> None:
+    """Refuse to score without a usable GPU, and say exactly why torch cannot see it.
+
+    The diagnosis matters as much as the refusal: `is_available()` returning False has one common
+    cause on a rented box — a torch built for a newer CUDA than the host driver supports — and the
+    message that torch itself emits is a warning nobody reads on a machine nobody is watching."""
+    try:
+        import torch
+    except Exception as e:
+        raise SystemExit(f"refusing to score: torch will not import ({type(e).__name__}: {e})")
+    if torch.cuda.is_available():
+        from .progress import tick
+        tick("gpu", f"{torch.cuda.get_device_name(0)} (torch {torch.__version__})", force=True)
+        return
+    detail = ""
+    try:
+        import subprocess
+        smi = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version",
+                              "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        detail = f" nvidia-smi reports: {smi or '(nothing)'}."
+    except Exception:
+        detail = " nvidia-smi could not be run at all."
+    raise SystemExit(
+        f"refusing to score: torch {getattr(torch, '__version__', '?')} cannot see a GPU "
+        f"(torch.cuda.is_available() is False; built for CUDA {torch.version.cuda}).{detail} "
+        f"The usual cause is a torch built for a newer CUDA than this host's driver supports — "
+        f"scoring would silently fall back to CPU, which is ~10x slower AND perfectly "
+        f"deterministic, so the identity canary would pass and the round would look fine.")
 
 
 def _gpu_name() -> str:
