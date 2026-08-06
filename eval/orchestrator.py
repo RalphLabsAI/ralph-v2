@@ -150,6 +150,12 @@ class GpuSpec:
     # ...and the ceiling that actually fires, on every remote step. See SILENCE_S.
     silence_s: float = SILENCE_S
     max_price_per_hour: float = 0.0  # 0 = no cap
+    # THE PROVIDER-SIDE BACKSTOP, in hours past our own ceiling. Everything else in this module
+    # bounds a rental by running code on this box: `kill_at` needs the process, the `finally` needs
+    # an exception, the watchdog needs the box to be up. All three die together when the box does,
+    # and a leak with nobody watching is unbounded — the incident was ended by a human noticing.
+    # `auto_delete` is enforced by Shadeform, so it is the only bound that survives that.
+    provider_deadline_slack_h: float = 0.5
     ssh_key: str = "/root/.ssh/id_bitzic"
 
 
@@ -235,16 +241,46 @@ class ShadeformProvider(Provider):
         regions = [a for a in best.get("availability", []) if a.get("available")]
         if not regions:
             raise RuntimeError("no available region for the selected instance type")
+        rate = best.get("hourly_price", 0) / 100.0
         body = {"cloud": best["cloud"], "region": regions[0]["region"],
                 "shade_instance_type": best["shade_instance_type"], "shade_cloud": True,
                 "name": name}
         if self.ssh_key_id:
             body["ssh_key_id"] = self.ssh_key_id
+        # THE ONE BOUND THAT SURVIVES THIS BOX DYING. Shadeform enforces both thresholds itself, so
+        # unlike `kill_at`, the `finally`, and the watchdog — all of which need something here to be
+        # alive — this one holds through a SIGKILL, an OOM, a panic, a reboot, or the orchestrator
+        # being reclaimed entirely. That was the largest uncovered risk in the design: with nothing
+        # off-box watching, a leak is bounded only by a human noticing, which last time took 226
+        # minutes. Set LOOSER than every local deadline so it never pre-empts a legitimate round,
+        # and paired with a spend cap because a date is the wrong unit for the thing being risked.
+        hours = spec.max_hours + spec.provider_deadline_slack_h
+        body["auto_delete"] = {
+            "date_threshold": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime(time.time() + hours * 3600.0)),
+            "spend_threshold": f"{max(1.0, rate * hours):.2f}",
+        }
+        # Self-describing ownership: the account is shared with a live miner box and other
+        # projects, and an instance that cannot say whose it is has to be reasoned about by name.
+        body["tags"] = ["ralph-v2", f"round-{name.split('-')[2] if name.count('-') >= 2 else '?'}",
+                        f"host-{os.uname().nodename[:16]}"]
         got = self._api("POST", "/instances/create", body)
-        return Instance(id=str(got.get("id", "")), cloud=best["cloud"],
+        inst = Instance(id=str(got.get("id", "")), cloud=best["cloud"],
                         region=regions[0]["region"],
                         instance_type=best["shade_instance_type"],
-                        price_per_hour=best.get("hourly_price", 0) / 100.0, status="pending")
+                        price_per_hour=rate, status="pending")
+        # VERIFIED, NOT ASSUMED — this module's own lesson, learned when destroy() used the wrong
+        # HTTP verb and reported success. A silently-ignored auto_delete is worse than none,
+        # because the whole point is that it is the guarantee nobody is around to check.
+        try:
+            got_ad = (self._api("GET", f"/instances/{inst.id}/info") or {}).get("auto_delete")
+        except Exception:
+            got_ad = None
+        if not got_ad or not got_ad.get("date_threshold"):
+            sys.stdout.write(
+                f"  WARNING the provider did not record an auto_delete deadline on {inst.id[:12]} "
+                f"— if this box dies holding it, nothing off-box will stop the billing\n")
+        return inst
 
     def wait_ready(self, inst: Instance, timeout_s: float = 900, out=None) -> Instance:
         """`out` IS NOT DEBUG NOISE. This loop is up to fifteen minutes long, the meter is already

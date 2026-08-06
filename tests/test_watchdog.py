@@ -564,6 +564,54 @@ def test_the_events_file_is_valid_json_when_an_age_is_unknown():
             json.loads(line)          # raises on `Infinity`
 
 
+def test_the_provider_deadline_is_the_outermost_ring():
+    """THE LADDER, end to end. Each ring must be looser than the one inside it, or the outer one
+    pre-empts a legitimate round; and the outermost must be the provider's, because it is the only
+    one that does not need this box to be alive. Inside-out: the in-process silence killer, the
+    rental's own kill_at, the watchdog's ceiling, then Shadeform's auto_delete."""
+    spec = GpuSpec()
+    kill_at_s = spec.max_hours * 3600
+    provider_s = (spec.max_hours + spec.provider_deadline_slack_h) * 3600
+    assert SILENCE_S < kill_at_s < RENTAL_CEILING_S < provider_s, \
+        "a ring is tighter than the one it is supposed to back up"
+    assert spec.provider_deadline_slack_h > 0, \
+        "auto_delete at exactly kill_at would race the round's own teardown"
+
+
+def test_rent_sets_a_provider_side_deadline_and_verifies_it():
+    """`kill_at`, the `finally` and the watchdog all need something on this box to be alive. The
+    incident ended with none of them able to run. This is the only bound that survives that, so it
+    is checked back rather than assumed — the same lesson destroy() learned the expensive way."""
+    from eval.orchestrator import ShadeformProvider
+
+    sent = {}
+
+    class _P(ShadeformProvider):
+        def __init__(self):
+            super().__init__(key_file="/dev/null")
+
+        def _key(self):
+            return "x"
+
+        def _api(self, method, path, body=None):
+            if path.startswith("/instances/types"):
+                return {"instance_types": [{"cloud": "c", "shade_instance_type": "H100",
+                                            "hourly_price": 330,
+                                            "availability": [{"region": "r", "available": True}]}]}
+            if path == "/instances/create":
+                sent.update(body)
+                return {"id": "i-new"}
+            return {"auto_delete": sent.get("auto_delete")}
+
+    inst = _P().rent(GpuSpec(), "ralph-round-8-12345")
+    ad = sent.get("auto_delete")
+    assert ad and ad.get("date_threshold") and ad.get("spend_threshold"), sent
+    assert ad["date_threshold"].endswith("Z"), ad["date_threshold"]
+    assert float(ad["spend_threshold"]) >= 3.30 * GpuSpec().max_hours, ad["spend_threshold"]
+    assert "ralph-v2" in sent.get("tags", []), sent.get("tags")
+    assert inst.price_per_hour == 3.30
+
+
 def test_the_run_banner_is_one_string_in_both_modules():
     """The watchdog's attribution collapses to the bannerless state if these ever diverge, and the
     bannerless state is the one where nothing in the log can be attributed to anyone."""
