@@ -91,7 +91,19 @@ class PoolSpec:
 #
 # LEFT, because these prefixes end where the step begins. Right-truncation would delete the only
 # context that predicts the thing being generated.
-MAX_PREFIX_TOKENS = 4096
+# BOUNDED BY THE TIGHTEST WINDOW OF EVERY MODEL THAT READS THE TEXT — and the observer's is
+# tighter than the student's, which I got wrong once. The student runs llama.cpp at N_CTX=8192, but
+# the OBSERVER is fed `prefix + step + continuation` and two of the three in the pool
+# (Phi-3-mini-4k, OLMo-2) stop at 4096 positions. Overflow there does not raise: a RoPE model
+# extrapolates and returns degraded distributions, which feed straight into the KL. Silent
+# wrongness in the one number that decides crowns.
+#
+#     4096 (tightest observer) - 256 (max_step_tokens) - 128 (max_cont_tokens) = 3712
+#
+# 3500 leaves room for chat-template tokens, which `_render` adds and this count does not see.
+# `preflight` refuses any observer whose window cannot hold it, so adding a short-context observer
+# fails before a cent is spent rather than silently degrading a round.
+MAX_PREFIX_TOKENS = 3500
 PREFIX_TOKENIZER = "Qwen/Qwen3-8B"
 PREFIX_TRUNCATION_SIDE = "left"
 

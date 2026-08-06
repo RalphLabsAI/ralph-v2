@@ -118,6 +118,23 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
                        f"carries no HF credential, so this round would die when the nonce drew it")
         except Exception as e:
             warn.append(f"could not verify observer {o} is reachable ({type(e).__name__})")
+        # ...AND IT MUST BE ABLE TO HOLD WHAT WE FEED IT. The observer reads
+        # prefix + step + continuation. Overflowing a RoPE model does not raise — it extrapolates
+        # and returns degraded distributions, which are the input to the KL that decides crowns.
+        try:
+            import json as _j
+            from .pool import MAX_PREFIX_TOKENS
+            with urllib.request.urlopen(
+                    f"https://huggingface.co/{o}/resolve/main/config.json", timeout=20) as r:
+                win = int(_j.loads(r.read()).get("max_position_embeddings") or 0)
+            need = MAX_PREFIX_TOKENS + 256 + 128
+            if win and win < need:
+                bad.append(f"observer {o} holds {win} positions but a round feeds it up to {need} "
+                           f"(prefix {MAX_PREFIX_TOKENS} + step 256 + continuation 128). It would "
+                           f"not raise — it would extrapolate and return degraded distributions "
+                           f"into the KL that decides crowns")
+        except Exception:
+            pass
 
     try:
         from .orchestrator import ShadeformProvider

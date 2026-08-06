@@ -50,6 +50,12 @@ def test_the_exam_is_clamped_not_filtered():
 
     assert MAX_PREFIX_TOKENS + 256 <= GGUFStudentRunner.N_CTX, \
         "a clamped prefix plus a full-length step must still fit the student's window"
+    # AND THE OBSERVER'S, WHICH IS TIGHTER. Two of the three observers stop at 4096 positions, and
+    # the observer is fed prefix + step + continuation. Overflow does not raise there — a RoPE
+    # model extrapolates and returns degraded distributions straight into the KL.
+    TIGHTEST_OBSERVER_WINDOW = 4096
+    assert MAX_PREFIX_TOKENS + 256 + 128 <= TIGHTEST_OBSERVER_WINDOW, \
+        "the exam overflows the smallest observer in the pool; it would degrade silently"
     assert PREFIX_TRUNCATION_SIDE == "left", \
         "these prefixes end where the step begins; right-truncation deletes what predicts it"
 
