@@ -555,6 +555,22 @@ def classify(now: float, unit: UnitView, owners: list, log: LogView, rentals, cf
                    extra="claimed by a run that is no longer here — nothing on this box can "
                          "destroy it, so nothing else will")
 
+    # THE RENTAL A LIVE ROUND CLAIMED, WHICH IS NO LONGER THERE. Every other rung asks "does
+    # something exist that should not"; this asks the opposite, and nothing did until a bulk console
+    # delete took a round's H100 out from under it mid-canary. The round did not notice for minutes
+    # — it only found out when ssh failed — and the watchdog said IDLE-adjacent nothing, because an
+    # instance that has vanished matches no prefix and appears in no list.
+    #
+    # ALARM ONLY, DELIBERATELY. The remedy is nothing this process can perform: there is no rental
+    # left to destroy, and the round's own silence budget will end it. What was missing was
+    # VISIBILITY — the operator and the dashboard learning within one poll instead of twenty
+    # minutes. Acting here could only ever be a false kill on a transient list blip.
+    if unit.running and log.trusted and log.claims_live and not mine and rentals is not None:
+        report.append(f"VANISHED this run claims rental(s) {sorted(log.claims_live)[:2]} but the "
+                      f"provider lists none of them — the round is holding a GPU that no longer "
+                      f"exists, and will not notice until ssh fails")
+        alarms.append("VANISHED")
+
     if unclaimed and owners:
         for t in unclaimed:
             report.append(f"HELD {t.name} ({t.id[:12]}, {t.age / 60:.0f} min) is unclaimed by this "

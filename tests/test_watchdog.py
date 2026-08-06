@@ -745,6 +745,37 @@ def test_the_torch_wheel_never_outruns_the_driver():
     assert _torch_index("") == "" and _torch_index("nonsense") == ""
 
 
+def test_a_rental_deleted_under_a_live_round_is_reported_at_once():
+    """EVERY OTHER RUNG ASKS "does something exist that should not". This asks the opposite.
+
+    On 2026-08-06 a console-side bulk delete took a round's H100 out from under it mid-canary,
+    along with a miner's box. The round did not notice for minutes — it only found out when ssh
+    failed — and the watchdog said nothing, because a vanished instance matches no prefix and
+    appears in no list. The gap was VISIBILITY, not remedy.
+
+    Alarm only, and that is deliberate: there is no rental left to destroy, the round's own silence
+    budget ends it, and acting here could only ever be a false kill on a transient list blip."""
+    log = _live_claim()
+    r = [_inst("ralph-round-1-1", "i-live", NOW - 600)]
+
+    ok = classify(NOW, _unit(), [_owner()], log, r, _cfg(), {})
+    assert "VANISHED" not in ok.alarms, "fired while the rental was present"
+
+    gone = classify(NOW, _unit(), [_owner()], log, [], _cfg(), {})
+    assert "VANISHED" in gone.alarms, gone.alarms
+    assert not gone.acting and not gone.destroy, "there is nothing left to destroy"
+    assert any("no longer exists" in x for x in gone.report), gone.report
+
+    # "could not ask" is not "gone" — the same distinction the rest of the file insists on
+    blind = classify(NOW, _unit(), [_owner()], log, None, _cfg(), {})
+    assert "VANISHED" not in blind.alarms, "an unreachable provider was read as a deletion"
+
+
+def _live_claim():
+    return LogView(mtime=NOW - 30, milestone="scoring", banner_pid=4242, trusted=True,
+                   claims_live=frozenset({"i-live"}))
+
+
 def test_the_run_banner_is_one_string_in_both_modules():
     """The watchdog's attribution collapses to the bannerless state if these ever diverge, and the
     bannerless state is the one where nothing in the log can be attributed to anyone."""
