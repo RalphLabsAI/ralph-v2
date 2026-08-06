@@ -612,6 +612,52 @@ def test_rent_sets_a_provider_side_deadline_and_verifies_it():
     assert inst.price_per_hour == 3.30
 
 
+def test_a_region_that_never_delivers_is_retried_elsewhere_and_never_leaked():
+    """Attempt 9 sat in `pending_provider` for the full 900 s at scaleway/warsaw and was charged
+    $0.84 for hardware that never booted — and the next attempt would have picked the identical
+    cheapest candidate. Retrying is safe here in a way substitution never is: the GPU MODEL is
+    unchanged and the round has not started. What must NOT happen is a retry loop that leaves a
+    billing box behind on every lap."""
+    import io as _io
+
+    from eval.orchestrator import Instance, RemoteRoundError, RoundPlan, run_remote_round
+
+    seen, destroyed = [], []
+
+    class _Flaky:
+        def rent(self, spec, name, exclude=()):
+            seen.append(tuple(exclude))
+            n = len(seen)
+            return Instance(id=f"i-{n}", ip="10.0.0.1", price_per_hour=3.30,
+                            cloud="scaleway", region=f"region-{n}")
+
+        def wait_ready(self, inst, timeout_s=900, out=None):
+            raise RuntimeError(f"instance {inst.id} not ready within {timeout_s:.0f}s")
+
+        def destroy(self, inst):
+            destroyed.append(inst.id)
+
+        def list_all(self):
+            return []
+
+        def sweep(self, **kw):
+            return []
+
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            run_remote_round(RoundPlan(round=1, commit_root="a", round_nonce="b", prev_anchor=""),
+                             _Flaky(), GpuSpec(), os.path.join(d, "w"), out=_io.StringIO())
+            raise AssertionError("a round that never got a box must not return quietly")
+        except RemoteRoundError as e:
+            assert "became usable" in str(e), e
+
+    assert len(seen) == 3, f"expected three regions tried, got {seen}"
+    assert seen[1] == (("scaleway", "region-1"),), seen[1]
+    assert seen[2] == (("scaleway", "region-1"), ("scaleway", "region-2")), seen[2]
+    assert destroyed == ["i-1", "i-2", "i-3"], \
+        f"a retry loop that leaks a billing box per lap is worse than the bug: {destroyed}"
+
+
 def test_the_run_banner_is_one_string_in_both_modules():
     """The watchdog's attribution collapses to the bannerless state if these ever diverge, and the
     bannerless state is the one where nothing in the log can be attributed to anyone."""

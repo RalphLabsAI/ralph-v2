@@ -162,7 +162,10 @@ class GpuSpec:
 class Provider:
     """Rent / wait / destroy. A protocol so the whole flow is testable without spending money."""
 
-    def rent(self, spec: GpuSpec, name: str) -> Instance: ...
+    # `exclude` is a tuple of (cloud, region) pairs already tried and failed THIS round. A
+    # provider that ignores it still works; one that honours it stops a single broken datacentre
+    # from wedging the subnet.
+    def rent(self, spec: GpuSpec, name: str, exclude: tuple = ()) -> Instance: ...
     # `out` is part of the protocol, not an implementation detail: this call blocks for up to
     # fifteen minutes with the meter running, and a provider that cannot say so leaves the
     # single most expensive silent gap in the round.
@@ -220,7 +223,7 @@ class ShadeformProvider(Provider):
             raise RuntimeError(f"shadeform {method} {path} -> {e.code}: "
                                f"{(e.read().decode() if e.fp else '')[:300]}") from e
 
-    def rent(self, spec: GpuSpec, name: str) -> Instance:
+    def rent(self, spec: GpuSpec, name: str, exclude: tuple = ()) -> Instance:
         r = self._api("GET", f"/instances/types?gpu_type={spec.gpu_type}"
                              f"&available=true&sort=price&num_gpus=1")
         types = r.get("instance_types", [])
@@ -237,12 +240,21 @@ class ShadeformProvider(Provider):
                 f"no {spec.gpu_type} available matching cloud={spec.cloud or 'any'} "
                 f"price<={spec.max_price_per_hour or 'any'}. Refusing to substitute a different "
                 f"GPU: cross-box spread is ~0.03 retention against a 0.05 dethrone margin.")
-        best = types[0]
-        regions = [a for a in best.get("availability", []) if a.get("available")]
-        if not regions:
-            raise RuntimeError("no available region for the selected instance type")
+        # ...BUT A DIFFERENT REGION IS NOT A DIFFERENT MEASUREMENT. What binds the round is the
+        # device NAME, which `require_gpu` gates on; where the box physically sits does not change
+        # it. That distinction is load-bearing, because a region can simply fail to deliver:
+        # scaleway/warsaw sat in `pending_provider` for the full 900 s and charged $0.84 for a box
+        # that never booted. Without `exclude` the retry picks the identical cheapest candidate and
+        # the subnet is wedged on one bad datacentre for as long as it stays broken.
+        cands = [(t, a["region"]) for t in types for a in t.get("availability", [])
+                 if a.get("available") and (t.get("cloud"), a.get("region")) not in exclude]
+        if not cands:
+            raise RuntimeError(
+                f"every available {spec.gpu_type} (cloud, region) has already failed this round: "
+                f"{sorted(exclude)}. Still not substituting a different GPU model.")
+        best, region = cands[0]
         rate = best.get("hourly_price", 0) / 100.0
-        body = {"cloud": best["cloud"], "region": regions[0]["region"],
+        body = {"cloud": best["cloud"], "region": region,
                 "shade_instance_type": best["shade_instance_type"], "shade_cloud": True,
                 "name": name}
         if self.ssh_key_id:
@@ -265,8 +277,7 @@ class ShadeformProvider(Provider):
         body["tags"] = ["ralph-v2", f"round-{name.split('-')[2] if name.count('-') >= 2 else '?'}",
                         f"host-{os.uname().nodename[:16]}"]
         got = self._api("POST", "/instances/create", body)
-        inst = Instance(id=str(got.get("id", "")), cloud=best["cloud"],
-                        region=regions[0]["region"],
+        inst = Instance(id=str(got.get("id", "")), cloud=best["cloud"], region=region,
                         instance_type=best["shade_instance_type"],
                         price_per_hour=rate, status="pending")
         # VERIFIED, NOT ASSUMED — this module's own lesson, learned when destroy() used the wrong
@@ -771,28 +782,58 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
         # times out client-side leaves a correctly-named H100 billing whose id nobody ever knew —
         # unfindable in the log, unattributable by any watcher. The name is the only claim that
         # survives that, so it goes to disk first.
-        w(f"  renting {name}…\n")
+        # PROVISIONING IS A SEPARATE FAILURE FROM SCORING, and it needs a separate remedy. A round
+        # that never got a box has produced nothing, risked nothing and audited nothing — retrying
+        # it elsewhere is free of every concern that makes substitution dangerous, because the GPU
+        # MODEL is unchanged and the round has not started. Attempt 9 died exactly here: 900 s in
+        # `pending_provider` at scaleway/warsaw, $0.84 for hardware that never booted, and the next
+        # attempt would have chosen the same broken datacentre.
+        tried: list = []
+        inst = None
+        for attempt in range(1, 4):
+            w(f"  renting {name}…"
+              f"{f' (attempt {attempt}, avoiding {tried})' if tried else ''}\n")
+            _flush(w)
+            inst = provider.rent(spec, name, exclude=tuple(tried))
+            inst.kill_at = time.time() + spec.max_hours * 3600.0
+            w(f"  rented {inst.id} {inst.instance_type} @ ${inst.price_per_hour:.2f}/hr "
+              f"({inst.cloud}/{inst.region}) — ceiling {spec.max_hours:.1f} h "
+              f"(~${inst.price_per_hour * spec.max_hours:.2f} worst case), "
+              f"silence limit {spec.silence_s / 60:.0f} min\n")
+            _flush(w)
+            t0 = time.time()
+            try:
+                inst = provider.wait_ready(inst, out=_Out(w))
+                break
+            except Exception as e:
+                # DESTROY BEFORE RETRYING. A box stuck in `pending_provider` is still billing, and
+                # leaving one behind per attempt is how a retry loop becomes the expensive bug.
+                w(f"  never became usable ({e}) — trying another region\n")
+                tried.append((inst.cloud, inst.region))
+                try:
+                    provider.destroy(inst)
+                    w(f"  destroyed {inst.id} (~${inst.price_per_hour * (time.time() - t0) / 3600.0:.2f})\n")
+                except Exception as de:
+                    w(f"  WARNING could not destroy {inst.id}: {de} — CHECK THE CONSOLE\n")
+                _flush(w)
+                inst = None
+        if inst is None:
+            raise RemoteRoundError(
+                f"no {spec.gpu_type} became usable after {len(tried)} region(s): {tried}. "
+                f"Nothing was scored and every instance was destroyed.")
+        w(f"  ready at {inst.ip} after {time.time() - t0:.0f}s\n")
         _flush(w)
-        inst = provider.rent(spec, name)
-        # The clock starts the moment the meter does, not when the first remote step does.
-        inst.kill_at = time.time() + spec.max_hours * 3600.0
-        w(f"  rented {inst.id} {inst.instance_type} @ ${inst.price_per_hour:.2f}/hr "
-          f"({inst.cloud}/{inst.region}) — ceiling {spec.max_hours:.1f} h "
-          f"(~${inst.price_per_hour * spec.max_hours:.2f} worst case), "
-          f"silence limit {spec.silence_s / 60:.0f} min\n")
-        _flush(w)
-        t0 = time.time()
         return _run_on(inst, plan, provider, spec, job_path, work_dir, repo_dir, remote_dir,
                        runner, w, t0)
 
 
 def _run_on(inst, plan, provider, spec, job_path, work_dir, repo_dir, remote_dir,
             runner, w, t0) -> dict:
-    """The rented half, split out only so the signal handler above wraps `rent` itself."""
+    """The rented half, split out only so the signal handler above wraps `rent` itself.
+
+    Enters with a box that is already READY — provisioning and its retries belong to the caller,
+    because a box that never booted has nothing to tear down here and nothing to audit."""
     try:
-        inst = provider.wait_ready(inst, out=_Out(w))
-        w(f"  ready at {inst.ip} after {time.time() - t0:.0f}s\n")
-        _flush(w)
         run = runner or _default_runner
         summary = run(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, w)
         rec_path = os.path.join(work_dir, "record.json")
@@ -855,6 +896,13 @@ def _capture_diagnostics(inst: Instance, spec: GpuSpec, w) -> None:
     Short timeout and everything swallowed: this runs while an exception is already propagating,
     on a host that has just proved it may be unreachable, and it must never replace the real error
     with its own."""
+    # NOTHING TO ASK IF IT NEVER ANSWERED. An instance that died in `pending_provider` has no IP,
+    # so every probe becomes `ssh: Could not resolve hostname` — four confusing 255s that look like
+    # the box refusing to talk rather than a box that never existed.
+    if not inst.ip:
+        w(f"  no post-mortem: {inst.id[:12]} never reached a usable IP "
+          f"(status {inst.status!r}), so there is nothing on it to ask\n")
+        return
     probes = (
         ("disk", "df -h / /home 2>/dev/null | head -5"),
         ("memory", "free -g 2>/dev/null | head -3"),

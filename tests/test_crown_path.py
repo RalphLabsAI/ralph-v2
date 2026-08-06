@@ -30,6 +30,42 @@ def _scored(mid, per_axis):
                   per_point=flat, gates_ok=True, per_axis=per_axis)
 
 
+def test_the_incumbent_cannot_swap_its_bytes_between_rounds():
+    """THE KING CONTROLS ITS OWN REPO. A challenger's artifact is pinned to the content hash it
+    revealed at commit time, but the incumbent used to be refetched with `expect_hash=""` — from a
+    URI whose repo the king owns. So the crown holder could force-push a model fitted to this
+    round's items over the same ref and have it scored AS the incumbent, while the published record
+    still named the ORIGINAL model_id. That single move defeats the dethrone margin (the paired
+    comparison runs against bytes nobody published), the anti-copy guarantee, and the L2/L3 re-run.
+
+    `Reign.model_id` is the recorded content hash, so pinning to it makes the swap self-refusing —
+    and a mutable `@main` ref becomes harmless."""
+    import tempfile
+    from pathlib import Path
+
+    import eval.fetch as F
+
+    swapped = b"weights fitted to this round's exam"
+    recorded_model_id = "a" * 64          # what the trail says the crown is
+
+    def _try(reveals):
+        with tempfile.TemporaryDirectory() as d:
+            orig = F.fetch
+            F.fetch = lambda uri, root, expect_hash="", **kw: orig(
+                uri, root, expect_hash=expect_hash,
+                lister=lambda repo, rev: [("model.gguf", len(swapped))],
+                downloader=lambda repo, rev, name, out: Path(out).write_bytes(swapped))
+            try:
+                return F.resolver(d, reveals=reveals, log=[])("king:ternary",
+                                                              "hf://kingrepo/m@main")
+            finally:
+                F.fetch = orig
+
+    assert _try({}) != "", "precondition: an unpinned incumbent fetch does succeed"
+    assert _try({"king:ternary": {"content_hash": recorded_model_id}}) == "", \
+        "the king swapped its bytes and was scored anyway"
+
+
 def test_worst_axis_blocks_drifter():
     """A challenger strong on a big axis but weak on a small one clears the POOLED mean
     margin yet is blocked by the worst-axis test; honest-better dethrones; copy ties."""
@@ -3985,7 +4021,9 @@ def test_orchestrator_audits_its_own_scorer_before_signing():
         events = []
 
         class _Provider:
-            def rent(self, spec, name):
+            def rent(self, spec, name, exclude=()):
+                # `exclude` carries the (cloud, region) pairs already tried this round: a region
+                # can fail to deliver a box at all, and without it the retry picks the same one.
                 events.append("rent")
                 return Instance(id="i-1", ip="10.0.0.1", price_per_hour=2.0)
 
@@ -4253,6 +4291,14 @@ def main() -> int:
              test_orchestrator_audits_its_own_scorer_before_signing,
              test_auditor_publishes_its_verdicts_or_stops_voting,
              test_auditor_treats_silence_as_a_finding]
+    # COLLECTED, NOT LISTED. The hand-maintained list above is kept only so the intended ORDER
+    # survives; anything defined and not named in it is appended rather than silently skipped.
+    # A test file where writing a test does nothing is worse than no test file: a security
+    # regression for the crown path was added here, the suite reported 61/61, and the new test had
+    # never run. Discovering that by counting is not a control.
+    named = {t.__name__ for t in tests}
+    tests += [v for k, v in sorted(globals().items())
+              if k.startswith("test_") and callable(v) and k not in named]
     failed = 0
     for t in tests:
         try:

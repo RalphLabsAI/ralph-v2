@@ -66,6 +66,17 @@ def score(job: dict, out_dir: str) -> dict:
     fetch_log: list = []
     reveals = {c["hotkey"]: {"content_hash": c.get("revealed_hash", ""), "salt": c.get("salt", "")}
                for c in job["committed"]}
+    # THE INCUMBENT'S BYTES ARE PINNED TOO, and until this line they were not. A challenger's
+    # artifact is bound to its revealed content hash, but the king was refetched with
+    # `expect_hash=""` — no check at all — from a URI whose repo the king controls. The crown
+    # holder could therefore force-push a model fitted to this round's items over the same ref and
+    # have it scored AS the incumbent, while the record still carried the ORIGINAL model_id. That
+    # is not one bug: it defeats the dethrone margin (the paired comparison is against bytes nobody
+    # published), the anti-copy guarantee, and the L2/L3 re-run (model_id no longer identifies the
+    # weights). `Reign.model_id` IS the recorded content hash, so pinning to it makes a swap
+    # self-refusing — a mutable `@main` ref becomes harmless once the bytes are bound.
+    for _tier, _k in (job.get("kings") or {}).items():
+        reveals[f"king:{_tier}"] = {"content_hash": str(_k.get("model_id", "")), "salt": ""}
     fetch_dir_for = resolver(os.path.join(out_dir, "artifacts"), reveals=reveals, log=fetch_log)
 
     committed, skipped = [], []
