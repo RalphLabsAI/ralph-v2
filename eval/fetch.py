@@ -210,7 +210,14 @@ def _hf_download(repo: str, rev: str, name: str, out_path: str) -> None:
     the only case `os.link` refuses."""
     from huggingface_hub import hf_hub_download
     p = hf_hub_download(repo, name, revision=rev)
+    # RESOLVE THE SYMLINK FIRST, and this line is scar tissue of its own. `hf_hub_download` returns
+    # a path under `snapshots/<rev>/`, which is a RELATIVE symlink (`../../blobs/<sha>`) into the
+    # cache. `os.link` does not follow it — despite `follow_symlinks=True` being the documented
+    # default — so linking it produced a symlink at the destination whose relative target no longer
+    # resolved from the artifact directory. Every file "arrived" and every read of one raised
+    # FileNotFoundError. Hardlink the BLOB, not the pointer to it.
+    real = os.path.realpath(p)
     try:
-        os.link(p, out_path)
+        os.link(real, out_path)
     except OSError:
-        shutil.copyfile(p, out_path)
+        shutil.copyfile(real, out_path)

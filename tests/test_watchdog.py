@@ -658,6 +658,54 @@ def test_a_region_that_never_delivers_is_retried_elsewhere_and_never_leaked():
         f"a retry loop that leaks a billing box per lap is worse than the bug: {destroyed}"
 
 
+def test_a_fetched_file_is_a_real_file_not_a_dangling_pointer():
+    """THE HF CACHE HANDS BACK A SYMLINK. `hf_hub_download` returns a path under `snapshots/<rev>/`
+    which is a RELATIVE symlink (`../../blobs/<sha>`). Hardlinking to save disk linked the POINTER
+    rather than the blob — `os.link` does not follow symlinks despite the documented default — so
+    every file "arrived" and every read of one raised FileNotFoundError. A real round caught this;
+    nothing in the suite could, because the download path had no test at all.
+
+    The destination is deliberately at a different depth from the cache, which is what makes the
+    relative target dangle. A test that puts them at the same depth passes on a broken build."""
+    import eval.fetch as F
+
+    with tempfile.TemporaryDirectory() as d:
+        blobs = os.path.join(d, "cache", "blobs")
+        snap = os.path.join(d, "cache", "models--x--y", "snapshots", "rev")
+        os.makedirs(blobs)
+        os.makedirs(snap)
+        with open(os.path.join(blobs, "sha"), "w") as fh:
+            fh.write('{"model_type": "qwen3"}')
+        os.symlink(os.path.join("..", "..", "..", "blobs", "sha"),
+                   os.path.join(snap, "config.json"))
+
+        dest_root = os.path.join(d, "out", "artifacts")
+        os.makedirs(dest_root)
+        out = os.path.join(dest_root, "config.json")
+
+        # THE REAL FUNCTION, with only the network call stubbed. Re-implementing its body in the
+        # test is how the last three bugs stayed hidden behind a green suite.
+        import sys as _sys
+        import types as _types
+        fake = _types.ModuleType("huggingface_hub")
+        fake.hf_hub_download = lambda repo, name, revision=None: os.path.join(snap, "config.json")
+        prev = _sys.modules.get("huggingface_hub")
+        _sys.modules["huggingface_hub"] = fake
+        try:
+            F._hf_download("x/y", "rev", "config.json", out)
+        finally:
+            if prev is None:
+                _sys.modules.pop("huggingface_hub", None)
+            else:
+                _sys.modules["huggingface_hub"] = prev
+
+        assert not os.path.islink(out), "the destination is a pointer, not a file"
+        with open(out) as fh:
+            assert "qwen3" in fh.read()
+        assert os.stat(out).st_ino == os.stat(os.path.join(blobs, "sha")).st_ino, \
+            "hardlink expected: one inode, one copy on disk"
+
+
 def test_the_run_banner_is_one_string_in_both_modules():
     """The watchdog's attribution collapses to the bannerless state if these ever diverge, and the
     bannerless state is the one where nothing in the log can be attributed to anyone."""
