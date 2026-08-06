@@ -40,7 +40,8 @@ Kill narrow, report wide.
     python -m eval.watchdog once --dry-run    # classify against the live API, touch nothing
     python -m eval.watchdog replay FILE -n N  # re-run classify() on a recorded pass
 
-Exit codes: 0 clear, 1 acted, 2 refused (nothing can be answered), 3 degraded or alarm-without-act.
+Exit codes: 0 clear, 1 acted OR would act (a dry run that found something is not "clear"),
+2 refused (nothing can be answered), 3 degraded or alarm-without-action.
 """
 from __future__ import annotations
 
@@ -152,6 +153,28 @@ class UnitView:
 
 @dataclass
 class LogView:
+    """THREE CLAIM BUCKETS, NOT TWO, and the third one is the whole correctness story.
+
+    The first version had `claims_live` and `claims_dead` and decided between them with
+    `fresh = (not unit.running) or (banner_pid == unit.pid)`. That is wrong in both directions at
+    once, which is how it passed 27 tests:
+
+      * A run SIGKILLed while holding a rental leaves `unit.running` False, so its slice was filed
+        as `claims_live` — which put the leaked instance in `mine`, and `mine` is excluded from
+        every bucket ORPHAN draws from. The rung written for the SIGKILL / OOM / reboot class could
+        not fire for it. The leak survived to the 2.75 h ceiling: ~$9 of the original $12.50.
+      * And the opposite: `claims_dead` was destroyed with no check that any orchestrator was
+        alive, so a log the reader could not attribute — no banner, or a banner pushed out of the
+        read window — put a LIVE round's H100 in the destroy set.
+
+    So attribution is now explicit about what it does not know:
+
+        claims_live   this run wrote it and this run is alive     never destroyed
+        claims_dead   an EARLIER banner wrote it                   destroyed on sight
+        claims_stale  written by a run that is gone, or by a slice
+                      we cannot attribute at all                   destroyed only if no
+                                                                   orchestrator process is alive
+    """
     mtime: float = 0.0
     inode: int = 0
     banner_pid: int = 0
@@ -159,6 +182,7 @@ class LogView:
     line: str = ""
     claims_live: frozenset = frozenset()
     claims_dead: frozenset = frozenset()
+    claims_stale: frozenset = frozenset()
     trusted: bool = False
     note: str = ""
 
@@ -272,7 +296,14 @@ def read_owners() -> list:
         if not cmd or "eval.watchdog" in cmd or "eval/watchdog" in cmd or "--dry-run" in cmd:
             continue
         if _OWNER_RE.search(cmd):
-            out.append((int(entry), cmd))
+            # The start time is READ HERE, not in classify(): classify is pure over frozen
+            # observations, and a /proc stat inside it meant replay() silently dropped every
+            # ZOMBIE_OWNER finding because a recorded pass has no /proc to consult.
+            try:
+                started = os.path.getmtime(f"/proc/{entry}")
+            except Exception:
+                started = 0.0
+            out.append((int(entry), cmd, started))
     return out
 
 
@@ -284,12 +315,24 @@ def _claims(text: str) -> frozenset:
     so a create that succeeds server-side and times out client-side leaves a correctly-named
     instance whose id was never returned to anybody."""
     held: set = set()
-    for raw in text.splitlines():
+    pending_name = ""
+    # SPLIT ON \n ONLY. `str.splitlines()` also breaks on \r, and `_stream_until_silent`
+    # deliberately forwards \r-separated progress bars — so a bar fragment could be mistaken for a
+    # line of the log's own grammar.
+    for raw in text.split("\n"):
         p = raw.split()
-        if len(p) >= 2 and p[0] == "rented" and len(p[1]) > 30:
+        if len(p) >= 2 and p[0] == "renting":
+            pending_name = p[1].rstrip("…").rstrip(".")
+            held.add(pending_name)
+        elif len(p) >= 2 and p[0] == "rented" and len(p[1]) > 30:
+            # THE NAME CLAIM IS SUPERSEDED BY THE ID. It exists only to cover a create whose
+            # response was lost; once the id is known it is the claim, and leaving the name behind
+            # meant a round's claim was NEVER released — `destroyed <uuid>` releases the uuid, and
+            # the orphaned name kept the log rung armed over the free publish tail for the rest of
+            # the run.
+            held.discard(pending_name)
+            pending_name = ""
             held.add(p[1])
-        elif len(p) >= 2 and p[0] == "renting":
-            held.add(p[1].rstrip("…").rstrip("."))
         elif len(p) >= 2 and p[0] == "destroyed" and len(p[1]) > 30:
             held.discard(p[1])
         elif len(p) >= 3 and p[0] == "sweeping" and p[1] == "orphan":
@@ -311,9 +354,12 @@ def read_log(path: str, unit: UnitView) -> LogView:
         st = os.stat(path)
     except OSError as e:
         return LogView(trusted=False, note=f"cannot stat {path}: {e}")
+    # A GENEROUS WINDOW, because losing the banner is not a small error — it is the state in which
+    # nothing in the file can be attributed to anyone. A single round's streamed output can be tens
+    # of megabytes once \r-separated progress bars are forwarded.
     try:
         with open(path, "rb") as fh:
-            fh.seek(max(0, st.st_size - 4 * 1024 * 1024))
+            fh.seek(max(0, st.st_size - 64 * 1024 * 1024))
             blob = fh.read().decode("utf-8", "replace")
     except OSError as e:
         return LogView(mtime=st.st_mtime, inode=st.st_ino, trusted=False,
@@ -321,19 +367,28 @@ def read_log(path: str, unit: UnitView) -> LogView:
 
     cut = blob.rfind(RUN_BANNER)
     if cut < 0:
-        return LogView(mtime=st.st_mtime, inode=st.st_ino, claims_dead=_claims(blob),
+        # UNATTRIBUTABLE, NOT DEAD. Claims found here go to the guarded bucket: this is the state
+        # a fresh deploy is in (no round has written a banner yet) and also the state a rotated or
+        # overflowed log is in, and in the latter a LIVE round's rental is sitting in this blob.
+        # Destroying on that evidence is how a monitor takes down the thing it was watching.
+        return LogView(mtime=st.st_mtime, inode=st.st_ino, claims_stale=_claims(blob),
                        trusted=False,
-                       note="no run banner in the log — deploy the run_orchestrated patch before "
-                            "the HUNG rung can mean anything")
+                       note="no run banner in the log — nothing here can be attributed to a run, "
+                            "so the log rung is off and claims need a dead box to be actioned")
     head, cur = blob[:cut], blob[cut:]
     m = re.search(r"pid=(\d+)", cur.split("\n", 1)[0])
     bpid = int(m.group(1)) if m else 0
-    # "fresh" = the newest banner belongs to the invocation systemd currently reports. If it does
-    # not, this run has not announced itself yet and none of these lines are its.
-    fresh = (not unit.running) or (bpid == unit.pid)
+    # THIS run wrote the newest banner AND is still alive. Anything less is not `live`: a slice
+    # whose author is gone is exactly the leak case, and calling it live was what made ORPHAN
+    # unreachable for every way a process can die without unwinding.
+    fresh = unit.running and bpid == unit.pid
 
     live = _claims(cur) if fresh else frozenset()
-    dead = _claims(head) | (frozenset() if fresh else _claims(cur))
+    # An EARLIER banner is by definition an earlier run: unconditionally actionable. The newest
+    # slice, when its author is gone, is only PROBABLY dead — a round started by hand outside the
+    # unit looks identical from here — so it waits on there being no orchestrator process at all.
+    dead = _claims(head)
+    stale = frozenset() if fresh else _claims(cur)
 
     milestone, line = "", ""
     if fresh:
@@ -349,7 +404,8 @@ def read_log(path: str, unit: UnitView) -> LogView:
                 milestone = needle
                 break
     return LogView(mtime=st.st_mtime, inode=st.st_ino, banner_pid=bpid, milestone=milestone,
-                   line=line, claims_live=live, claims_dead=dead, trusted=True)
+                   line=line, claims_live=live, claims_dead=dead, claims_stale=stale,
+                   trusted=True)
 
 
 def read_rentals(provider):
@@ -407,15 +463,17 @@ def classify(now: float, unit: UnitView, owners: list, log: LogView, rentals, cf
     # worst defect in the reviewed designs: any leaked corpse from a previous crash would then
     # re-arm the log rung over the head and the tail, and a stale mtime there would kill a healthy
     # round that had not even rented yet.
-    mine = [_t(r) for r in mint
-            if str(r.get("id", "")) in log.claims_live or str(r.get("name", "")) in log.claims_live]
-    claimed_dead = [_t(r) for r in mint
-                    if (str(r.get("id", "")) in log.claims_dead
-                        or str(r.get("name", "")) in log.claims_dead)
-                    and not any(m.id == str(r.get("id", "")) for m in mine)]
+    def _in(r, bucket) -> bool:
+        return str(r.get("id", "")) in bucket or str(r.get("name", "")) in bucket
+
+    mine = [_t(r) for r in mint if _in(r, log.claims_live)]
+    claimed_dead = [_t(r) for r in mint if not _in(r, log.claims_live) and _in(r, log.claims_dead)]
+    claimed_stale = [_t(r) for r in mint
+                     if not _in(r, log.claims_live) and not _in(r, log.claims_dead)
+                     and _in(r, log.claims_stale)]
     unclaimed = [_t(r) for r in mint
-                 if not any(m.id == str(r.get("id", "")) for m in mine)
-                 and not any(d.id == str(r.get("id", "")) for d in claimed_dead)]
+                 if not _in(r, log.claims_live) and not _in(r, log.claims_dead)
+                 and not _in(r, log.claims_stale)]
 
     for s in strays:
         t = _t(s)
@@ -425,12 +483,9 @@ def classify(now: float, unit: UnitView, owners: list, log: LogView, rentals, cf
                           f"expected add it to RALPH_WATCHDOG_IGNORE")
             alarms.append("STRAY")
 
-    for pid, cmd in owners:
+    for pid, cmd, started in owners:
         if pid != unit.pid:
-            try:
-                age = now - os.path.getmtime(f"/proc/{pid}")
-            except Exception:
-                age = 0.0
+            age = now - started if started else 0.0
             if age > 10800:
                 report.append(f"ZOMBIE_OWNER pid {pid} has run {age / 3600:.1f} h outside the "
                               f"unit: {cmd[:80]}")
@@ -446,7 +501,17 @@ def classify(now: float, unit: UnitView, owners: list, log: LogView, rentals, cf
     #    is hoisted above the owner split on purpose: in the reviewed designs the absolute ceiling
     #    lived inside `if not owners:` and was therefore unreachable in the one quadrant where a
     #    dollar was actually burning.
-    over = [t for t in (mine + claimed_dead + unclaimed) if t.age > cfg.rental_ceiling_s]
+    # AN UNKNOWN AGE IS NOT AN OLD AGE WHEN THE RENTAL IS OURS AND LIVE. `instance_age_s` fails to
+    # +inf so that a leak is never mistaken for something fresh — right for a rental nobody owns,
+    # and wrong here: applied to a rental THIS run is holding, +inf means "destroy the healthy
+    # round's GPU because the provider reformatted a timestamp". Report it instead.
+    for t in mine:
+        if t.age == float("inf"):
+            report.append(f"UNDATED {t.name} ({t.id[:12]}) is claimed by this run but the provider "
+                          f"gave no parseable created_at — not applying the ceiling to it")
+            alarms.append("UNDATED")
+    over = [t for t in (claimed_dead + claimed_stale + unclaimed) if t.age > cfg.rental_ceiling_s]
+    over += [t for t in mine if cfg.rental_ceiling_s < t.age < float("inf")]
     # A LATCH OF ITS OWN. Sharing "orphan" meant that when this rung failed its first observation
     # the ORPHAN check below immediately overwrote the latch with a different key, so neither rung
     # could ever reach two consecutive observations and the ceiling was unreachable.
@@ -460,9 +525,14 @@ def classify(now: float, unit: UnitView, owners: list, log: LogView, rentals, cf
     # 2. ORPHAN — the orchestrator is gone and only the provider can stop the meter. This is the
     #    incident's last 52 minutes, and the whole SIGKILL / OOM / panic / reboot class. It is the
     #    only rung whose guarantee survives this box being unable to run code.
+    # An EARLIER banner's rental is actionable whatever else is true: that run is over by
+    # definition, because a later one announced itself.
     orphans = [t for t in claimed_dead if t.age > cfg.grace_s]
+    # The newest slice's rental, and anything nobody claimed, need the box to be genuinely empty of
+    # orchestrators — a round started by hand outside the unit is indistinguishable from a corpse
+    # by log evidence alone, and killing it is worse than the leak.
     if not owners:
-        orphans += [t for t in unclaimed if t.age > cfg.grace_s]
+        orphans += [t for t in (claimed_stale + unclaimed) if t.age > cfg.grace_s]
     if orphans and _confirmed(latches, "orphan", [t.id for t in orphans], now, cfg.confirm_s):
         alarms.append("ORPHAN")
         return _mk("ORPHAN", destroy=orphans,
@@ -531,7 +601,10 @@ def _confirmed(latches: dict, kind: str, key_parts, now: float, confirm_s: float
     Keyed on more than mtime: keying on mtime alone is vacuous for every false positive, because a
     false positive is precisely the case where mtime is frozen. Any contradicting observation
     clears the latch, so a round that writes one line resets the clock."""
-    key = "|".join(str(p) for p in key_parts)
+    # SORTED. The instance list comes back in whatever order the provider chose, so an unsorted
+    # join produced a different key on every poll — the latch reset each time and the money rungs
+    # could never reach two consecutive observations.
+    key = "|".join(sorted(str(p) for p in key_parts))
     st = latches.get(kind) or {}
     if st.get("key") != key:
         latches[kind] = {"key": key, "since": now, "obs": 1}
@@ -574,9 +647,12 @@ def act(v: Verdict, cfg: WatchdogConfig, provider, out=sys.stdout, now=time.time
           f"{v.signal_pid or '-'}, destroy {[d.name for d in v.destroy] or '-'}\n")
         return 3
     if not cfg.act or cfg.dry_run:
-        w(f"  DRY RUN  would signal pid {v.signal_pid or '-'} and destroy "
-          f"{[d.name for d in v.destroy] or '-'}\n")
-        return 0
+        # 1, NOT 0. A pass that found a live leak and declined to touch it has not found nothing,
+        # and a monitor whose exit code says "clear" while its alarm file says otherwise is a
+        # monitor that gets wired into something that only reads the exit code.
+        w(f"  {'DRY RUN' if cfg.dry_run else 'DISARMED'}  would signal pid "
+          f"{v.signal_pid or '-'} and destroy {[d.name for d in v.destroy] or '-'}\n")
+        return 1
 
     if v.signal_pid:
         # SIGTERM, NEVER SIGKILL, and never `systemctl stop`.
@@ -596,9 +672,17 @@ def act(v: Verdict, cfg: WatchdogConfig, provider, out=sys.stdout, now=time.time
             os.kill(v.signal_pid, signal.SIGTERM)
         except Exception as e:
             w(f"  ERROR    could not signal {v.signal_pid}: {type(e).__name__}: {e}\n")
-        if _wait_gone(provider, [d.id for d in v.destroy], TEARDOWN_S, now):
+        # ONLY IF THERE WAS SOMETHING TO VERIFY. `_wait_gone([])` is vacuously true, so on
+        # DEGRADED_HUNG — where the destroy list is empty BY CONSTRUCTION because the provider is
+        # unreachable — this printed "the round destroyed its own rental" having checked nothing,
+        # on the one path where we know we cannot see the money.
+        if v.destroy and _wait_gone(provider, [d.id for d in v.destroy], TEARDOWN_S, now):
             w("  clean    the round destroyed its own rental. Nothing left to do.\n")
             return 1
+        if not v.destroy:
+            w("  signalled — the provider is unreachable from here, so whether the rental "
+              "actually went cannot be confirmed. Check the console.\n")
+            return 3
 
     for d in v.destroy:
         # BY ID, NEVER provider.sweep(). Between classification and here a new round may have
@@ -647,6 +731,18 @@ def _save_state(cfg, state: dict) -> None:
         pass
 
 
+def _finite(o):
+    """inf/nan are not JSON. `json.dumps` emits bare `Infinity`, which nothing can read back — in
+    exactly the degraded passes this file exists to preserve."""
+    if isinstance(o, float):
+        return o if o == o and abs(o) != float("inf") else str(o)
+    if isinstance(o, dict):
+        return {k: _finite(x) for k, x in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_finite(x) for x in o]
+    return o
+
+
 def _record(cfg, payload: dict) -> None:
     try:
         os.makedirs(cfg.work_dir, exist_ok=True)
@@ -654,7 +750,7 @@ def _record(cfg, payload: dict) -> None:
         if os.path.exists(path) and os.path.getsize(path) > 5 * 1024 ** 2:
             os.replace(path, path + ".1")
         with open(path, "a") as fh:
-            fh.write(json.dumps(payload) + "\n")
+            fh.write(json.dumps(_finite(payload), allow_nan=False) + "\n")
     except Exception:
         pass
 
@@ -692,9 +788,30 @@ def observe(cfg: WatchdogConfig, provider, now: float):
 
 
 def once(cfg: WatchdogConfig, provider, out=sys.stdout, now=None) -> int:
+    # THE WATCHDOG'S OWN BUDGET, actually enforced. A watchdog that can itself hang is the joke
+    # that writes itself, and the unit's TimeoutStartSec would SIGKILL this process mid-destroy —
+    # abandoning the very instance it was rescuing, which is the incident one level up.
+    started = time.monotonic()
+    signal.signal(signal.SIGALRM, _too_slow) if hasattr(signal, "SIGALRM") else None
+    if hasattr(signal, "alarm"):
+        signal.alarm(int(DEADLINE_S))
+    try:
+        return _once(cfg, provider, out, now, started)
+    finally:
+        if hasattr(signal, "alarm"):
+            signal.alarm(0)
+
+
+def _too_slow(_sig, _frame):
+    raise TimeoutError(f"the watchdog exceeded its own {DEADLINE_S:.0f}s budget")
+
+
+def _once(cfg: WatchdogConfig, provider, out, now, started) -> int:
     now = now if now is not None else time.time()
     state = _load_state(cfg)
     latches = {k: state.get(k) for k in _LATCHES if state.get(k)}
+    import copy
+    latches_in = copy.deepcopy(latches)     # the INPUT state, before classify advances it
     unit, owners, log, rentals = observe(cfg, provider, now)
     v = classify(now, unit, owners, log, rentals, cfg, latches)
 
@@ -705,6 +822,10 @@ def once(cfg: WatchdogConfig, provider, out=sys.stdout, now=None) -> int:
         rc = 3
     for line in v.report:
         out.write(f"  {line}\n")
+    if not v.report and not v.acting:
+        # ONE LINE, EVERY PASS. journalctl timestamps it, so this is also how an operator confirms
+        # the watchdog is alive without running the thing this file exists to replace.
+        out.write(f"  {v.state}: {v.why}\n")
     if v.alarms or v.acting:
         _alarm_file(cfg, True)
     else:
@@ -714,8 +835,11 @@ def once(cfg: WatchdogConfig, provider, out=sys.stdout, now=None) -> int:
     for kind in _LATCHES:
         state[kind] = latches.get(kind)
     _save_state(cfg, state)
-    _record(cfg, {"t": now, "verdict": v.to_event(),
-                  "unit": vars(unit), "owners": [c for _p, c in owners],
+    # THE LATCHES ARE PART OF THE INPUT. classify() is pure over (observations, latches), so a
+    # record without them cannot reproduce any verdict that ACTED — every real incident replayed
+    # as `match: false`, which is exactly the forensic case the file exists for.
+    _record(cfg, {"t": now, "verdict": v.to_event(), "latches": latches_in,
+                  "unit": vars(unit), "owners": [[p, c, st] for p, c, st in owners],
                   "log": {k: (sorted(x) if isinstance(x, frozenset) else x)
                           for k, x in vars(log).items()},
                   "rentals": rentals})
@@ -738,7 +862,8 @@ def status(cfg: WatchdogConfig, provider, out=sys.stdout, now=None) -> int:
     w(f"  unit      {cfg.unit}: load={unit.load_state} active={unit.active_state}"
       f"/{unit.sub_state} pid={unit.pid or '-'} alive={unit.pid_alive}\n")
     w(f"  owners    {len(owners)}"
-      + ("".join(f"\n              pid {p}: {c[:88]}" for p, c in owners) if owners else "") + "\n")
+      + ("".join(f"\n              pid {p}: {c[:88]}" for p, c, _s in owners) if owners else "")
+      + "\n")
     if log.mtime:
         w(f"  log       {cfg.log_path}\n")
         w(f"            last write {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(log.mtime))}"
@@ -787,9 +912,11 @@ def replay(path: str, n: int, cfg: WatchdogConfig, out=sys.stdout) -> int:
     rec = json.loads(lines[n if n >= 0 else len(lines) + n])
     log = LogView(**{**rec["log"],
                      "claims_live": frozenset(rec["log"].get("claims_live") or []),
-                     "claims_dead": frozenset(rec["log"].get("claims_dead") or [])})
-    v = classify(rec["t"], UnitView(**rec["unit"]), [(0, c) for c in rec["owners"]],
-                 log, rec["rentals"], cfg, {})
+                     "claims_dead": frozenset(rec["log"].get("claims_dead") or []),
+                     "claims_stale": frozenset(rec["log"].get("claims_stale") or [])})
+    owners = [tuple(o) if isinstance(o, list) else (0, o, 0.0) for o in rec["owners"]]
+    v = classify(rec["t"], UnitView(**rec["unit"]), owners, log, rec["rentals"], cfg,
+                 dict(rec.get("latches") or {}))
     out.write(json.dumps({"recorded": rec["verdict"]["state"], "replayed": v.state,
                           "match": rec["verdict"]["state"] == v.state}, indent=1) + "\n")
     return 0 if rec["verdict"]["state"] == v.state else 1

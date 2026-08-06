@@ -45,10 +45,18 @@ def _unit(running=True, pid=4242, start=NOW - 7200):
                     start_t=start, invocation="abc123", pid_alive=running)
 
 
-def _log(mtime, milestone="", line="", live=(), dead=(), pid=4242, trusted=True):
+def _owner(pid=4242, cmd="python -m eval.run_orchestrated", started=NOW - 600):
+    """(pid, cmdline, start_time). The start time is read by `read_owners`, never by `classify` —
+    classify is pure over frozen observations, and a /proc stat inside it meant a replayed pass
+    silently lost every ZOMBIE_OWNER finding."""
+    return (pid, cmd, started)
+
+
+def _log(mtime, milestone="", line="", live=(), dead=(), stale=(), pid=4242, trusted=True):
     return LogView(mtime=mtime, inode=1, banner_pid=pid, milestone=milestone,
                    line=line or (milestone + "…" if milestone else ""),
-                   claims_live=frozenset(live), claims_dead=frozenset(dead), trusted=trusted)
+                   claims_live=frozenset(live), claims_dead=frozenset(dead),
+                   claims_stale=frozenset(stale), trusted=trusted)
 
 
 def _inst(name, iid, created_s, price=RATE, status="active"):
@@ -71,7 +79,7 @@ def test_a_fresh_run_does_not_inherit_the_previous_runs_tail():
     """The append-only trap. The file's last line is the PREVIOUS round's `scoring…` — the tightest
     budget there is — and the current run started 60 s ago and has not written its banner yet."""
     log = _log(NOW - 4000, milestone="scoring", pid=999)      # banner pid != unit pid
-    v = classify(NOW, _unit(pid=4242, start=NOW - 60), [(4242, "python -m eval.run_orchestrated")],
+    v = classify(NOW, _unit(pid=4242, start=NOW - 60), [_owner(cmd="python -m eval.run_orchestrated")],
                  log, [_inst("ralph-round-1-1", "i-1", NOW - 60)], _cfg(), {})
     assert v.state != "HUNG", f"a 60-second-old run inherited a dead round's milestone: {v}"
 
@@ -101,9 +109,9 @@ def test_attempt_seven_at_the_moment_the_watchdog_would_have_acted():
     log = _log(NOW - 2000, milestone="scoring", live=["i-real"])
     r = [_inst("ralph-round-1-69408", "i-real", NOW - 2400)]
     latches = {}
-    first = classify(NOW - POLL_S, _unit(), [(4242, "x")], log, r, _cfg(), latches)
+    first = classify(NOW - POLL_S, _unit(), [_owner()], log, r, _cfg(), latches)
     assert not first.acting, "one observation must never be enough"
-    v = classify(NOW, _unit(), [(4242, "x")], log, r, _cfg(), latches)
+    v = classify(NOW, _unit(), [_owner()], log, r, _cfg(), latches)
     assert v.state == "HUNG", v.state
     assert v.signal_pid == 4242
     assert [d.id for d in v.destroy] == ["i-real"]
@@ -116,13 +124,13 @@ def test_a_healthy_install_survives_and_a_dead_one_does_not():
     """The largest false-positive risk in the system: pip reports per package, so a 2.5 GB torch
     wheel is legitimately quiet for a long time."""
     r = [_inst("ralph-round-1-1", "i-1", NOW - 3000)]
-    ok = classify(NOW, _unit(), [(4242, "x")], _log(NOW - 1700, "installing", live=["i-1"]),
+    ok = classify(NOW, _unit(), [_owner()], _log(NOW - 1700, "installing", live=["i-1"]),
                   r, _cfg(), {})
     assert ok.state == "RUNNING", ok.state
     latches = {}
-    classify(NOW - POLL_S, _unit(), [(4242, "x")], _log(NOW - 2600, "installing", live=["i-1"]),
+    classify(NOW - POLL_S, _unit(), [_owner()], _log(NOW - 2600, "installing", live=["i-1"]),
              r, _cfg(), latches)
-    bad = classify(NOW, _unit(), [(4242, "x")], _log(NOW - 2600, "installing", live=["i-1"]),
+    bad = classify(NOW, _unit(), [_owner()], _log(NOW - 2600, "installing", live=["i-1"]),
                    r, _cfg(), latches)
     assert bad.state == "HUNG", bad.state
 
@@ -130,7 +138,7 @@ def test_a_healthy_install_survives_and_a_dead_one_does_not():
 def test_wait_ready_silence_is_not_a_hang():
     """`rented` → the provider can legitimately take 900 s to hand over a box, and that is the
     most expensive place in the round to be wrong: the meter has started and nothing exists yet."""
-    v = classify(NOW, _unit(), [(4242, "x")], _log(NOW - 890, "rented", live=["i-1"]),
+    v = classify(NOW, _unit(), [_owner()], _log(NOW - 890, "rented", live=["i-1"]),
                  [_inst("ralph-round-1-1", "i-1", NOW - 900)], _cfg(), {})
     assert v.state == "RUNNING", v.state
 
@@ -139,7 +147,7 @@ def test_scoring_budget_never_beats_the_in_process_killer():
     """`_stream_until_silent` owns the scoring window: when IT fires it destroys the rental itself
     and writes the accounting line. The watchdog is the backstop for a WEDGED detector, so its
     budget must be strictly the looser of the two."""
-    v = classify(NOW, _unit(), [(4242, "x")], _log(NOW - (SILENCE_S + 100), "scoring",
+    v = classify(NOW, _unit(), [_owner()], _log(NOW - (SILENCE_S + 100), "scoring",
                                                    live=["i-1"]),
                  [_inst("ralph-round-1-1", "i-1", NOW - 3000)], _cfg(), {})
     assert v.state == "RUNNING", v.state
@@ -149,7 +157,7 @@ def test_an_unrecognised_milestone_gets_slower_never_faster():
     """These needles are prose in another module and WILL be reworded. A rename must fall back to
     the conservative budget, never to a shorter one."""
     r = [_inst("ralph-round-1-1", "i-1", NOW - 5000)]
-    mild = classify(NOW, _unit(), [(4242, "x")], _log(NOW - 2000, "", "  frobnicating", ["i-1"]),
+    mild = classify(NOW, _unit(), [_owner()], _log(NOW - 2000, "", "  frobnicating", ["i-1"]),
                     r, _cfg(), {})
     assert mild.state == "RUNNING", mild.state
     assert max(b for _n, b, _w in GRAMMAR) <= STALE_S
@@ -160,7 +168,7 @@ def test_the_growing_head_is_out_of_jurisdiction_even_with_a_corpse_present():
     and free, and no budget applies to it. The trap this closes: keying "is a rental in flight" on
     the name prefix rather than on THIS run's claim, so any leaked corpse re-arms the log rung."""
     corpse = _inst("ralph-round-9-9", "i-corpse", NOW - 5 * 3600)
-    v = classify(NOW, _unit(), [(4242, "x")],
+    v = classify(NOW, _unit(), [_owner()],
                  _log(NOW - 5000, "", "  v2 commitments: 3", live=[]), [corpse],
                  _cfg(), {})
     assert v.signal_pid == 0, "a healthy head was signalled because a corpse was lying around"
@@ -172,9 +180,9 @@ def test_a_corpse_does_not_arm_a_kill_against_the_live_round():
     rentals = [_inst("ralph-round-9-9", "i-corpse", NOW - 5 * 3600),
                _inst("ralph-round-10-1", "i-live", NOW - 300)]
     latches = {}
-    classify(NOW - POLL_S, _unit(), [(4242, "x")], _log(NOW - 10, "scoring", live=["i-live"]),
+    classify(NOW - POLL_S, _unit(), [_owner()], _log(NOW - 10, "scoring", live=["i-live"]),
              rentals, _cfg(), latches)
-    v = classify(NOW, _unit(), [(4242, "x")], _log(NOW - 10, "scoring", live=["i-live"]),
+    v = classify(NOW, _unit(), [_owner()], _log(NOW - 10, "scoring", live=["i-live"]),
                  rentals, _cfg(), latches)
     ids = [d.id for d in v.destroy]
     assert "i-live" not in ids, ids
@@ -244,8 +252,8 @@ def test_an_api_failure_is_degraded_and_still_signals():
     extra steps. SIGTERM costs nothing and delegates teardown to the round's own `finally`."""
     log = _log(NOW - 4000, "scoring", live=["i-1"])
     latches = {}
-    classify(NOW - POLL_S, _unit(), [(4242, "x")], log, None, _cfg(), latches)
-    v = classify(NOW, _unit(), [(4242, "x")], log, None, _cfg(), latches)
+    classify(NOW - POLL_S, _unit(), [_owner()], log, None, _cfg(), latches)
+    v = classify(NOW, _unit(), [_owner()], log, None, _cfg(), latches)
     assert v.state == "DEGRADED_HUNG", v.state
     assert v.signal_pid == 4242
     assert not v.destroy, "nothing can be destroyed through an unreachable API"
@@ -269,14 +277,14 @@ def test_an_untrusted_log_disables_only_the_log_rung():
 def test_the_confirm_latch_needs_two_observations_and_a_still_log():
     latches = {}
     r = [_inst("ralph-round-1-1", "i-1", NOW - 3000)]
-    a = classify(NOW - POLL_S, _unit(), [(4242, "x")], _log(NOW - 2000, "scoring", live=["i-1"]),
+    a = classify(NOW - POLL_S, _unit(), [_owner()], _log(NOW - 2000, "scoring", live=["i-1"]),
                  r, _cfg(), latches)
     assert not a.acting
     # a single fresh write clears it — the key carries the mtime
-    b = classify(NOW - 10, _unit(), [(4242, "x")], _log(NOW - 20, "scoring", live=["i-1"]),
+    b = classify(NOW - 10, _unit(), [_owner()], _log(NOW - 20, "scoring", live=["i-1"]),
                  r, _cfg(), latches)
     assert not b.acting
-    c = classify(NOW, _unit(), [(4242, "x")], _log(NOW - 3000, "scoring", live=["i-1"]),
+    c = classify(NOW, _unit(), [_owner()], _log(NOW - 3000, "scoring", live=["i-1"]),
                  r, _cfg(), latches)
     assert not c.acting, "a new silence episode must start its own confirmation"
 
@@ -412,6 +420,155 @@ def test_the_mint_prefix_cannot_match_the_miner_box():
     for name in PROTECTED:
         assert not name.startswith(MINT_PREFIX), name
     assert MINT_PREFIX == "ralph-round-"
+
+
+# --- through the REAL reader ------------------------------------------------------------------
+#
+# Everything above this line hands `classify()` a LogView built by hand, and that is how a blocker
+# hid behind a green suite: the two tests that appeared to cover ORPHAN passed `running=False`
+# together with `claims_dead={...}`, which is the exact INVERSE of what `read_log` produces for a
+# crashed run. It filed the dead run's rental as `claims_live`, which excluded it from every bucket
+# ORPHAN draws from, so the rung written for the SIGKILL / OOM / reboot class could not fire for
+# it. These go through the real reader over a real file.
+
+def _real_log(d, body):
+    p = os.path.join(d, "ralph-validator.log")
+    with open(p, "w") as fh:
+        fh.write(body)
+    return p
+
+
+_CRASHED = (f"{RUN_BANNER}pid=111 t=1 ===\n"
+            "  renting ralph-round-7-11111…\n"
+            "  rented 11111111-1111-1111-1111-111111111111 H100 @ $3.30/hr\n"
+            "  destroyed 11111111-1111-1111-1111-111111111111 after 5.5 min\n"
+            f"{RUN_BANNER}pid=3851559 t=2 ===\n"
+            "  renting ralph-round-8-69408…\n"
+            "  rented 22222222-2222-2222-2222-222222222222 H100 @ $3.30/hr\n"
+            "  scoring (this is the expensive part)…\n")
+
+
+def test_a_crashed_run_leaves_an_orphan_the_real_reader_can_see():
+    """THE INCIDENT'S OWN SHAPE. The round rented, was SIGKILLed (or the box rebooted), and the
+    unit is `failed` with no process left. Nothing on this box can destroy that rental, so if this
+    rung does not fire, nothing does — and it bills to the 2.75 h ceiling instead of ~8 min."""
+    with tempfile.TemporaryDirectory() as d:
+        lv = read_log(_real_log(d, _CRASHED), _unit(running=False))
+        assert "22222222-2222-2222-2222-222222222222" in lv.claims_stale, lv
+        assert not lv.claims_live, "a dead run's rental is not live"
+        r = [_inst("ralph-round-8-69408", "22222222-2222-2222-2222-222222222222", NOW - 3600)]
+        latches = {}
+        classify(NOW - POLL_S, _unit(running=False), [], lv, r, _cfg(), latches)
+        v = classify(NOW, _unit(running=False), [], lv, r, _cfg(), latches)
+        assert v.state == "ORPHAN", v.state
+        assert [d_.id for d_ in v.destroy] == ["22222222-2222-2222-2222-222222222222"]
+        assert v.signal_pid == 0, "there is no process to signal"
+
+
+def test_a_hand_started_round_is_not_an_orphan():
+    """The other direction, and the reason the stale bucket is gated rather than destroyed on
+    sight: a round started outside systemd looks identical to a corpse by log evidence alone.
+    Killing somebody's live round is worse than the leak it prevents."""
+    with tempfile.TemporaryDirectory() as d:
+        lv = read_log(_real_log(d, _CRASHED), _unit(running=False))
+        v = classify(NOW, _unit(running=False), [_owner()], lv,
+                     [_inst("ralph-round-8-69408", "22222222-2222-2222-2222-222222222222",
+                            NOW - 3600)], _cfg(), {})
+        assert not v.destroy, [x.name for x in v.destroy]
+        assert "HELD" in v.alarms or v.state == "IDLE", v
+
+
+def test_a_bannerless_log_cannot_destroy_a_live_rental():
+    """A rotated log, or one whose banner fell outside the read window. Nothing in the file can be
+    attributed to anyone — and a LIVE round's rental is sitting in that blob."""
+    with tempfile.TemporaryDirectory() as d:
+        body = ("  rented 33333333-3333-3333-3333-333333333333 H100 @ $3.30/hr\n"
+                "  scoring (this is the expensive part)…\n")
+        lv = read_log(_real_log(d, body), _unit())
+        assert not lv.trusted and not lv.claims_dead, lv
+        v = classify(NOW, _unit(), [_owner()], lv,
+                     [_inst("ralph-round-8-1", "33333333-3333-3333-3333-333333333333", NOW - 600)],
+                     _cfg(), {})
+        assert not v.destroy, "an unattributable log destroyed a live round's GPU"
+
+
+def test_the_renting_name_claim_is_released_by_the_id():
+    """`renting <name>` exists only to survive a create whose response was lost. Left behind after
+    the id is known, it was never released by `destroyed <uuid>` — so the claim outlived the
+    rental and kept the log rung armed over the publish tail, which is free and unbounded."""
+    with tempfile.TemporaryDirectory() as d:
+        body = (f"{RUN_BANNER}pid=4242 t=1 ===\n"
+                "  renting ralph-round-8-1…\n"
+                "  rented 44444444-4444-4444-4444-444444444444 H100 @ $3.30/hr\n"
+                "  destroyed 44444444-4444-4444-4444-444444444444 after 30.0 min\n"
+                "  signed by abc…\n")
+        lv = read_log(_real_log(d, body), _unit(pid=4242))
+        assert not lv.claims_live, f"the round's claim outlived its rental: {lv.claims_live}"
+        v = classify(NOW, _unit(pid=4242), [_owner()], lv, [], _cfg(), {})
+        assert v.state != "HUNG" and not v.acting, v
+
+
+def test_an_undated_rental_of_this_run_is_reported_not_destroyed():
+    """`instance_age_s` fails to +inf so a leak is never mistaken for something fresh. Applied to a
+    rental THIS run is holding, +inf would mean "destroy the healthy round's GPU because the
+    provider reformatted a timestamp"."""
+    bad = {"name": "ralph-round-8-1", "id": "i-live", "status": "active", "hourly_price": RATE,
+           "created_at": None}
+    v = classify(NOW, _unit(), [_owner()], _log(NOW - 10, "scoring", live=["i-live"]), [bad],
+                 _cfg(), {})
+    assert not v.destroy, "an unparseable timestamp destroyed the live round's rental"
+    assert "UNDATED" in v.alarms, v.alarms
+
+
+def test_the_latch_key_is_order_independent():
+    """The provider returns instances in whatever order it likes. An unsorted key changed on every
+    poll, so the latch reset each time and the money rungs could never reach two observations."""
+    from eval.watchdog import _confirmed
+    a, b = {}, {}
+    assert not _confirmed(a, "orphan", ["i-1", "i-2"], NOW - 600, 300.0)
+    assert _confirmed(a, "orphan", ["i-2", "i-1"], NOW, 300.0), \
+        "a reordered instance list reset the confirmation"
+    assert not _confirmed(b, "orphan", ["i-1"], NOW - 600, 300.0)
+    assert _confirmed(b, "orphan", ["i-1"], NOW, 300.0)
+
+
+def test_a_recorded_acting_pass_replays_to_the_same_verdict():
+    """Without the latches in the record, every verdict that ACTED replayed as a non-action — the
+    forensic case the events file exists for was the one case it could not reproduce."""
+    import eval.watchdog as W
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(work_dir=d, log_path=_real_log(d, _CRASHED))
+        r = [_inst("ralph-round-8-69408", "22222222-2222-2222-2222-222222222222", NOW - 3600)]
+        p = _FakeProvider(r)
+        W.once(cfg, p, out=io.StringIO(), now=NOW - POLL_S)
+        W.once(cfg, p, out=io.StringIO(), now=NOW)
+        events = os.path.join(d, "watchdog-events.jsonl")
+        lines = [json.loads(x) for x in open(events)]
+        assert lines[-1]["verdict"]["state"] == "ORPHAN", lines[-1]["verdict"]["state"]
+        assert lines[-1]["verdict"]["acting"] is True
+        buf = io.StringIO()
+        assert W.replay(events, -1, cfg, out=buf) == 0, buf.getvalue()
+        assert json.loads(buf.getvalue())["match"] is True
+
+
+def test_the_events_file_is_valid_json_when_an_age_is_unknown():
+    """`json.dumps` emits a bare `Infinity` token, which nothing can read back — in exactly the
+    degraded passes this file exists to preserve."""
+    import eval.watchdog as W
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(work_dir=d, log_path=_real_log(d, _CRASHED))
+        bad = {"name": "ralph-round-8-69408", "id": "i-x", "status": "active",
+               "hourly_price": RATE, "created_at": "not a date"}
+        W.once(cfg, _FakeProvider([bad]), out=io.StringIO(), now=NOW)
+        for line in open(os.path.join(d, "watchdog-events.jsonl")):
+            json.loads(line)          # raises on `Infinity`
+
+
+def test_the_run_banner_is_one_string_in_both_modules():
+    """The watchdog's attribution collapses to the bannerless state if these ever diverge, and the
+    bannerless state is the one where nothing in the log can be attributed to anyone."""
+    from eval.run_orchestrated import RUN_BANNER as WRITTEN
+    assert WRITTEN == RUN_BANNER
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
