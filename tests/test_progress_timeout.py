@@ -108,6 +108,35 @@ def test_output_is_streamed_not_collected():
     assert time.monotonic() - t0 >= 2.0
 
 
+def test_a_carriage_return_only_child_still_writes_the_log():
+    """THE SIGNAL THE EXTERNAL WATCHDOG READS. `silence_s` measures bytes on the PIPE; the watchdog
+    measures bytes in the LOG, and a `\\r`-only tqdm bar reaches `_emit` once per 2000 characters —
+    so a healthy 16 GB download can leave the log's mtime frozen for many minutes while the pipe is
+    busy. That is the exact signature of a hang, on a round that is working."""
+    buf = io.StringIO()
+    _stream_until_silent(
+        _proc("import sys, time\n"
+              "for i in range(12):\n"
+              "    sys.stdout.write('%d%%\\r' % i); sys.stdout.flush(); time.sleep(0.1)\n"),
+        5.0, 60.0, buf.write, "the test child", heartbeat_s=0.3)
+    assert "[heartbeat]" in buf.getvalue(), "the log would have gone silent on a healthy round"
+
+
+def test_output_past_the_suppression_cap_still_heartbeats():
+    """`_emit` stops writing after `max_lines` while the reader keeps resetting the silence clock.
+    Without a heartbeat that is a permanently frozen log on a round that is talking constantly."""
+    buf = io.StringIO()
+    _stream_until_silent(
+        _proc("import time\n"
+              "for i in range(40):\n"
+              "    print('line', i); time.sleep(0.05)\n"),
+        5.0, 60.0, buf.write, "the test child", max_lines=3, heartbeat_s=0.2)
+    log = buf.getvalue()
+    assert "further output suppressed" in log
+    assert "[heartbeat]" in log.split("further output suppressed", 1)[1], \
+        "the log froze after the suppression cap — the watchdog would read this as a hang"
+
+
 def test_a_flood_cannot_fill_the_disk():
     """The log lives on the orchestrator, which also holds the signing key, and a remote in a
     print loop must not be able to fill that disk. The round still succeeds — a chatty box is not

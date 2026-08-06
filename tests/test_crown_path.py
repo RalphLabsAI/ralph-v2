@@ -3989,7 +3989,9 @@ def test_orchestrator_audits_its_own_scorer_before_signing():
                 events.append("rent")
                 return Instance(id="i-1", ip="10.0.0.1", price_per_hour=2.0)
 
-            def wait_ready(self, inst, timeout_s=900):
+            def wait_ready(self, inst, timeout_s=900, out=None):
+                # `out` is part of the Provider protocol: the real wait_ready blocks for up to
+                # fifteen minutes with the meter running and has to say so as it goes.
                 events.append("ready")
                 return inst
 

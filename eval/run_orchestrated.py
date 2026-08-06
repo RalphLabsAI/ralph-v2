@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 
 
@@ -96,6 +97,22 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
     if cfg.live:
         warn.append("LIVE: this round WILL commit an anchor and set weights with the validator "
                     "hotkey. If another signer holds that key, expect nonce collisions.")
+    # NOTHING WATCHES THE WATCHER, and `systemctl is-enabled` would be the pgrep mistake one level
+    # up — it proves the unit EXISTS. This reads the heartbeat the watchdog writes on every pass,
+    # including passes that errored, because a watchdog blind since a key rotation looks perfect to
+    # is-enabled and has not actually run in a week. A warning, never a blocker: a monitor being
+    # off is not a reason to refuse work, it is a reason to know you are unmonitored.
+    import json as _json
+    try:
+        st = _json.load(open(os.path.join(cfg.work_dir, "watchdog-state.json")))
+        age = time.time() - float(st.get("last_pass", 0))
+        if age > 900:
+            warn.append(f"the watchdog has not completed a pass in {age / 60:.0f} min — if this "
+                        f"round is SIGKILLed, OOM-killed, or the box reboots, no in-process guard "
+                        f"runs and the rental leaks. That cost $12.50 once.")
+    except Exception:
+        warn.append("no watchdog heartbeat at all (watchdog-state.json missing) — nothing outside "
+                    "this process will notice a leaked rental. See deploy/install_watchdog.sh")
     for r in bad:
         out.write(f"  BLOCKED  {r}\n")
     for r in warn:
@@ -106,13 +123,38 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
     return bad
 
 
+RUN_BANNER = "=== ralph round start "
+
+
+def _milestone_writer(out):
+    """`out.write`, but flushed. The whole external-liveness signal is the log's mtime, and until
+    this existed it rode entirely on `-u` in a unit file that is not in this repo and that no test
+    can see. A buffered milestone is a round that reads as hung."""
+    def w(s: str) -> None:
+        out.write(s)
+        try:
+            out.flush()
+        except Exception:
+            pass
+    return w
+
+
 def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout) -> int:
     from .chain_bittensor import BittensorChainIO
     from .orchestrator import GpuSpec, RoundPlan, ShadeformProvider, run_remote_round
     from .publish import HFSink, PublishError, RecordPublisher, publish_and_gate
     from .signing import Ed25519Signer
 
-    w = out.write
+    w = _milestone_writer(out)
+    # THE RUN DELIMITER, and it is what makes the log readable by anything but a human.
+    # /var/log/ralph-validator.log is opened `append:` once per invocation and never truncated, so
+    # nothing in it is attributable by position: six runs currently share one file with no
+    # separator and no timestamps of their own. A watcher tailing it reads the PREVIOUS round's
+    # last line as this round's state — and that line is currently `  scoring (this is the
+    # expensive part)…`, which carries the tightest budget there is. UNINDENTED on purpose: every
+    # milestone below starts with exactly two spaces, so this can never be mistaken for one.
+    w(f"{RUN_BANNER}pid={os.getpid()} t={int(time.time())} "
+      f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===\n")
     if preflight(cfg, out):
         w("\n  refusing to run — nothing rented, nothing spent\n")
         return 2
