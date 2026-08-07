@@ -337,6 +337,22 @@ def test_a_published_record_becomes_the_score_a_miner_reads():
     assert doc['trail']['weights']['state'] == 'MEASURED'
 
 
+def test_a_rejected_miner_reads_the_reason_from_the_signed_record():
+    """Round 1 dropped two miners: one never revealed, one shipped a GGUF llama.cpp cannot open.
+    Both reasons existed only in a summary file on the orchestrator — a box the miner cannot see —
+    so from their side they simply vanished from a round they had been accepted into."""
+    rec = _rec(rejected=[["5ZZZnotInTheRecordxxxxxx",
+                          ["committed but not revealed: the sealed value cannot be checked"]]])
+    doc = _build(trail_index={"rounds": [{"round": 1}]}, latest_record=rec,
+                 commitments=[{'hotkey': '5ZZZnotInTheRecordxxxxxx', 'tier': 'sub4',
+                               'artifact_uri': 'hf://x/z@1'}])
+    out = doc['chain']['miners']['value'][0]['outcome']
+    # NOT_APPLICABLE, not NOT_YET_MEASURED: nothing is still coming for this miner this round
+    assert out['state'] == 'NOT_APPLICABLE', out
+    assert 'committed but not revealed' in out['because'], out['because']
+    assert 'value' not in out, "a rejection is not a score"
+
+
 def test_a_committed_miner_absent_from_the_record_is_told_so():
     """Eleven cleared intake, nine reached the record. A miner missing from a published round must
     read a reason, not an empty cell that looks identical to 'still running'."""
@@ -346,6 +362,7 @@ def test_a_committed_miner_absent_from_the_record_is_told_so():
     out = doc['chain']['miners']['value'][0]['outcome']
     assert out['state'] == 'NOT_YET_MEASURED', out
     assert 'published without this submission' in out['because'], out['because']
+    assert 'without a recorded reason' in out['because'], 'silence about the silence'
     assert 'value' not in out
 
 

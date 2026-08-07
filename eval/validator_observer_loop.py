@@ -475,7 +475,10 @@ def run_observer_round(
                                     f"observer:{obs_name}", "unconditioned",
                                     f"trajectories:{len(usable)}", pts, scored, out.events,
                                     out.weights, manifest=manifest, noise=out.noise,
-                                    safety=noise_safety, prev_anchor=prev_anchor)
+                                    safety=noise_safety, prev_anchor=prev_anchor,
+                                    # so a dropped miner learns why from the SIGNED record rather
+                                    # than from a file on a box they cannot see
+                                    rejected=out.rejected)
     if signer is not None:
         out.record.sign(signer)
     return out

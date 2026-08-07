@@ -135,7 +135,8 @@ def _trail_unknown(trail_err: str, what: str) -> dict:
                       state="UNKNOWN")
 
 
-def _outcome_for(hk, scored_by_hk, rounds_published, rec_round, rec_uri, trail_ok, trail_err):
+def _outcome_for(hk, scored_by_hk, rejected_by_hk, rounds_published, rec_round, rec_uri,
+                 trail_ok, trail_err):
     """What the SIGNED record says about this submission, or an honest reason there is nothing.
 
     The four cases are genuinely different and a miner reading their own row can act on which one
@@ -148,8 +149,16 @@ def _outcome_for(hk, scored_by_hk, rounds_published, rec_round, rec_uri, trail_o
         return unmeasured("no round has completed, so this submission has not been scored yet")
     sub = scored_by_hk.get(hk)
     if sub is None:
-        return unmeasured(f"round {rec_round} published without this submission — it did not "
-                          f"reach scoring, or it was rejected before it got there")
+        why_not = rejected_by_hk.get(hk)
+        if why_not:
+            # NOT_APPLICABLE, not NOT_YET_MEASURED: there is nothing still to come for this miner
+            # in this round. The reason is quoted from the signed record verbatim.
+            return unmeasured("round %s did not score this submission: %s"
+                              % (rec_round, "; ".join(str(r) for r in why_not)),
+                              state="NOT_APPLICABLE", round=rec_round,
+                              record_uri=rec_uri or None)
+        return unmeasured(f"round {rec_round} published without this submission, and without a "
+                          f"recorded reason — ask the validator operator")
     return m({"retention": sub.get("retention"),
               "retention_lb": sub.get("retention_lb"),
               "tier": sub.get("tier"),
@@ -215,6 +224,7 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
     # produce a MEASURED score: it was audited, signed, published and anchored, and the verifier
     # re-checked its digest, round number and signature before it got here.
     scored_by_hk: dict = {}
+    rejected_by_hk: dict = {}
     rec_round, rec_uri = None, ""
     if latest_record:
         rec_round = latest_record.get("round")
@@ -223,6 +233,16 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
             hk = str(sub.get("miner", ""))
             if hk:
                 scored_by_hk[hk] = sub
+        # WHY A MINER IS NOT IN `submissions`, straight from the signed record. Round 1 dropped two
+        # and the reasons lived only on the orchestrator, so from the miner's side they vanished
+        # from a round they had been accepted into.
+        for entry in (latest_record.get("rejected") or []):
+            try:
+                hk, reasons = entry[0], list(entry[1])
+            except Exception:
+                continue
+            if hk:
+                rejected_by_hk[str(hk)] = reasons
 
     # --- validator liveness -------------------------------------------------------------------
     last_pass = float(watchdog_state.get("last_pass") or 0)
@@ -346,8 +366,8 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
                                         "no round is currently handling this submission")),
                 # Intake runs on the rented GPU, so acceptance is only knowable once a round has
                 # scored. Saying "accepted" here would be predicting the gates, not reporting them.
-                "outcome": _outcome_for(hk, scored_by_hk, rounds_published, rec_round, rec_uri,
-                                        trail_ok, trail_err),
+                "outcome": _outcome_for(hk, scored_by_hk, rejected_by_hk, rounds_published,
+                                        rec_round, rec_uri, trail_ok, trail_err),
                 # THE IN-FLIGHT NUMBER, never merged into `outcome`. `outcome` means "a published,
                 # signed, anchored record says this"; this means "the scorer produced this and
                 # nothing has checked it". Keeping them as separate fields is what stops a renderer

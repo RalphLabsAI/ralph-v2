@@ -4334,6 +4334,45 @@ def _isolate_env() -> None:
 _isolate_env()          # also covers `pytest tests/test_crown_path.py`, which never calls main()
 
 
+def test_a_sparse_field_cannot_move_an_already_published_digest():
+    """THE TRAP IN ADDING `rejected`. `canonical()` covers every dataclass field, so a new field
+    defaulting to `[]` puts `"rejected":[]` into the canonical form of records published BEFORE it
+    existed. Those records are re-loaded and re-digested by `verify_window` on EVERY publish, so
+    round 1 — already anchored — would have gone stale and the gate would have withheld round 2.
+
+    An absent field and an empty one are the same statement; they must produce the same bytes."""
+    from eval.round_record import RoundRecord
+
+    def _rec(**kw):
+        d = dict(round=1, commit_root="c", round_nonce="n", teacher="t", judge="j", base="b",
+                 pile_id="p", points=[], submissions=[], events=[], weights={})
+        d.update(kw)
+        return RoundRecord(**d)
+
+    empty = _rec()
+    assert '"rejected"' not in empty.canonical(), \
+        "an empty sparse field entered the signed payload — every published record just moved"
+
+    # the digest a pre-`rejected` record would have had: canonical() minus the sparse key
+    import json as _j
+    from dataclasses import asdict
+    legacy = {k: v for k, v in asdict(empty).items()
+              if k not in RoundRecord._SIG_FIELDS and k != "rejected"}
+    assert empty.canonical() == _j.dumps(legacy, sort_keys=True, separators=(",", ":")), \
+        "the canonical form drifted from what a record published before this field would digest to"
+
+    # ...and a real rejection IS signed
+    full = _rec(rejected=[["5XYZ", ["committed but not revealed"]]])
+    assert '"rejected"' in full.canonical()
+    assert full.sha256() != empty.sha256(), "a rejection that does not change the digest is unsigned"
+
+    # a record round-trips through the reader with the field intact
+    from eval.rerun import record_from_blob
+    back = record_from_blob(_j.dumps({**asdict(full)}).encode())
+    assert back.rejected == [["5XYZ", ["committed but not revealed"]]], back.rejected
+    assert back.sha256() == full.sha256()
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,

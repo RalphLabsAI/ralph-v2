@@ -87,6 +87,13 @@ class RoundRecord:
     # holds one digest, so every past record was checkable only against an index the operator also
     # owns, and deleting or swapping an old round broke nothing.
     prev_anchor: str = ""
+    # WHY A MINER IS NOT IN `submissions`. Round 1 accepted eleven artifacts and published nine,
+    # and the two reasons — one miner never revealed, one shipped a GGUF llama.cpp cannot open —
+    # existed only in a summary file on the orchestrator, on a box the miner cannot see. From
+    # their side they vanished from a round they had been accepted into. A rejection is a
+    # judgement about someone's work, so it belongs in the signed, anchored record beside the
+    # scores, exactly as tamper-evident as a retention. Shape: [[hotkey, [reason, ...]], ...]
+    rejected: list = field(default_factory=list)
     # Tolerance is derived from the MEASURED floor, not assumed. The old 0.02 default was ~200x
     # looser than the measured forward-pass floor, i.e. it would certify a materially wrong
     # re-run. build_round_record() sets this from `noise` when one is supplied.
@@ -100,8 +107,19 @@ class RoundRecord:
     # excluded from the signed payload: a payload cannot contain its own signature
     _SIG_FIELDS = ("signature", "signer", "sig_scheme")
 
+    # OMITTED FROM THE PAYLOAD WHEN EMPTY, and this is what makes the field addable at all.
+    # `canonical()` covers every dataclass field, so a new field defaulting to `[]` would put
+    # `"rejected":[]` into the canonical form of records published BEFORE it existed — and those
+    # records are re-loaded and re-digested by `verify_window` on every publish. Round 1 was
+    # already anchored when this was added; without this rule its digest would have moved, the
+    # window check would have called it stale, and round 2 would have been WITHHELD by the gate
+    # that exists to catch exactly that. An absent field and an empty one say the same thing, so
+    # they get the same bytes.
+    _SPARSE = ("rejected",)
+
     def canonical(self) -> str:
-        d = {k: v for k, v in asdict(self).items() if k not in self._SIG_FIELDS}
+        d = {k: v for k, v in asdict(self).items()
+             if k not in self._SIG_FIELDS and not (k in self._SPARSE and not v)}
         return json.dumps(d, sort_keys=True, separators=(",", ":"))
 
     def sha256(self) -> str:
@@ -146,7 +164,7 @@ def build_round_record(round_no: int, commit_root: str, round_nonce: str, teache
                        judge: str, base: str, pile_id: str, points, scored: dict,
                        events: list, weights: dict, manifest: dict | None = None,
                        noise: dict | None = None, safety: float = 3.0,
-                       prev_anchor: str = "") -> RoundRecord:
+                       prev_anchor: str = "", rejected: list | None = None) -> RoundRecord:
     def _pt(p):
         if not isinstance(p, dict):
             return {"rollout_id": getattr(p, "rollout_idx", None), "k": getattr(p, "k", None),
@@ -183,7 +201,9 @@ def build_round_record(round_no: int, commit_root: str, round_nonce: str, teache
                       # round permanently unrepublishable.
                       pts, subs, list(events), weights,
                       manifest=dict(manifest or {}), noise=dict(noise or {}),
-                      prev_anchor=prev_anchor)
+                      prev_anchor=prev_anchor,
+                      # COPIED, for the same reason `events` is
+                      rejected=[[str(hk), list(rs)] for hk, rs in (rejected or [])])
     if noise:
         # derive the acceptance band from the MEASURED floor instead of a fixed 0.02, which was
         # ~200x looser than measured and would certify a materially wrong re-run.
