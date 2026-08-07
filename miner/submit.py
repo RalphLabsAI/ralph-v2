@@ -131,8 +131,12 @@ def cmd_reveal(a) -> int:
     body = json.loads(env)
     body["ch"], body["salt"] = st["content_hash"], st["salt"]
     revealed = json.dumps(body, separators=(",", ":"), sort_keys=True)
-    print(json.dumps({"content_hash": st["content_hash"], "salt": st["salt"]}, indent=2))
-    print(f"\nreveal envelope ({len(revealed)} bytes):\n  {revealed}")
+    # PRINT THE ENVELOPE, NOT A DIFFERENT SHAPE OF IT. This used to print
+    # `{"content_hash": ..., "salt": ...}` first, which is not what goes on chain — the envelope
+    # keys it `ch`. A miner publishing by hand (which `_write_chain` explicitly asks for when the
+    # bittensor SDK is missing) copied the printed shape, and the validator read no reveal at all.
+    # One string, the one that is written.
+    print(f"reveal envelope ({len(revealed)} bytes) — THIS is what goes on chain:\n  {revealed}")
     return _write_chain(a, revealed)
 
 

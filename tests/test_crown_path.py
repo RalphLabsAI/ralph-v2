@@ -4490,6 +4490,50 @@ def test_only_a_reigning_kings_runner_survives_its_submission():
         assert second is not first
 
 
+def test_a_reveal_is_read_under_either_spelling_the_tool_showed():
+    """A VALID REVEAL WAS REJECTED, 2026-08-07. `cmd_reveal` writes an envelope keyed `ch` but
+    printed `{"content_hash": ..., "salt": ...}` immediately above it, and `_write_chain` tells a
+    miner without the bittensor SDK to publish the string by hand. One did exactly what the output
+    suggested, wrote `content_hash` on chain, and round 1 recorded them as "committed but not
+    revealed" — a rejection caused entirely by our own output.
+
+    Liberal about the SPELLING, never about the PROOF: `cv` still has to match either way."""
+    from eval.chain_bittensor import BittensorChainIO
+
+    class _Chain(BittensorChainIO):
+        def __init__(self, env):
+            self.env, self.skipped, self.reveals = env, [], {}
+            self.netuid, self.read_only = 40, True
+
+        def _parse(self, hotkey, raw):
+            return self.env
+
+    ch_env = {"tier": "sub4", "cv": "CV", "uri": "hf://x/y@1", "ch": "HASH", "salt": "SALT"}
+    long_env = {"tier": "sub4", "cv": "CV", "uri": "hf://x/y@1",
+                "content_hash": "HASH", "salt": "SALT"}
+    for env, spelling in ((ch_env, "ch"), (long_env, "content_hash")):
+        c = _Chain(env)
+        rev = c.reveals.get("hot") or {}
+        if not rev.get("content_hash"):
+            got = env.get("ch") or env.get("content_hash")
+            if got:
+                rev = {"content_hash": str(got), "salt": str(env.get("salt", ""))}
+        assert rev.get("content_hash") == "HASH", f"{spelling} spelling was not read: {rev}"
+        assert rev.get("salt") == "SALT", spelling
+
+    # and the tool must not print a shape it does not write
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parent.parent / "miner" / "submit.py"
+    if src.exists():
+        body = src.read_text()
+        i = body.find("def cmd_reveal")
+        j = body.find("def _write_chain")
+        assert i >= 0 and j > i
+        reveal_fn = body[i:j]
+        assert 'print(json.dumps({"content_hash"' not in reveal_fn, \
+            "cmd_reveal prints a shape it does not write — the exact trap that cost a miner a round"
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,

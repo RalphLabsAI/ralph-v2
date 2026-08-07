@@ -178,8 +178,17 @@ class BittensorChainIO:
             # its seal check. A miner's commitment slot is the only channel they have, so the
             # reveal is written back into it alongside the `cv` it has to match.
             rev = self.reveals.get(hotkey) or {}
-            if not rev.get("content_hash") and env.get("ch"):
-                rev = {"content_hash": str(env.get("ch", "")), "salt": str(env.get("salt", ""))}
+            # BOTH SPELLINGS. `cmd_reveal` writes `ch` but PRINTS `{"content_hash", "salt"}` just
+            # above it, and tells a miner without the bittensor SDK to publish the string by hand —
+            # so the tool showed one field name and wrote another. A miner did exactly what the
+            # output suggested, their reveal was valid and on chain, and round 1 rejected them as
+            # "committed but not revealed". The seal check is unchanged and still binding: whichever
+            # key carries it, H(content_hash‖salt) must equal the `cv` sealed before the nonce. Be
+            # liberal about the spelling, never about the proof.
+            if not rev.get("content_hash"):
+                got = env.get("ch") or env.get("content_hash")
+                if got:
+                    rev = {"content_hash": str(got), "salt": str(env.get("salt", ""))}
             ckpt = ""
             if self.fetch_dir_for is not None:
                 try:
