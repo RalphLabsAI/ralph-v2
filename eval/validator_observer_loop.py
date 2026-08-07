@@ -370,6 +370,13 @@ def run_observer_round(
         s.container_bits = float(getattr(_b, "container_bits", 0.0) or 0.0)
         s.steps = _freeze(ms, runner, usable, max_step_tokens)
         s.effects = _effects(ms)
+        # PROVISIONAL, and it says so. The signed record is still the only authority — this number
+        # has not been audited, signed or anchored, and the round can still be WITHHELD after it is
+        # emitted. But withholding it from the operator for the two hours the round takes meant the
+        # dashboard read as "nothing is happening" while the GPU worked, which is its own kind of
+        # dishonesty. The consumer is required to label it; see status.py.
+        _tick("retention", f"{sub.miner[:12]}… tier={sub.tier} retention={ms.score:.4f} "
+                           f"gates={'ok' if s.gates_ok else 'REJECTED'}", force=True)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
         out.scores[sub.model_id] = ms.as_dict()

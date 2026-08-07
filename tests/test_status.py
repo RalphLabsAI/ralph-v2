@@ -269,6 +269,49 @@ def test_the_whole_document_serialises_without_nan_or_infinity():
     json.dumps(_build(), allow_nan=False)
 
 
+
+
+def test_a_live_retention_is_provisional_and_never_an_outcome():
+    """The operator asked to see scores during the ~2h a round takes, rather than only at publish.
+    That is a real need — the page read as "nothing is happening" while the GPU worked — but the
+    number is unaudited, unsigned, unanchored, and the round can still be WITHHELD after it. So it
+    gets a state of its own that CARRIES a value and is FORCED to carry the sentence saying what
+    the value is not, and it lives in its own field so no renderer can promote it into `outcome`."""
+    prog = _PROGRESS + ((402.0, 'retention', '5ERWJp4StMcQ… tier=ternary retention=0.9131 gates=ok'),)
+    doc = _build(unit=_unit(running=True), log=_live(prog),
+                 commitments=[{'hotkey': '5ERWJp4StMcQQBNgxxxxxxxx', 'tier': 'ternary',
+                               'artifact_uri': 'hf://Jordun01/x@1'},
+                              {'hotkey': '5ZZZneverTouchedYetxxxxx', 'tier': 'sub4',
+                               'artifact_uri': 'hf://other/y@1'}])
+    rows = doc['chain']['miners']['value']
+    pr = rows[0]['provisional_retention']
+    assert pr['state'] == 'PROVISIONAL', pr
+    assert pr['value'] == 0.9131, pr
+    assert pr['because'], "a PROVISIONAL number must say what it is not"
+    assert 'not been audited' in pr['because'], pr['because']
+    # it must NOT become an outcome, and must NOT displace the step
+    assert rows[0]['outcome']['state'] != 'MEASURED', rows[0]['outcome']
+    assert rows[0]['handling']['value']['step'] == 'intake', rows[0]['handling']
+    # and a miner the round has not scored says so rather than showing someone else's number
+    assert rows[1]['provisional_retention']['state'] == 'NOT_YET_MEASURED'
+    assert 'value' not in rows[1]['provisional_retention']
+
+
+def test_a_reworded_retention_line_degrades_to_no_number():
+    """The grammar being parsed lives in another module and WILL be reworded. A lenient parse would
+    put a wrong number next to somebody's hotkey; a miss just leaves it unmeasured."""
+    from eval.status import _parse_retention
+    assert _parse_retention('5ERWJp… tier=ternary retention=0.9131 gates=ok') == 0.9131
+    assert _parse_retention('5ERWJp… scored 0.9131') is None
+    assert _parse_retention('') is None
+    assert _parse_retention('retention=nonsense') is None
+    # out-of-band values mean the grammar moved under us, not that a miner scored 4000
+    assert _parse_retention('retention=4000.0') is None
+
+
+# COLLECTED AFTER EVERY TEST IS DEFINED. This used to sit above the last few tests, which
+# meant a test appended to the end of the file was silently never run — it does not fail,
+# it does not appear, and the count just does not go up. Keep this immediately above main().
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

@@ -45,13 +45,30 @@ SCHEMA = "ralph-v2-status/1"
 # every section carries its own and the writer marks the ones it is knowingly publishing stale.
 STALE_AFTER_S = 900.0
 
-STATES = ("MEASURED", "NOT_YET_MEASURED", "UNKNOWN", "NOT_APPLICABLE", "WITHHELD", "STALE")
-_HAS_VALUE = ("MEASURED", "WITHHELD", "STALE")
+# PROVISIONAL is the only state that carries a number nobody has verified. It exists because the
+# alternative was worse: for the ~2h a round takes, every score read NOT_YET_MEASURED and the page
+# looked like nothing was happening while the GPU worked. It is deliberately NOT "MEASURED" — the
+# value has not been audited, signed or anchored, and the round can still be WITHHELD after it is
+# published. Being in _HAS_VALUE it carries the number; being outside "MEASURED" it is forced by
+# `validate` to carry the sentence explaining what the number is not.
+STATES = ("MEASURED", "NOT_YET_MEASURED", "UNKNOWN", "NOT_APPLICABLE", "WITHHELD", "STALE",
+          "PROVISIONAL")
+_HAS_VALUE = ("MEASURED", "WITHHELD", "STALE", "PROVISIONAL")
 
 
 def m(value, **kw) -> dict:
     """A measurement that was actually taken. `kw` carries its provenance (round, record_uri)."""
     d = {"state": "MEASURED", "value": value}
+    d.update({k: v for k, v in kw.items() if v is not None})
+    return d
+
+
+def provisional(value, because: str, **kw) -> dict:
+    """A number the scorer produced but nothing has verified. See STATES.
+
+    Never use this for anything read from a published record — that is `m()`. This is only for
+    values observed in flight, which a later audit can still overturn."""
+    d = {"state": "PROVISIONAL", "value": value, "because": because}
     d.update({k: v for k, v in kw.items() if v is not None})
     return d
 
@@ -91,6 +108,25 @@ def validate(doc) -> None:
             for i, v in enumerate(node):
                 walk(v, f"{path}[{i}]")
     walk(doc, "$")
+
+
+def _parse_retention(detail: str):
+    """`… retention=0.9131 gates=ok` -> 0.9131, or None.
+
+    Returns None rather than guessing on anything it does not recognise: this feeds a number onto a
+    public page, and the grammar it parses lives in another module and WILL be reworded. A miss
+    leaves the score NOT_YET_MEASURED, which is the honest degradation; a lenient parse would put a
+    wrong number next to somebody's hotkey."""
+    import re
+    mo = re.search(r"retention=(-?\d+(?:\.\d+)?)", detail or "")
+    if not mo:
+        return None
+    try:
+        v = float(mo.group(1))
+    except Exception:
+        return None
+    # retention is a ratio; anything outside a sane band means the grammar moved under us
+    return v if -10.0 <= v <= 10.0 else None
 
 
 def _section(as_of: float, max_age_s: float, now: float, **body) -> dict:
@@ -198,16 +234,24 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
         # WHAT THE ROUND HAS DONE TO EACH SUBMISSION, so far, from the scorer's own heartbeats.
         # The progress lines carry a TRUNCATED hotkey ("5ERWJp4StMcQ…"), so matching is by prefix.
         handled: dict = {}
+        live_scores: dict = {}
         for elapsed, stage, detail in log.progress:
             # `rejected` is the only TERMINAL step here, and it is the one a miner most needs to
             # see. Without it the dashboard's last word on a rejected submission is `intake`, which
             # reads as "still being worked on" for the rest of the round — the round announced 11
             # accepted artifacts and then scored 10, and nothing said which miner fell out or why.
-            if stage not in ("fetch", "hash", "intake", "submission", "rejected"):
+            if stage not in ("fetch", "hash", "intake", "submission", "rejected", "retention"):
                 continue
             for c in commitments:
                 hk = str(c.get("hotkey", ""))
                 if hk and hk[:12] in detail:
+                    if stage == "retention":
+                        # carried separately: it is a NUMBER, not a step, and it must not displace
+                        # `submission` as the answer to "what is the round doing with these bytes"
+                        got = _parse_retention(detail)
+                        if got is not None:
+                            live_scores[hk] = (got, elapsed)
+                        continue
                     handled[hk] = (stage, elapsed)
 
         rows = []
@@ -233,6 +277,19 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
                                        "through intake yet")
                             if rounds_published == 0 else
                             unmeasured("this submission has not appeared in a published round")),
+                # THE IN-FLIGHT NUMBER, never merged into `outcome`. `outcome` means "a published,
+                # signed, anchored record says this"; this means "the scorer produced this and
+                # nothing has checked it". Keeping them as separate fields is what stops a renderer
+                # from quietly promoting one into the other.
+                "provisional_retention": (
+                    provisional(live_scores[hk][0],
+                                "the scorer produced this mid-round; it has not been audited, "
+                                "signed or anchored, and the round can still be withheld",
+                                remote_elapsed_s=live_scores[hk][1])
+                    if hk in live_scores else
+                    unmeasured("this round has not finished scoring this submission yet"
+                               if in_flight else
+                               "no round is currently scoring this submission")),
             })
         miners = m(rows)
         by_tier: dict = {}
