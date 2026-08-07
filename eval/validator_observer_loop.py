@@ -49,6 +49,24 @@ def _pool_sha(trajectory_pool) -> str:
         return ""
 
 
+def _determinism_drift(a, b) -> float:
+    """Largest per-slice difference between two scorings of the SAME bytes. 0.0 means reproduced.
+
+    Compares SLICES, not just the headline score. Two runs can agree on the aggregate while
+    disagreeing underneath — and since the aggregate is a worst-slice minimum, a slice that moved
+    without changing the minimum this time can change it next time. The point is to catch the
+    instability, not only the occasion it happened to matter."""
+    sa, sb = dict(getattr(a, "slice_samples", {}) or {}), dict(getattr(b, "slice_samples", {}) or {})
+    worst = abs(float(getattr(a, "score", 0.0)) - float(getattr(b, "score", 0.0)))
+    for k in set(sa) | set(sb):
+        va, vb = sa.get(k) or [], sb.get(k) or []
+        if len(va) != len(vb):
+            return float("inf")          # a different sample count is not a drift, it is a break
+        for x, y in zip(va, vb):
+            worst = max(worst, abs(float(x) - float(y)))
+    return worst
+
+
 def _close_runner(runner) -> None:
     """Release a student's backend if it has one. Never raises: cleanup that throws would convert
     a scored submission into a rejected one, which is the failure this exists to prevent."""
@@ -204,6 +222,11 @@ class ObserverRoundOutcome:
     item_indices: list = field(default_factory=list)
     corpus_spec: str = ""
     identity: dict = field(default_factory=dict)
+    # What re-scoring ONE submission twice on this box produced. `identity` checks the PARENT
+    # through the HF/torch path and says nothing about llama.cpp, which is the path that actually
+    # decides crowns — round 2 scored one file at 0.3030 and 0.2875 with `identity` reporting a
+    # perfect 1.000 the whole time.
+    determinism: dict = field(default_factory=dict)
     # the tier->King map as it stood BEFORE this round scored anything. tournament.consider()
     # mutates in place, so without a snapshot a withheld round's crown survives in memory and the
     # next round writes it on chain — the gate would withhold payment and then pay anyway.
@@ -365,6 +388,31 @@ def run_observer_round(
     # lazy, so the object stays valid and transparently reloads if a later round needs it. Cache
     # eviction, not destruction.
     keep_loaded = {k.model_id for k in tournament.kings.values()}
+
+    # THE STUDENT DETERMINISM CANARY, and which submission it runs on is the whole design.
+    #
+    # Round 2 scored ONE file twice — as a challenger and as the re-scored incumbent — and got
+    # 0.3030 and 0.2875. Four of five slices were bit-identical; the fifth differed, and because
+    # the score is the WORST slice, that one unstable slice WAS the score. Worst-slice aggregation
+    # systematically selects the slice most exposed to nondeterminism: the worst slice is where the
+    # model is struggling, and struggling generations sit on near-tied token probabilities where a
+    # floating-point wobble flips a token. The 0.0155 spread is about a third of the 0.05 dethrone
+    # margin. Nothing caught it — `identity_check` scores the PARENT against itself through the
+    # HF/torch path and never touches the llama.cpp student path at all.
+    #
+    # It runs on the LARGEST submission, not the cheapest. The observed failure was on the biggest
+    # model in the round, which is the one nearest the point where llama.cpp stops offloading every
+    # layer; a canary on a small model would pass while the thing it exists to catch goes by. A
+    # canary that tests the easy case is decoration.
+    #
+    # It costs ONE extra pass, not two: the first result is kept as that submission's real score.
+    probe_id = ""
+    if subs:
+        def _bulk(t):
+            b = d_bits.get(t[0].model_id)
+            return float(getattr(b, "container_bits", 0.0) or 0.0) * (t[0].params or 1)
+        probe_id = max(subs, key=_bulk)[0].model_id
+
     for n, (sub, runner, art_uri) in enumerate(subs, 1):
         _tick("submission", f"[{n}/{len(subs)}] {sub.miner[:12]}… tier={sub.tier}", force=True)
         registry[sub.model_id] = runner
@@ -374,6 +422,24 @@ def run_observer_round(
         # to be one submission. The reason is recorded against that miner rather than swallowed.
         try:
             ms = score_submission(shared, runner, observer, max_step_tokens=max_step_tokens)
+            if sub.model_id == probe_id:
+                _tick("determinism canary", f"re-scoring {sub.miner[:12]}… to check the student "
+                                            f"path reproduces", force=True)
+                again = score_submission(shared, runner, observer,
+                                         max_step_tokens=max_step_tokens)
+                drift = _determinism_drift(ms, again)
+                out.determinism = {"model_id": sub.model_id, "first": round(ms.score, 6),
+                                   "second": round(again.score, 6),
+                                   "max_slice_drift": round(drift, 6), "reproduced": drift == 0.0}
+                if drift != 0.0:
+                    out.events.append({
+                        "round": round_no, "action": "abort",
+                        "reason": f"the student path is not reproducible: scoring "
+                                  f"{sub.model_id[:12]}… twice on this box gave "
+                                  f"{ms.score:.6f} and {again.score:.6f} (worst slice drifted "
+                                  f"{drift:.6f}). A crown decided inside that drift is a lottery.",
+                        "determinism": out.determinism})
+                    return out
         except Exception as e:
             out.rejected.append((c_hotkey_of(sub), [f"scoring raised {type(e).__name__}: "
                                                     f"{str(e)[:200]}"]))
@@ -502,6 +568,7 @@ def run_observer_round(
         "max_cont_tokens": max_cont_tokens,
         "noise_safety": noise_safety,
         "identity": out.identity,
+        "determinism": out.determinism,
         "frozen_rollouts": True,
         "versions": _versions(),
     }

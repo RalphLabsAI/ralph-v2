@@ -4603,6 +4603,39 @@ def test_a_hold_round_binds_its_inherited_kings():
     assert any("kings" in c.name for c in bad2), [c.name for c in bad2]
 
 
+def test_the_student_path_must_reproduce_or_the_round_aborts():
+    """ROUND 2 SCORED ONE FILE AT 0.3030 AND 0.2875. Four of five slices were bit-identical; the
+    fifth moved, and because the score is the WORST slice, that one unstable slice WAS the score.
+    Worst-slice aggregation selects the slice most exposed to nondeterminism — the worst slice is
+    where the model struggles, and struggling generations sit on near-tied probabilities where a
+    float wobble flips a token. The 0.0155 spread is a third of the 0.05 dethrone margin.
+
+    `identity_check` reported a perfect 1.000 throughout: it scores the PARENT against itself
+    through the HF/torch path and never touches llama.cpp, which is the path that decides crowns."""
+    from eval.validator_observer_loop import _determinism_drift
+
+    class MS:
+        def __init__(self, score, slices):
+            self.score, self.slice_samples = score, slices
+
+    same = MS(0.3, {"en|shallow": [0.30, 0.31], "zh|deep": [0.5]})
+    assert _determinism_drift(same, MS(0.3, {"en|shallow": [0.30, 0.31], "zh|deep": [0.5]})) == 0.0
+
+    # the round-2 shape: aggregate moved, one slice moved
+    drifted = _determinism_drift(MS(0.3030, {"en|shallow": [0.3030], "zh|deep": [0.5956]}),
+                                 MS(0.2875, {"en|shallow": [0.2875], "zh|deep": [0.5956]}))
+    assert abs(drifted - 0.0155) < 1e-9, drifted
+
+    # A SLICE MAY MOVE WITHOUT MOVING THE MINIMUM — and that still has to count, because the slice
+    # that did not decide the score this time can decide it next time.
+    hidden = _determinism_drift(MS(0.30, {"worst": [0.30], "other": [0.80]}),
+                                MS(0.30, {"worst": [0.30], "other": [0.90]}))
+    assert hidden > 0.0, "a slice moved underneath an unchanged aggregate and was reported clean"
+
+    # a different sample count is a break, not a drift
+    assert _determinism_drift(MS(0.3, {"a": [0.1, 0.2]}), MS(0.3, {"a": [0.1]})) == float("inf")
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
