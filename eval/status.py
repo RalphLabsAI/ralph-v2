@@ -129,6 +129,64 @@ def _parse_retention(detail: str):
     return v if -10.0 <= v <= 10.0 else None
 
 
+def _trail_unknown(trail_err: str, what: str) -> dict:
+    return unmeasured(f"the published trail could not be read ({trail_err}), so {what} cannot be "
+                      f"reported — this is a failed read, not an absence of results",
+                      state="UNKNOWN")
+
+
+def _outcome_for(hk, scored_by_hk, rounds_published, rec_round, rec_uri, trail_ok, trail_err):
+    """What the SIGNED record says about this submission, or an honest reason there is nothing.
+
+    The four cases are genuinely different and a miner reading their own row can act on which one
+    they are in: the trail is unreadable, no round has run, a round ran and did not include them,
+    or a round scored them. Collapsing the first into the second is what made the dashboard say
+    `0 rounds completed` for an hour after round 1 anchored."""
+    if not trail_ok:
+        return _trail_unknown(trail_err, "this submission's result")
+    if rounds_published == 0:
+        return unmeasured("no round has completed, so this submission has not been scored yet")
+    sub = scored_by_hk.get(hk)
+    if sub is None:
+        return unmeasured(f"round {rec_round} published without this submission — it did not "
+                          f"reach scoring, or it was rejected before it got there")
+    return m({"retention": sub.get("retention"),
+              "retention_lb": sub.get("retention_lb"),
+              "tier": sub.get("tier"),
+              "gates_ok": bool(sub.get("gates_ok")),
+              "reasons": list(sub.get("reasons") or [])},
+             round=rec_round, record_uri=rec_uri or None)
+
+
+def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err):
+    if not trail_ok:
+        return _trail_unknown(trail_err, "the crowns")
+    if rounds_published == 0 or not rec:
+        return unmeasured("no round has completed, so no tier has a crown")
+    crowns = {}
+    for e in (rec.get("events") or []):
+        if str(e.get("action")) == "crown" and e.get("tier"):
+            crowns[str(e["tier"])] = {"miner": e.get("miner"), "model_id": e.get("king"),
+                                      "retention": e.get("retention")}
+    if not crowns:
+        return unmeasured(f"round {rec_round} published but crowned no tier")
+    return m(crowns, round=rec_round, record_uri=rec_uri or None)
+
+
+def _weights_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err):
+    """The weight vector the record DECIDED. Deliberately not "what is on chain": the extrinsic can
+    be refused by the rate limit — as it was on round 1 — and reporting the decision as if it were
+    the chain state would be the page's one unforgivable lie."""
+    if not trail_ok:
+        return _trail_unknown(trail_err, "the weights")
+    if rounds_published == 0 or not rec:
+        return unmeasured("weights are set only after a round publishes and its anchor verifies")
+    ws = dict(rec.get("weights") or {})
+    if not ws:
+        return unmeasured(f"round {rec_round} published without a weight vector")
+    return m(ws, round=rec_round, record_uri=rec_uri or None)
+
+
 def _section(as_of: float, max_age_s: float, now: float, **body) -> dict:
     """Every section dates itself and declares how long it may be believed. The writer stamps
     `expired` because it knows the age at PUSH time, while a renderer only learns it at fetch time
@@ -143,13 +201,28 @@ def _section(as_of: float, max_age_s: float, now: float, **body) -> dict:
 # ---------------------------------------------------------------------------------------------
 
 def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, chain_err: str,
-          trail_index: dict, live: bool) -> dict:
+          trail_index: dict, live: bool, latest_record: dict | None = None,
+          trail_err: str = "") -> dict:
     """Pure over frozen observations, exactly as `watchdog.classify` is, and for the same reason:
     a snapshot builder that reads the world as it goes cannot be tested against the states that
     matter (no round, dead chain, empty trail) without arranging the world first."""
     from .watchdog import budget_for
 
     rounds_published = len((trail_index or {}).get("rounds") or [])
+    trail_ok = not trail_err
+
+    # WHAT THE SIGNED RECORD SAYS, keyed by hotkey. This is the only source on the page allowed to
+    # produce a MEASURED score: it was audited, signed, published and anchored, and the verifier
+    # re-checked its digest, round number and signature before it got here.
+    scored_by_hk: dict = {}
+    rec_round, rec_uri = None, ""
+    if latest_record:
+        rec_round = latest_record.get("round")
+        rec_uri = str(latest_record.get("uri") or "")
+        for sub in (latest_record.get("submissions") or []):
+            hk = str(sub.get("miner", ""))
+            if hk:
+                scored_by_hk[hk] = sub
 
     # --- validator liveness -------------------------------------------------------------------
     last_pass = float(watchdog_state.get("last_pass") or 0)
@@ -273,10 +346,8 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
                                         "no round is currently handling this submission")),
                 # Intake runs on the rented GPU, so acceptance is only knowable once a round has
                 # scored. Saying "accepted" here would be predicting the gates, not reporting them.
-                "outcome": (unmeasured("no round has completed, so this submission has not been "
-                                       "through intake yet")
-                            if rounds_published == 0 else
-                            unmeasured("this submission has not appeared in a published round")),
+                "outcome": _outcome_for(hk, scored_by_hk, rounds_published, rec_round, rec_uri,
+                                        trail_ok, trail_err),
                 # THE IN-FLIGHT NUMBER, never merged into `outcome`. `outcome` means "a published,
                 # signed, anchored record says this"; this means "the scorer produced this and
                 # nothing has checked it". Keeping them as separate fields is what stops a renderer
@@ -302,16 +373,16 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
     # --- the trail: where every score would live ----------------------------------------------
     trail = _section(
         now, 900.0, now,
-        rounds_published=m(rounds_published),
+        rounds_published=(m(rounds_published) if trail_ok else
+                          unmeasured(f"the published trail could not be read ({trail_err}); a "
+                                     f"failed read is not a count of zero", state="UNKNOWN")),
         # ATTEMPTS ARE NOT ROUNDS and the two are never added together.
         note=("no round has completed yet; every scored quantity below is NOT_YET_MEASURED by "
-              "fact, not by omission" if rounds_published == 0 else ""),
-        crowns=(unmeasured("no round has completed, so no tier has a crown")
-                if rounds_published == 0 else
-                unmeasured("crowns are read from the published trail", state="UNKNOWN")),
-        weights=(unmeasured("weights are set only after a round publishes and its anchor verifies")
-                 if rounds_published == 0 else
-                 unmeasured("weights are read from the published trail", state="UNKNOWN")),
+              "fact, not by omission" if trail_ok and rounds_published == 0 else ""),
+        crowns=_crowns_from(latest_record, rounds_published, rec_round, rec_uri, trail_ok,
+                            trail_err),
+        weights=_weights_from(latest_record, rounds_published, rec_round, rec_uri, trail_ok,
+                              trail_err),
     )
 
     doc = {
@@ -377,15 +448,34 @@ def main(argv: list) -> int:
         except Exception as e:
             chain_err = f"{type(e).__name__}: {e}"
 
+    # THE TRAIL READ USED TO FAIL SILENTLY INTO "NO ROUNDS". `RecordPublisher` refuses to
+    # construct without `state_path` — deliberately, it is the never-shrink guard — so this call
+    # raised on every single pass and the bare `except` turned it into an empty index. Round 1
+    # published and anchored, and the dashboard still said `0 rounds completed` with a MEASURED
+    # zero next to it. A failed read is not a measurement of zero; it is now reported as UNKNOWN.
     trail_index: dict = {}
+    trail_err = ""
+    latest_record = None
     try:
         from .publish import HFSink, RecordPublisher
-        trail_index = RecordPublisher(HFSink(cfg.records_repo)).load_index()
-    except Exception:
-        trail_index = {}
+        hwm = os.path.join(cfg.work_dir,
+                           f"publish-hwm-{cfg.records_repo.replace('/', '_')}.json")
+        trail_index = RecordPublisher(HFSink(cfg.records_repo), state_path=hwm).load_index()
+    except Exception as e:
+        trail_err = f"{type(e).__name__}: {e}"
+
+    # and the newest record itself, fetched through the verifier rather than trusted: the scores a
+    # miner reads here must be the ones that were signed and anchored, not whatever bytes the repo
+    # happens to serve.
+    if not trail_err and (trail_index.get("rounds") or []):
+        try:
+            from .show_round import load as _load_round
+            _n, latest_record, _idx = _load_round(None, cfg.records_repo)
+        except Exception as e:
+            trail_err = f"record unreadable: {type(e).__name__}: {e}"
 
     doc = build(now, unit, log, wstate, rentals, commitments, chain_err, trail_index,
-                _effective_live(unit))
+                _effective_live(unit), latest_record=latest_record, trail_err=trail_err)
     blob = json.dumps(doc, indent=1, sort_keys=True, allow_nan=False)
 
     out_path = os.path.join(cfg.work_dir, "status.json")

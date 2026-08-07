@@ -28,9 +28,7 @@ def load(round_no: int | None, repo: str):
     """Fetch through the SAME path `verify_window` uses: the index names the blob, the sink serves
     it, and the digest is re-checked here rather than assumed. A summary that skipped the digest
     would happily render a record that no longer matches what was anchored."""
-    import hashlib
-
-    from .publish import HFSink, RecordPublisher
+    from .publish import HFSink, RecordPublisher, roundtrip_reason
 
     # THE SAME high-water-mark file the round uses, not a throwaway publisher. It is what makes a
     # failed index read raise instead of rendering as "no rounds yet" — which is precisely the
@@ -52,10 +50,17 @@ def load(round_no: int | None, repo: str):
     blob = pub.sink.get(entry["name"])
     if blob is None:
         raise SystemExit(f"round {round_no} is indexed as {entry['name']} but is not fetchable")
-    got = hashlib.sha256(blob).hexdigest()
-    if entry.get("sha256") and got != entry["sha256"]:
-        raise SystemExit(f"round {round_no} digest mismatch: index says {entry['sha256'][:16]}…, "
-                         f"bytes hash to {got[:16]}… — do not trust this record")
+    # THE REAL VERIFIER, not a reimplementation of it. My first version compared
+    # `sha256(blob)` to the index digest and rejected the very first honest record this subnet
+    # ever published — the digest is over `canonical()`, so two different serialisations of the
+    # same record are the same record, and `roundtrip_reason`'s docstring says so by name. It also
+    # checks the round number and the pinned signature, which a bare digest comparison misses:
+    # canonical() excludes the signature, so a record can be re-signed with the digest intact.
+    ok, reason = roundtrip_reason(blob, entry.get("sha256", ""),
+                                  expect_round=int(round_no),
+                                  expect_signature=entry.get("signature", ""))
+    if not ok:
+        raise SystemExit(f"round {round_no} failed verification: {reason}")
     return round_no, json.loads(blob.decode()), idx
 
 

@@ -309,6 +309,60 @@ def test_a_reworded_retention_line_degrades_to_no_number():
     assert _parse_retention('retention=4000.0') is None
 
 
+def _rec(**kw):
+    d = dict(round=1, weights={"5AAA": 0.5, "5BBB": 0.5},
+             submissions=[{"miner": "5ERWJp4StMcQQBNgxxxxxxxx", "tier": "ternary",
+                           "retention": 0.3142, "retention_lb": 0.3142, "gates_ok": True,
+                           "reasons": []}],
+             events=[{"action": "crown", "tier": "ternary", "miner": "5ERWJp4StMcQQBNgxxxxxxxx",
+                      "king": "abc123", "retention": 0.3142}])
+    d.update(kw)
+    return d
+
+
+def test_a_published_record_becomes_the_score_a_miner_reads():
+    """Round 1 anchored and the page still said `0 rounds completed`, because nothing ever read the
+    record. `outcome` is the only field allowed to carry a MEASURED score, and it comes from bytes
+    that were audited, signed, published and anchored."""
+    doc = _build(trail_index={"rounds": [{"round": 1}]}, latest_record=_rec(),
+                 commitments=[{'hotkey': '5ERWJp4StMcQQBNgxxxxxxxx', 'tier': 'ternary',
+                               'artifact_uri': 'hf://x/y@1'}])
+    assert doc['trail']['rounds_published']['value'] == 1
+    out = doc['chain']['miners']['value'][0]['outcome']
+    assert out['state'] == 'MEASURED', out
+    assert out['value']['retention'] == 0.3142
+    assert out['round'] == 1, "a score with no round attached cannot be checked against the trail"
+    crowns = doc['trail']['crowns']
+    assert crowns['state'] == 'MEASURED' and crowns['value']['ternary']['retention'] == 0.3142
+    assert doc['trail']['weights']['state'] == 'MEASURED'
+
+
+def test_a_committed_miner_absent_from_the_record_is_told_so():
+    """Eleven cleared intake, nine reached the record. A miner missing from a published round must
+    read a reason, not an empty cell that looks identical to 'still running'."""
+    doc = _build(trail_index={"rounds": [{"round": 1}]}, latest_record=_rec(),
+                 commitments=[{'hotkey': '5ZZZnotInTheRecordxxxxxx', 'tier': 'sub4',
+                               'artifact_uri': 'hf://x/z@1'}])
+    out = doc['chain']['miners']['value'][0]['outcome']
+    assert out['state'] == 'NOT_YET_MEASURED', out
+    assert 'published without this submission' in out['because'], out['because']
+    assert 'value' not in out
+
+
+def test_an_unreadable_trail_is_never_a_confident_zero():
+    """THE BUG THIS FILE EXISTS FOR, one layer up. `RecordPublisher` refuses to construct without a
+    state_path, so the trail read raised on every pass and a bare `except` turned it into an empty
+    index — the page published `rounds_published: {MEASURED, 0}` for an hour after round 1 anchored.
+    A failed read is not a measurement of zero."""
+    doc = _build(trail_index={}, trail_err="PublishError: state_path is required")
+    rp = doc['trail']['rounds_published']
+    assert rp['state'] == 'UNKNOWN', rp
+    assert 'value' not in rp, "a failed read published a number"
+    assert 'state_path' in rp['because']
+    for k in ('crowns', 'weights'):
+        assert doc['trail'][k]['state'] == 'UNKNOWN', doc['trail'][k]
+
+
 # COLLECTED AFTER EVERY TEST IS DEFINED. This used to sit above the last few tests, which
 # meant a test appended to the end of the file was silently never run — it does not fail,
 # it does not appear, and the count just does not go up. Keep this immediately above main().
