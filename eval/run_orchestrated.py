@@ -64,6 +64,9 @@ class Config:
     # Whether to write the weight vector on chain. Separate from `live` on purpose: a shakedown
     # wants a real anchored trail without moving anyone's emission.
     set_weights: bool = True
+    # (cloud/region) pairs whose IMAGE cannot run a round — e.g. no CUDA toolkit, so llama.cpp
+    # falls back to the CPU wheel and every submission scores ~6x slower on a GPU we are paying for.
+    exclude_regions: tuple = ()
     n_items: int = 72
     pool_size: int = 900
     commit_window: int = 100
@@ -90,6 +93,8 @@ class Config:
             tiers=tuple(x.strip() for x in e("RALPH_TIERS", "").split(",") if x.strip())
                   or cls.tiers,
             set_weights=e("RALPH_SET_WEIGHTS", "1") != "0",
+            exclude_regions=tuple(x.strip() for x in e("RALPH_GPU_EXCLUDE", "").split(",")
+                                  if x.strip()),
             gpu_type=e("RALPH_GPU_TYPE", "H100"), require_gpu=e("RALPH_REQUIRE_GPU", ""),
             max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
 
@@ -271,7 +276,8 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     plan.kings = {t: vars(r) for t, r in kings.items()}
 
     spec = GpuSpec(gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,
-                   max_price_per_hour=cfg.max_price_per_hour)
+                   max_price_per_hour=cfg.max_price_per_hour,
+                   exclude_regions=cfg.exclude_regions)
     res = run_remote_round(plan, provider or ShadeformProvider(), spec,
                            os.path.join(cfg.work_dir, f"round-{idx_round}"), out=out)
     rec, summary = res["record"], res["summary"]

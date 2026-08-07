@@ -48,6 +48,7 @@ def score(job: dict, out_dir: str) -> dict:
     # This is also the only place that can tell the difference cheaply. Downstream, CPU inference
     # looks BETTER than GPU: it is perfectly deterministic, so the identity canary passes.
     _assert_gpu()
+    _assert_student_gpu()
 
     spec = PARENTS[job["parent_key"]]
 
@@ -190,6 +191,44 @@ def _assert_gpu() -> None:
         f"The usual cause is a torch built for a newer CUDA than this host's driver supports — "
         f"scoring would silently fall back to CPU, which is ~10x slower AND perfectly "
         f"deterministic, so the identity canary would pass and the round would look fine.")
+
+
+def _assert_student_gpu() -> None:
+    """On a GPU box, students must run ON the GPU. Refuse early rather than pay for both.
+
+    `_assert_gpu` closed this hole for torch — the parent and observer — and left it open for the
+    students, which are the expensive half. llama.cpp's pip wheel is built CPU-only and then
+    ACCEPTS AND SILENTLY IGNORES `n_gpu_layers`, so an image without `nvcc` yields a round that
+    rents an H100, runs every submission on CPU at roughly 6x the time, and says so in one log line
+    nobody is watching. Observed on massedcompute/desmoines, 2026-08-07.
+
+    It is not a correctness failure — CPU llama.cpp is deterministic and the incumbent is re-scored
+    on the same box, so the paired comparison still holds. It is a MONEY failure, and the cheapest
+    place to catch it is before the first token."""
+    import os
+
+    try:
+        import torch
+        on_gpu = torch.cuda.is_available()
+    except Exception:
+        on_gpu = False
+    if not on_gpu or os.environ.get("RALPH_ALLOW_CPU_STUDENTS") == "1":
+        return
+
+    from .progress import tick
+    from .runners import GGUFStudentRunner
+
+    backend = GGUFStudentRunner.backend()
+    if backend == "cuda":
+        tick("student backend", "cuda", force=True)
+        return
+    raise SystemExit(
+        f"refusing to score: this box has a GPU but llama.cpp reports backend {backend!r}, so "
+        f"every submission would run on CPU while the GPU bills. The usual cause is an image with "
+        f"no `nvcc`, which makes the source build fall back to the CPU-only wheel — and that wheel "
+        f"accepts `n_gpu_layers` and ignores it, so nothing else would have told you. Rent an "
+        f"image with the CUDA toolkit, or set RALPH_ALLOW_CPU_STUDENTS=1 to accept ~6x the time "
+        f"and cost deliberately.")
 
 
 def _gpu_name() -> str:

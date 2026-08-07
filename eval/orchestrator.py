@@ -143,6 +143,13 @@ class GpuSpec:
     gpu_type: str = "H100"
     require_gpu: str = "NVIDIA H100 PCIe"
     cloud: str = ""                  # "" = any, but see require_gpu — the NAME is what binds
+    # (cloud, region) pairs to skip PERMANENTLY, from RALPH_GPU_EXCLUDE="cloud/region,...".
+    # `rent`'s own `exclude` only lives for one round's retries, so an image that cannot build a
+    # CUDA llama.cpp — massedcompute/desmoines-usa-1, 2026-08-07 — is the cheapest candidate again
+    # on the next start, and the subnet wedges on it. This is about the IMAGE, never the GPU: the
+    # device name still binds through `require_gpu`, and a different region is not a different
+    # measurement.
+    exclude_regions: tuple = ()
     # THE HARD CEILING ON A RENTAL, and it must stay under whatever supervises this process
     # (currently systemd's TimeoutStartSec=10800). Whoever's deadline fires first decides whether
     # the instance gets destroyed or leaked, so it has to be ours.
@@ -266,12 +273,15 @@ class ShadeformProvider(Provider):
         # scaleway/warsaw sat in `pending_provider` for the full 900 s and charged $0.84 for a box
         # that never booted. Without `exclude` the retry picks the identical cheapest candidate and
         # the subnet is wedged on one bad datacentre for as long as it stays broken.
+        banned = set(exclude) | {tuple(x.split("/", 1)) for x in spec.exclude_regions
+                                 if "/" in x}
         cands = [(t, a["region"]) for t in types for a in t.get("availability", [])
-                 if a.get("available") and (t.get("cloud"), a.get("region")) not in exclude]
+                 if a.get("available") and (t.get("cloud"), a.get("region")) not in banned]
         if not cands:
             raise RuntimeError(
-                f"every available {spec.gpu_type} (cloud, region) has already failed this round: "
-                f"{sorted(exclude)}. Still not substituting a different GPU model.")
+                f"every available {spec.gpu_type} (cloud, region) is excluded: failed this "
+                f"round {sorted(exclude)}, permanently excluded {sorted(spec.exclude_regions)}. "
+                f"Still not substituting a different GPU model.")
         best, region = cands[0]
         rate = best.get("hourly_price", 0) / 100.0
         body = {"cloud": best["cloud"], "region": region,
@@ -1120,7 +1130,12 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     # compile is strictly worse than scoring slowly — and `student_backend` records which one
     # actually ran, so a record never claims a speed it did not have.
     cuda_build = (
-        "(sudo -n apt-get install -y -q cuda-toolkit >/dev/null 2>&1 || true); "
+        # APT LISTS ARE STALE ON A FRESH IMAGE, so the install used to fail silently and leave us
+        # on the CPU wheel. Update first, and try both package names — `cuda-toolkit` exists only
+        # where NVIDIA's repo is configured; `nvidia-cuda-toolkit` is the distro one.
+        "(sudo -n apt-get update -q >/dev/null 2>&1 || true); "
+        "(sudo -n apt-get install -y -q cuda-toolkit >/dev/null 2>&1 "
+        "|| sudo -n apt-get install -y -q nvidia-cuda-toolkit >/dev/null 2>&1 || true); "
         "NVCC=$(command -v nvcc || ls -1 /usr/local/cuda*/bin/nvcc 2>/dev/null | head -1); "
         "if [ -n \"$NVCC\" ]; then "
         "export CUDACXX=$NVCC; export PATH=$(dirname $NVCC):$PATH; "
@@ -1129,11 +1144,28 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
         "|| .venv/bin/pip install --no-cache-dir llama-cpp-python; "
         "else echo 'no nvcc on this image - CPU wheel, scoring will be slower'; "
         ".venv/bin/pip install --no-cache-dir llama-cpp-python; fi && ")
+
+    # AND THEN CHECK WHAT WE ACTUALLY BUILT. The CPU wheel accepts `n_gpu_layers` and silently
+    # ignores it, so a failed CUDA build produces a round that rents an H100, scores every
+    # submission on CPU at ~6x the time, and announces it in one log line nobody is watching.
+    # Observed on massedcompute/desmoines, 2026-08-07: the build fell back and the wheel came out
+    # 20 MB instead of 283 MB. Catching it HERE costs five minutes; catching it in `score_job`
+    # costs the parent and observer downloads first, and not catching it costs about $12.
+    # `llama_supports_gpu_offload` is llama.cpp's own capability flag — the only honest source.
+    gpu_students = os.environ.get("RALPH_ALLOW_CPU_STUDENTS") != "1"
+    verify_cmd = (
+        ".venv/bin/python -c \"from llama_cpp import llama_cpp as c; import sys; "
+        "sys.exit(0 if c.llama_supports_gpu_offload() else 9)\" "
+        "|| { echo 'FATAL: llama.cpp has no GPU offload - the CUDA build fell back to the CPU "
+        "wheel, which accepts n_gpu_layers and ignores it. Every submission would run on CPU "
+        "while the GPU bills. Rent an image with the CUDA toolkit, or set "
+        "RALPH_ALLOW_CPU_STUDENTS=1 to accept ~6x time and cost.'; exit 9; } && "
+    ) if gpu_students else ""
     _ssh_stream(inst, spec, f"cd {remote_dir} && {_VENV_CMD}"
                             f"{torch_cmd}"
                             f".venv/bin/pip install transformers safetensors datasets "
                             f"huggingface_hub pynacl accelerate && "
-                            f"{cuda_build} true",
+                            f"{cuda_build}{verify_cmd} true",
                 w, what="the remote install", silence_s=INSTALL_SILENCE_S,
                 hard_s=INSTALL_HARD_S, prefix="    · ")
 

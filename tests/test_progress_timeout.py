@@ -234,6 +234,73 @@ def test_a_venv_without_pip_fails_immediately_and_says_why():
     assert r.returncode == 0, f"generated install shell does not parse: {r.stderr}"
 
 
+def test_a_cpu_llama_build_is_refused_before_it_can_bill():
+    """The CPU wheel accepts `n_gpu_layers` and IGNORES it, so a failed CUDA build yields a round
+    that rents an H100, scores every submission on CPU at ~6x, and says so in one log line nobody
+    reads. Observed on massedcompute/desmoines: the wheel came out 20 MB instead of 283 MB.
+
+    Catching it at install costs five minutes. Catching it in score_job costs the parent and
+    observer downloads first. Not catching it cost $12 of a round that had to be killed."""
+    import inspect
+    import os
+    import re
+
+    from eval import orchestrator as O
+
+    src = inspect.getsource(O)
+    assert "llama_supports_gpu_offload" in src, \
+        "nothing verifies the wheel that was actually built"
+    assert "RALPH_ALLOW_CPU_STUDENTS" in src, "no deliberate escape hatch"
+    # the check must be chained with && so a failure short-circuits the round
+    m = re.search(r"verify_cmd = \(\n(.*?)\n    \) if gpu_students else \"\"", src, re.S)
+    assert m, "verify_cmd not found in the shape the install builds"
+    assert "exit 9" in m.group(1), "a CPU-only build must stop the install, not warn"
+
+
+def test_a_region_whose_image_cannot_build_is_not_rented_again():
+    """`rent`'s own `exclude` lives for one round's retries, so the cheapest broken candidate is
+    picked again on the very next start and the subnet wedges on one bad image. This is about the
+    IMAGE, never the GPU — `require_gpu` still binds the device name, and a different region is
+    not a different measurement."""
+    import os
+
+    from eval.orchestrator import GpuSpec
+    from eval.run_orchestrated import Config
+
+    assert GpuSpec().exclude_regions == ()
+    old = os.environ.get("RALPH_GPU_EXCLUDE")
+    try:
+        os.environ["RALPH_GPU_EXCLUDE"] = "massedcompute/desmoines-usa-1, foo/bar"
+        cfg = Config.from_env()
+        assert cfg.exclude_regions == ("massedcompute/desmoines-usa-1", "foo/bar"), \
+            cfg.exclude_regions
+    finally:
+        if old is None:
+            os.environ.pop("RALPH_GPU_EXCLUDE", None)
+        else:
+            os.environ["RALPH_GPU_EXCLUDE"] = old
+
+    # and rent() must actually filter on it
+    class _P(__import__("eval.orchestrator", fromlist=["x"]).ShadeformProvider):
+        def __init__(self):
+            self.ssh_key_id = ""
+
+        def _key(self):
+            return "k"
+
+        def _api(self, method, path, body=None):
+            return {"instance_types": [
+                {"cloud": "massedcompute", "shade_instance_type": "H100", "hourly_price": 199,
+                 "availability": [{"region": "desmoines-usa-1", "available": True}]}]}
+
+    spec = GpuSpec(exclude_regions=("massedcompute/desmoines-usa-1",))
+    try:
+        _P().rent(spec, "ralph-round-9-1")
+        raise AssertionError("rented an excluded region")
+    except RuntimeError as e:
+        assert "excluded" in str(e), e
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
