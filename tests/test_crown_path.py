@@ -4534,6 +4534,34 @@ def test_a_reveal_is_read_under_either_spelling_the_tool_showed():
             "cmd_reveal prints a shape it does not write — the exact trap that cost a miner a round"
 
 
+def test_anchoring_and_paying_are_separate_decisions():
+    """`--live` used to mean both, so the only way to publish a verifiable anchored round during a
+    shakedown was to also move real emission. Round 1 wrote no weights purely because the 100-block
+    rate limit refused it — luck, not a control. The trail is the product; the payout is not."""
+    import os
+    from eval.run_orchestrated import Config
+
+    old = os.environ.get("RALPH_SET_WEIGHTS")
+    try:
+        assert Config().set_weights is True, "the default must still pay"
+        os.environ["RALPH_SET_WEIGHTS"] = "0"
+        cfg = Config.from_env()
+        assert cfg.set_weights is False
+        # withholding the payout must NOT turn off the anchor: `live` is untouched
+        os.environ["RALPH_SET_WEIGHTS"] = "1"
+        assert Config.from_env().set_weights is True
+    finally:
+        if old is None:
+            os.environ.pop("RALPH_SET_WEIGHTS", None)
+        else:
+            os.environ["RALPH_SET_WEIGHTS"] = old
+
+    # and the two are genuinely independent fields, not one derived from the other
+    import dataclasses
+    names = {f.name for f in dataclasses.fields(Config)}
+    assert {"live", "set_weights"} <= names, names
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,

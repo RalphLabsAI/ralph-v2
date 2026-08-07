@@ -61,6 +61,9 @@ class Config:
     # "not being scored this round" — the spec promised a lane that could not be won. A tier that
     # receives nothing is free: `consider()` returns action "none" and no crown is minted.
     tiers: tuple = ("binary", "ternary", "sub2", "sub4")
+    # Whether to write the weight vector on chain. Separate from `live` on purpose: a shakedown
+    # wants a real anchored trail without moving anyone's emission.
+    set_weights: bool = True
     n_items: int = 72
     pool_size: int = 900
     commit_window: int = 100
@@ -86,6 +89,7 @@ class Config:
             # a redeploy while every other setting was a config flip
             tiers=tuple(x.strip() for x in e("RALPH_TIERS", "").split(",") if x.strip())
                   or cls.tiers,
+            set_weights=e("RALPH_SET_WEIGHTS", "1") != "0",
             gpu_type=e("RALPH_GPU_TYPE", "H100"), require_gpu=e("RALPH_REQUIRE_GPU", ""),
             max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
 
@@ -157,8 +161,10 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
         warn.append("RALPH_REQUIRE_GPU is unset — this round will accept whatever GPU it gets and "
                     "print the name to pin. Set it before the round that awards a real crown.")
     if cfg.live:
-        warn.append("LIVE: this round WILL commit an anchor and set weights with the validator "
-                    "hotkey. If another signer holds that key, expect nonce collisions.")
+        warn.append("LIVE: this round WILL commit an anchor with the validator hotkey"
+                    + (" and SET WEIGHTS" if cfg.set_weights else
+                       "; weights are WITHHELD (RALPH_SET_WEIGHTS=0)")
+                    + ". If another signer holds that key, expect nonce collisions.")
     # NOTHING WATCHES THE WATCHER, and `systemctl is-enabled` would be the pgrep mistake one level
     # up — it proves the unit EXISTS. This reads the heartbeat the watchdog writes on every pass,
     # including passes that errored, because a watchdog blind since a key rotation looks perfect to
@@ -287,8 +293,17 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
         # FAIL CLOSED. The previous crown keeps earning; an unauditable new one does not take over.
         w("  WITHHELD — publishing did not verify, so no weights were set\n")
         return 1
-    ok = chain.set_weights(rec.weights)
-    w(f"  weights   : {rec.weights} -> set={ok} (live={cfg.live})\n")
+    # ANCHORING AND PAYING ARE SEPARATE DECISIONS. `--live` used to mean both, so the only way to
+    # publish a verifiable, anchored round during a shakedown was to also move real emission. The
+    # trail is the product; the weight vector is the payout. Round 1 wrote no weights only because
+    # the 100-block rate limit happened to refuse it, which is luck, not a control.
+    if not cfg.set_weights:
+        w(f"  weights   : {rec.weights}\n"
+          f"  weights   : NOT SET — RALPH_SET_WEIGHTS=0. The round is scored, signed, published "
+          f"and anchored; only the payout is withheld.\n")
+    else:
+        ok = chain.set_weights(rec.weights)
+        w(f"  weights   : {rec.weights} -> set={ok} (live={cfg.live})\n")
     w(f"  cost      : ~${res['cost']:.2f}\n")
     return 0
 
