@@ -357,6 +357,56 @@ def test_a_region_whose_image_cannot_build_is_not_rented_again():
         assert "excluded" in str(e), e
 
 
+def test_the_supervisor_deadline_must_be_outside_our_own():
+    """THE LADDER'S OUTERMOST RING LIVES IN A UNIT FILE, so the ladder test — which asserts the
+    rings this code owns — could not see it. On 2026-08-07 `kill_at` was raised 4.5 h -> 8 h and
+    `TimeoutStartSec` was left at 6 h, leaving it INVERTED: systemd would have SIGTERMed a healthy
+    6.5 h round 30 minutes from the end. Whoever kills the process decides whether the rental dies
+    or leaks, which is the shape of the 226-minute hang."""
+    from eval.orchestrator import GpuSpec
+    from eval.run_orchestrated import _supervisor_deadline_problems
+
+    spec = GpuSpec()
+    outer_h = spec.max_hours + spec.provider_deadline_slack_h
+
+    class _Run:
+        def __init__(self, value):
+            self.stdout, self.returncode = value, 0
+
+    import subprocess
+    real = subprocess.run
+    try:
+        # inside our deadlines -> a finding, naming both numbers
+        subprocess.run = lambda *a, **k: _Run("6h")
+        bad = _supervisor_deadline_problems(spec)
+        assert bad and "INSIDE" in bad[0], bad
+        assert "6h" in bad[0] and f"{outer_h:.2f}" in bad[0], bad[0]
+
+        # comfortably outside -> silent
+        subprocess.run = lambda *a, **k: _Run("10h")
+        assert _supervisor_deadline_problems(spec) == []
+
+        # compound and bare-seconds forms both parse
+        subprocess.run = lambda *a, **k: _Run("1h 30min")
+        assert _supervisor_deadline_problems(spec), "1h30 is inside an 8.5h ring"
+        subprocess.run = lambda *a, **k: _Run("36000s")
+        assert _supervisor_deadline_problems(spec) == []
+
+        # no supervisor at all says NOTHING: an unsupervised round has no outer ring to invert
+        subprocess.run = lambda *a, **k: _Run("infinity")
+        assert _supervisor_deadline_problems(spec) == []
+        subprocess.run = lambda *a, **k: _Run("")
+        assert _supervisor_deadline_problems(spec) == []
+
+        def _boom(*a, **k):
+            raise OSError("no systemctl here")
+
+        subprocess.run = _boom
+        assert _supervisor_deadline_problems(spec) == [], "a missing systemctl must not block a round"
+    finally:
+        subprocess.run = real
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

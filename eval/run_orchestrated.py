@@ -99,6 +99,41 @@ class Config:
             max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
 
 
+def _supervisor_deadline_problems(spec) -> list:
+    """Is this process's own supervisor deadline OUTSIDE every deadline the round enforces?
+
+    Reads the running unit rather than a file path, because the drop-in that actually applies is
+    whichever systemd merged last. Absent systemd (a hand-started round, a container, a test) this
+    says nothing: an unsupervised round has no outer ring to invert."""
+    import subprocess
+
+    unit = os.environ.get("RALPH_VALIDATOR_UNIT", "ralph-validator.service")
+    try:
+        r = subprocess.run(["systemctl", "show", unit, "-p", "TimeoutStartUSec", "--value"],
+                           capture_output=True, text=True, timeout=15)
+        raw = (r.stdout or "").strip()
+    except Exception:
+        return []
+    if not raw or raw in ("infinity", "0"):
+        return []
+    # systemd prints things like "10h", "6h", "1h 30min", "21600s"
+    units = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, "h": 3600.0, "d": 86400.0}
+    import re
+    secs = 0.0
+    for n, u in re.findall(r"(\d+(?:\.\d+)?)\s*(us|ms|min|[smhd])", raw):
+        secs += float(n) * units.get(u, 0.0)
+    if secs <= 0:
+        return []
+    outer = (spec.max_hours + spec.provider_deadline_slack_h) * 3600.0
+    if secs <= outer:
+        return [f"{unit} has TimeoutStartSec={raw} ({secs / 3600:.2f} h), which is INSIDE this "
+                f"round's own deadlines (kill_at {spec.max_hours:.2f} h, provider auto_delete "
+                f"{outer / 3600:.2f} h). systemd would SIGTERM a healthy round before it finished, "
+                f"and whoever kills the process decides whether the rental dies or leaks. Raise it "
+                f"above {outer / 3600:.2f} h in a drop-in and `systemctl daemon-reload`."]
+    return []
+
+
 def preflight(cfg: Config, out=sys.stdout) -> list:
     """Everything checkable before a cent is spent. NOTE WHAT IS ABSENT: no torch check.
 
@@ -111,6 +146,16 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
     if not os.environ.get("RALPH_RECORD_SEED"):
         bad.append("RALPH_RECORD_SEED unset: records would be unsigned and publish_and_gate "
                    "withholds every unsigned round, so the whole rental would be thrown away")
+    # WHOEVER KILLS THE PROCESS DECIDES WHETHER THE RENTAL DIES OR LEAKS. Every deadline the round
+    # enforces itself is useless if the SUPERVISOR's fires first: systemd SIGTERMs, and only the
+    # teardown handler stands between that and an abandoned H100. This was live on 2026-08-07 —
+    # `kill_at` was raised 4.5 h -> 8 h and the unit's `TimeoutStartSec` was left at 6 h, so a
+    # healthy 6.5 h round would have been killed 30 minutes from the end. Nothing caught it because
+    # the ladder test asserts the rings this code owns, and the outermost ring lives in a unit file.
+    bad.extend(_supervisor_deadline_problems(GpuSpec(
+        gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,
+        max_price_per_hour=cfg.max_price_per_hour)))
+
     from .parent import PARENTS
     if cfg.parent_key not in PARENTS:
         bad.append(f"unknown parent {cfg.parent_key!r}")
