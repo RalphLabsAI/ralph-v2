@@ -207,6 +207,33 @@ def test_the_ceiling_is_the_rentals_not_the_steps():
     assert time.monotonic() - t0 < 30, "the step used its own budget, not the rental's"
 
 
+def test_a_venv_without_pip_fails_immediately_and_says_why():
+    """`python3 -m venv .venv 2>/dev/null;` — error hidden, `;` carrying on regardless. On an image
+    with no ensurepip (massedcompute/desmoines, 2026-08-07) venv "succeeded", produced no pip, and
+    the round died three commands later as a bare `127` with the real message discarded. Provider
+    images vary and we do not pick them, so the install must repair what it can and fail LOUDLY at
+    four minutes rather than silently at forty."""
+    import subprocess
+    import tempfile
+
+    from eval.orchestrator import _VENV_CMD
+
+    # the suppression that hid it must not come back
+    assert "venv .venv 2>/dev/null" not in _VENV_CMD,         "the venv error is being discarded again — that is the whole bug"
+    # it must be able to REPAIR the common case...
+    assert "python3-venv" in _VENV_CMD and "get-pip" in _VENV_CMD
+    # ...and REFUSE rather than continue when it cannot
+    assert "exit 3" in _VENV_CMD, "a venv with no pip must stop the round, not carry on"
+    assert _VENV_CMD.rstrip().endswith("&&"),         "the install must chain on success, so a failure short-circuits the rest"
+
+    # and it has to be valid shell — this string is only ever executed on a box that bills
+    with tempfile.NamedTemporaryFile("w", suffix=".sh") as fh:
+        fh.write("set -e\n" + _VENV_CMD + " true\n")
+        fh.flush()
+        r = subprocess.run(["bash", "-n", fh.name], capture_output=True, text=True)
+    assert r.returncode == 0, f"generated install shell does not parse: {r.stderr}"
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

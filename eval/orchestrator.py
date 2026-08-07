@@ -1007,6 +1007,32 @@ def _capture_diagnostics(inst: Instance, spec: GpuSpec, w) -> None:
     _flush(w)
 
 
+# A VENV WITHOUT PIP IS NOT A VENV. This was `python3 -m venv .venv 2>/dev/null;` — the error
+# hidden and the `;` carrying on regardless — so on an image with no `ensurepip`
+# (massedcompute/desmoines, 2026-08-07) venv "succeeded", produced no pip, and the round died
+# three commands later as a bare `127` with the real message discarded. Provider images vary
+# and we do not choose them, so the install has to repair what it can and fail LOUDLY and
+# IMMEDIATELY on what it cannot, while the meter is at four minutes rather than forty.
+_VENV_CMD = (
+    "python3 -m venv .venv 2>&1 || true; "
+    "if [ ! -x .venv/bin/pip ]; then "
+    "echo 'venv has no pip (image lacks ensurepip) - installing python3-venv'; "
+    "PYV=$(python3 -c 'import sys;print(\"%d.%d\"%sys.version_info[:2])'); "
+    "(sudo -n apt-get update -q >/dev/null 2>&1 || true); "
+    "(sudo -n apt-get install -y -q python3-venv \"python$PYV-venv\" >/dev/null 2>&1 || true); "
+    "rm -rf .venv; python3 -m venv .venv 2>&1 || true; fi; "
+    # last resort: a venv with no pip, then bootstrap pip into it
+    "if [ ! -x .venv/bin/pip ]; then "
+    "echo 'still no pip - bootstrapping with get-pip'; "
+    "rm -rf .venv; python3 -m venv --without-pip .venv 2>&1 || true; "
+    "(curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py "
+    "&& .venv/bin/python /tmp/get-pip.py >/dev/null 2>&1) || true; fi; "
+    "if [ ! -x .venv/bin/pip ]; then "
+    "echo 'FATAL: no usable python venv on this image - cannot install anything'; "
+    "exit 3; fi; "
+    ".venv/bin/python -V && ")
+
+
 def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, w) -> dict:
     """Push the repo, install, score, pull the artifacts back. Replaceable for tests."""
     # NAMED SUB-STEPS, because "pushing repo…" covered three calls with a combined structural
@@ -1103,7 +1129,7 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
         "|| .venv/bin/pip install --no-cache-dir llama-cpp-python; "
         "else echo 'no nvcc on this image - CPU wheel, scoring will be slower'; "
         ".venv/bin/pip install --no-cache-dir llama-cpp-python; fi && ")
-    _ssh_stream(inst, spec, f"cd {remote_dir} && python3 -m venv .venv 2>/dev/null; "
+    _ssh_stream(inst, spec, f"cd {remote_dir} && {_VENV_CMD}"
                             f"{torch_cmd}"
                             f".venv/bin/pip install transformers safetensors datasets "
                             f"huggingface_hub pynacl accelerate && "
