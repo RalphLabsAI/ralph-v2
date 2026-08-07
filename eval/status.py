@@ -172,13 +172,33 @@ def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err)
         return _trail_unknown(trail_err, "the crowns")
     if rounds_published == 0 or not rec:
         return unmeasured("no round has completed, so no tier has a crown")
+    # A HOLD IS A REIGN, NOT AN ABSENCE. Round 2 held both tiers, so it contains `hold` events and
+    # no `crown` events — and this said "published but crowned no tier", which to a miner reads as
+    # an empty throne. The same shape as the audit bug that rejected that round: a crown minted in
+    # an earlier round is still a crown. `hold` names the tier and the model; the miner and the
+    # retention come from the re-scored incumbent submission, never from the event, for the same
+    # anti-circularity reason the audit gives.
+    by_model = {}
+    for sub in (rec.get("submissions") or []):
+        by_model.setdefault(str(sub.get("model_id")), sub)
+
     crowns = {}
     for e in (rec.get("events") or []):
-        if str(e.get("action")) == "crown" and e.get("tier"):
-            crowns[str(e["tier"])] = {"miner": e.get("miner"), "model_id": e.get("king"),
-                                      "retention": e.get("retention")}
+        action, tier = str(e.get("action")), e.get("tier")
+        if not tier or action not in ("crown", "dethrone", "hold"):
+            continue
+        mid = str(e.get("king") or "")
+        if not mid:
+            continue
+        sub = by_model.get(mid) or {}
+        crowns[str(tier)] = {
+            "miner": sub.get("miner") or e.get("miner"),
+            "model_id": mid,
+            "retention": sub.get("retention", e.get("retention")),
+            "held": action == "hold",
+        }
     if not crowns:
-        return unmeasured(f"round {rec_round} published but crowned no tier")
+        return unmeasured(f"round {rec_round} published but no tier has a crown")
     return m(crowns, round=rec_round, record_uri=rec_uri or None)
 
 

@@ -337,6 +337,29 @@ def test_a_published_record_becomes_the_score_a_miner_reads():
     assert doc['trail']['weights']['state'] == 'MEASURED'
 
 
+def test_a_held_throne_is_a_crown_not_an_empty_tier():
+    """Round 2 held both tiers, so it carries `hold` events and no `crown` events, and this said
+    "published but crowned no tier" — which to a miner reads as an empty throne. A crown minted in
+    an earlier round is still a crown; a hold is a reign, not an absence. Same shape as the audit
+    bug that rejected that round outright."""
+    rec = _rec(round=2,
+               events=[{"action": "hold", "tier": "ternary", "king": "KT", "margin_lcb": 0.0},
+                       {"action": "none", "tier": "binary", "king": None}],
+               submissions=[{"miner": "5KING", "tier": "ternary", "model_id": "KT",
+                             "retention": 0.2406, "retention_lb": 0.2406, "gates_ok": True,
+                             "reasons": [], "role": "incumbent"}])
+    doc = _build(trail_index={"rounds": [{"round": 2}]}, latest_record=rec, commitments=[])
+    cr = doc['trail']['crowns']
+    assert cr['state'] == 'MEASURED', cr
+    assert 'ternary' in cr['value'], cr['value']
+    got = cr['value']['ternary']
+    # the miner and the number come from the SUBMISSION, not from the event
+    assert got['miner'] == '5KING' and got['retention'] == 0.2406, got
+    assert got['held'] is True, "a defended crown must be distinguishable from a fresh one"
+    # a tier nobody has ever won stays absent rather than rendering as a blank throne
+    assert 'binary' not in cr['value'], cr['value']
+
+
 def test_a_rejected_miner_reads_the_reason_from_the_signed_record():
     """Round 1 dropped two miners: one never revealed, one shipped a GGUF llama.cpp cannot open.
     Both reasons existed only in a summary file on the orchestrator — a box the miner cannot see —
