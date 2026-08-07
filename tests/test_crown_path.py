@@ -4373,6 +4373,39 @@ def test_a_sparse_field_cannot_move_an_already_published_digest():
     assert back.sha256() == full.sha256()
 
 
+def test_every_configured_tier_is_a_tier_that_can_actually_be_scored():
+    """A tier named in the config but absent from bitrate.TIERS is a lane miners can submit to and
+    never win: intake looks the budget up by name, misses, and rejects the submission after they
+    did the whole compression job. The config and the budget table must not drift.
+
+    And the reverse: the public README advertises all four tiers and miners clone it, so a tier
+    that exists in the budget table but is not scored is the same broken promise from the other
+    side. Round 1 ran two of four."""
+    from eval.bitrate import TIERS
+    from eval.run_orchestrated import Config
+
+    known = {t.name for t in TIERS}
+    cfg = Config()
+    assert set(cfg.tiers) <= known, f"config names a tier with no bit budget: {set(cfg.tiers) - known}"
+    assert set(cfg.tiers) == known, (
+        f"the README advertises {sorted(known)} but the round scores {sorted(cfg.tiers)} — "
+        f"a miner can submit to a lane that cannot be won")
+
+    # and the field is env-overridable like every other setting
+    import os
+    old = os.environ.get("RALPH_TIERS")
+    try:
+        os.environ["RALPH_TIERS"] = "ternary, sub4"
+        assert Config.from_env().tiers == ("ternary", "sub4")
+        os.environ["RALPH_TIERS"] = ""
+        assert set(Config.from_env().tiers) == known, "an empty override must fall back to default"
+    finally:
+        if old is None:
+            os.environ.pop("RALPH_TIERS", None)
+        else:
+            os.environ["RALPH_TIERS"] = old
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,

@@ -56,7 +56,11 @@ class Config:
                         "microsoft/Phi-3-mini-4k-instruct",
                         "allenai/OLMo-2-1124-7B-Instruct")
     records_repo: str = "RalphLabsAI/ralph-v2-rounds"
-    tiers: tuple = ("ternary", "sub4")
+    # ALL FOUR, because the public README advertises all four and miners clone it. Running two
+    # meant a `binary` submission did the whole compression job and was rejected at intake with
+    # "not being scored this round" — the spec promised a lane that could not be won. A tier that
+    # receives nothing is free: `consider()` returns action "none" and no crown is minted.
+    tiers: tuple = ("binary", "ternary", "sub2", "sub4")
     n_items: int = 72
     pool_size: int = 900
     commit_window: int = 100
@@ -78,6 +82,10 @@ class Config:
             work_dir=e("RALPH_WORK_DIR", "/workspace/ralph-v2-work"),
             observers=tuple(x.strip() for x in e("RALPH_OBSERVERS", "").split(",") if x.strip())
                       or cls.observers,
+            # the ONE field that was not env-readable, so opening a tier needed a code change and
+            # a redeploy while every other setting was a config flip
+            tiers=tuple(x.strip() for x in e("RALPH_TIERS", "").split(",") if x.strip())
+                  or cls.tiers,
             gpu_type=e("RALPH_GPU_TYPE", "H100"), require_gpu=e("RALPH_REQUIRE_GPU", ""),
             max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
 
