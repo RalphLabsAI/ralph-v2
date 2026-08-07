@@ -1195,13 +1195,17 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
     # costs the parent and observer downloads first, and not catching it costs about $12.
     # `llama_supports_gpu_offload` is llama.cpp's own capability flag — the only honest source.
     gpu_students = os.environ.get("RALPH_ALLOW_CPU_STUDENTS") != "1"
+    # THE PROBE LIVES IN THE REPO, NOT IN THIS STRING. The first version asked
+    # `llama_supports_gpu_offload` inline; that symbol is gone from recent bindings, the call
+    # raised, the shell's `||` read the non-zero exit as "no GPU", and a correctly built 283 MB
+    # CUDA wheel was refused. `eval/gpu_check` asks in two independent ways, is unit-testable, and
+    # is the SAME code the runner uses to report the backend into the record. The repo is already
+    # on the box: it is rsync'd before this leg runs.
     verify_cmd = (
-        ".venv/bin/python -c \"from llama_cpp import llama_cpp as c; import sys; "
-        "sys.exit(0 if c.llama_supports_gpu_offload() else 9)\" "
-        "|| { echo 'FATAL: llama.cpp has no GPU offload - the CUDA build fell back to the CPU "
-        "wheel, which accepts n_gpu_layers and ignores it. Every submission would run on CPU "
-        "while the GPU bills. Rent an image with the CUDA toolkit, or set "
-        "RALPH_ALLOW_CPU_STUDENTS=1 to accept ~6x time and cost.'; exit 9; } && "
+        ".venv/bin/python -m eval.gpu_check "
+        "|| { echo 'FATAL: llama.cpp has no CUDA backend - the build fell back to the CPU wheel, "
+        "which accepts n_gpu_layers and ignores it. Every submission would run on CPU while the "
+        "GPU bills. Set RALPH_ALLOW_CPU_STUDENTS=1 to accept ~6x time and cost.'; exit 9; } && "
     ) if gpu_students else ""
     # PYPI IS A DEPENDENCY OF EVERY ROUND, and it times out. `files.pythonhosted.org` dropped a
     # read mid-torch on 2026-08-07 and the install had no retry policy at all — pip's defaults are

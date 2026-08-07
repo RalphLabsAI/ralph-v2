@@ -476,12 +476,13 @@ class GGUFStudentRunner:
         And it cannot be inferred from configuration. The pip wheel is built CPU-only, in which
         case `n_gpu_layers` is ACCEPTED AND SILENTLY IGNORED — a parameter that lies. The only
         honest source is llama.cpp's own capability flag."""
-        try:
-            from llama_cpp import llama_cpp as _c
-            fn = getattr(_c, "llama_supports_gpu_offload", None)
-            return "cuda" if (fn and fn()) else "cpu"
-        except Exception:
-            return "unknown"
+        # ONE PROBE, SHARED WITH THE INSTALL GUARD. This used to ask only for
+        # `llama_supports_gpu_offload`, which recent bindings no longer export — so a genuine CUDA
+        # build reported "cpu" into the signed record, and the install guard built on the same
+        # question refused a working round outright.
+        from .gpu_check import probe
+        ok, _why = probe()
+        return "cuda" if ok else "cpu"
     # 8192, NOT 4096, AND THIS IS A FAIRNESS FIX. llama.cpp silently rewrites
     # `max_tokens = n_ctx - len(prompt_tokens)` rather than erroring, so at n_ctx=4096 a miner with
     # a 3,900-token prefix gets 196 step tokens where the parent got its full 256 — a

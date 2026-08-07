@@ -248,13 +248,69 @@ def test_a_cpu_llama_build_is_refused_before_it_can_bill():
     from eval import orchestrator as O
 
     src = inspect.getsource(O)
-    assert "llama_supports_gpu_offload" in src, \
-        "nothing verifies the wheel that was actually built"
+    assert "eval.gpu_check" in src, "nothing verifies the wheel that was actually built"
     assert "RALPH_ALLOW_CPU_STUDENTS" in src, "no deliberate escape hatch"
-    # the check must be chained with && so a failure short-circuits the round
     m = re.search(r"verify_cmd = \(\n(.*?)\n    \) if gpu_students else \"\"", src, re.S)
     assert m, "verify_cmd not found in the shape the install builds"
     assert "exit 9" in m.group(1), "a CPU-only build must stop the install, not warn"
+
+
+def test_the_cuda_probe_does_not_fail_closed_on_a_missing_symbol():
+    """IT REFUSED A GOOD ROUND. The guard asked for `llama_supports_gpu_offload`; recent bindings
+    no longer export it, the call raised, the shell's `||` read the non-zero exit as "no GPU", and
+    a correctly built 283 MB CUDA wheel was rejected — $0.61 and an hour, and it would have blocked
+    every round after it.
+
+    An absent capability FUNCTION and an absent capability look identical through `getattr`, so one
+    probe returning false is not evidence. The two errors are asymmetric: believing a CPU build is
+    CUDA wastes a round's money; believing a CUDA build is CPU refuses a round that would have
+    worked — and that is the one that happened."""
+    import os
+    import sys
+    import tempfile
+    import types
+
+    from eval.gpu_check import probe
+
+    real = sys.modules.get("llama_cpp")
+    real_inner = sys.modules.get("llama_cpp.llama_cpp")
+    try:
+        # a binding with NO capability function, whose package ships a CUDA backend
+        with tempfile.TemporaryDirectory() as d:
+            os_path = os.path.join(d, "lib")
+            os.makedirs(os_path)
+            open(os.path.join(os_path, "libggml-cuda.so"), "w").close()
+            pkg = types.ModuleType("llama_cpp")
+            pkg.__file__ = os.path.join(d, "__init__.py")
+            inner = types.ModuleType("llama_cpp.llama_cpp")   # deliberately no symbol
+            sys.modules["llama_cpp"] = pkg
+            sys.modules["llama_cpp.llama_cpp"] = inner
+            ok, why = probe()
+            assert ok, f"a CUDA build was called CPU because one symbol was missing: {why}"
+            assert "cuda" in why.lower()
+
+        # and a genuine CPU wheel is still caught
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "lib"))
+            open(os.path.join(d, "lib", "libggml-cpu.so"), "w").close()
+            pkg = types.ModuleType("llama_cpp")
+            pkg.__file__ = os.path.join(d, "__init__.py")
+            inner = types.ModuleType("llama_cpp.llama_cpp")
+            inner.llama_supports_gpu_offload = lambda: False
+            sys.modules["llama_cpp"] = pkg
+            sys.modules["llama_cpp.llama_cpp"] = inner
+            ok, why = probe()
+            assert not ok, f"a CPU wheel passed as CUDA: {why}"
+    finally:
+        for k, v in (("llama_cpp", real), ("llama_cpp.llama_cpp", real_inner)):
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    # the probe must never raise, whatever it finds
+    ok, why = probe()
+    assert isinstance(ok, bool) and isinstance(why, str)
 
 
 def test_a_region_whose_image_cannot_build_is_not_rented_again():
