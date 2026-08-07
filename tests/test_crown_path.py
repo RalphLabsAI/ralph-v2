@@ -4562,6 +4562,47 @@ def test_anchoring_and_paying_are_separate_decisions():
     assert {"live", "set_weights"} <= names, names
 
 
+def test_a_hold_round_binds_its_inherited_kings():
+    """IT REFUSED A CORRECT ROUND AFTER 7 HOURS. `audit_emission` seeds `apply_events` from `{}`,
+    because one record is all an auditor has. A `hold` deliberately does not MINT a throne — it
+    maintains one established earlier — so a round where every tier held produced NO kings, the
+    weight vector named two kings "the record does not have", and round 2 was rejected at the
+    audit with the GPU already torn down.
+
+    A hold round is the STEADY STATE of a working subnet. It has to pass."""
+    from eval.rerun import FAIL, Audit, audit_emission
+    from eval.round_record import RoundRecord, SubmissionRecord
+
+    def run(r):
+        a = Audit()
+        audit_emission(r, a)
+        return [c for c in a.checks if c.status == FAIL]
+
+    def sub(mid, miner, tier, ret, role):
+        return SubmissionRecord(model_id=mid, miner=miner, tier=tier, retention=ret,
+                                retention_lb=ret, per_point=[], gates_ok=True, role=role)
+
+    # both tiers HELD: no crown events anywhere, kings carried in from an earlier round
+    rec = RoundRecord(
+        round=2, commit_root="c", round_nonce="n", teacher="t", judge="j", base="b", pile_id="p",
+        points=[], events=[{"tier": "ternary", "round": 2, "action": "hold", "king": "KT"},
+                           {"tier": "sub4", "round": 2, "action": "hold", "king": "KS"},
+                           {"tier": "binary", "round": 2, "action": "none", "king": None}],
+        submissions=[sub("KT", "hotT", "ternary", 0.31, "incumbent"),
+                     sub("KS", "hotS", "sub4", 0.45, "incumbent"),
+                     sub("CH", "hotC", "sub4", 0.30, "challenger")],
+        weights={"hotT": 0.5, "hotS": 0.5})
+
+    bad = run(rec)
+    assert not bad, [f"{c.name}: {c.detail}" for c in bad]
+
+    # ...and paying somebody who is NOT the held king still fails
+    rec.weights = {"hotC": 1.0}
+    bad2 = run(rec)
+    assert bad2, "a hold round paid a non-king and the audit allowed it"
+    assert any("kings" in c.name for c in bad2), [c.name for c in bad2]
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,

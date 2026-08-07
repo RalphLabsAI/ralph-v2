@@ -289,6 +289,21 @@ def audit_emission(rec, a: Audit) -> None:
     from .lineage import apply_events
     kings = {t: r.model_id for t, r in
              apply_events({}, rec.events, round_no=rec.round, submissions=rec.submissions).items()}
+    # A HOLD ROUND IS THE STEADY STATE OF A WORKING SUBNET, AND IT HAD NO KINGS HERE.
+    # `apply_events` is seeded from `{}` because one record is all an auditor has, and a `hold`
+    # deliberately does not MINT a throne — it maintains one established in an earlier round, which
+    # is right for `replay()` walking the whole chain and wrong here. Round 2 held both tiers, so
+    # this map came back empty, the weight vector named two kings the record "did not have", and a
+    # correct round was refused after 7 hours of scoring.
+    #
+    # A hold event names the tier and the model. That is enough to say WHICH throne is claimed;
+    # WHO gets paid still comes from the scored submission below, never from the event's own
+    # `miner` field, so the anti-circularity that makes this check worth running is untouched. A
+    # held king with no re-scored incumbent in the record falls through to the `unbound` SKIP,
+    # which already says the inheritance cannot be checked from one record alone.
+    for e in rec.events or []:
+        if e.get("action") == "hold" and e.get("tier") and e.get("king"):
+            kings.setdefault(e["tier"], e["king"])
 
     # 2. BIND MODEL -> MINER THROUGH THE SCORED SUBMISSIONS, not through the event's own `miner`
     #    field. The event is written by the operator next to the weights; using it to validate the
