@@ -482,6 +482,10 @@ class RoundPlan:
     n_items: int = 72
     pool_size: int = 900
     margin: float = 0.05
+    # Artifacts scored on this round's exam that cannot win anything: a stock quantisation of the
+    # parent, a competitor's published model. `[{"name", "tier", "artifact_uri"}, ...]`. They carry
+    # no hotkey and no commitment because they are not miners — see run_observer_round.
+    references: list = field(default_factory=list)
 
     def as_job(self) -> dict:
         d = {k: v for k, v in self.__dict__.items()}

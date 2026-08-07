@@ -4636,6 +4636,131 @@ def test_the_student_path_must_reproduce_or_the_round_aborts():
     assert _determinism_drift(MS(0.3, {"a": [0.1, 0.2]}), MS(0.3, {"a": [0.1]})) == float("inf")
 
 
+def test_a_reference_is_scored_and_can_never_win_anything():
+    """A retention of 0.30 means nothing without a fixed point. Nobody — including us — could say
+    whether the crowns beat what `llama-quantize` gives away for free, so every number went into
+    every conversation unanchored. A reference artifact answers that IN THE SIGNED RECORD.
+
+    But a reference is not a miner: no hotkey, no commit-reveal, no bond. So the safety property is
+    structural rather than a rule someone must remember — it never enters `by_tier`, the only list
+    `Tournament.consider` reads. Here that is asserted through the ROUND, not by reading the source:
+    the reference outscores every miner and still wins nothing."""
+    import json as _json
+    import struct
+    import tempfile
+    from pathlib import Path
+
+    from eval.economics import RegistrationLedger
+    from eval.gates import TierBudget
+    from eval.identity import commit_value, content_hash
+    from eval.koth import Tier, Tournament
+    from eval.steps import Trajectory
+    from eval.validator_observer_loop import CommittedSubmission, run_observer_round
+
+    pool = [Trajectory(id=f"t{i}", source="glaive_r1", prefix=f"p{i}", step="s", index=0)
+            for i in range(200)]
+    d3 = lambda x, y, z: {"a": x, "b": y, "c": z}
+
+    class Obs:
+        def generate(self, prompts, max_new_tokens=128):
+            return ["cont cont"] * len(prompts)
+
+        def distributions(self, prefix, continuation):
+            t = prefix.rstrip()[-1:]
+            return [d3(0.8, 0.1, 0.1)] * 6 if t == "X" else [d3(0.34, 0.33, 0.33)] * 6
+
+    class Step:
+        """Matches the parent exactly -> the best possible retention."""
+
+        def generate(self, prompts, max_new_tokens=256):
+            return ["X"] * len(prompts)
+
+    with tempfile.TemporaryDirectory() as dd:
+        def ck(name, n):
+            q = Path(dd) / name
+            q.mkdir()
+            hb = _json.dumps({"w": {"dtype": "F32", "shape": [n],
+                                    "data_offsets": [0, 4 * n]}}).encode()
+            (q / "model.safetensors").write_bytes(struct.pack("<Q", len(hb)) + hb + b"\0" * 4 * n)
+            (q / "config.json").write_text('{"hidden_size":8}')
+            return str(q)
+
+        cd = ck("miner", 4)
+        hh, ss = content_hash(cd), "s1"
+        tiers = [Tier("t", 10 ** 12, 1.0)]
+        bud = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
+        # the miner is GOOD — good enough to be crowned. The reference then TIES it, which is the
+        # sharpest version of the property: matching the best model in the round still wins nothing.
+        miner = CommittedSubmission(hotkey="hotM", coldkey="cM", tier="t", ckpt_dir=cd,
+                                    declared_compute_h100h=1.0, bond_posted=1.0,
+                                    make_runner=lambda: Step(), revealed_hash=hh, salt=ss,
+                                    committed_value=commit_value(hh, ss),
+                                    artifact_uri=f"file://{cd}")
+
+        out = run_observer_round(
+            1, "root", "nonce", [miner], pool, Step(), {"kimi": Obs()}, tiers, bud,
+            Tournament(tiers, margin=0.03), RegistrationLedger(), {}, n_items=20,
+            corpus_spec="glaive_r1@rev=abc|order=stream",
+            # the reference matches the best miner exactly
+            references=[("stock-q4", "t", Step(), "hf://ref/stock@1")])
+
+        rec = out.record
+        assert rec is not None, out.events
+        refs = [s for s in rec.submissions if s.role == "reference"]
+        assert len(refs) == 1, [(s.model_id, s.role) for s in rec.submissions]
+        ref = refs[0]
+        mine = [s for s in rec.submissions if s.role == "challenger"][0]
+        assert ref.retention >= mine.retention, (ref.retention, mine.retention)
+
+        # ...and having outscored the field it still wins NOTHING
+        crowned = [e for e in rec.events if e.get("action") in ("crown", "dethrone")]
+        for e in crowned:
+            assert e.get("king") != ref.model_id, f"a reference was crowned: {e}"
+        assert ref.model_id not in (rec.weights or {}), rec.weights
+        assert not any(str(k).startswith("reference:") for k in (rec.weights or {})), rec.weights
+        # the miner still gets its crown — a reference must not block a real winner either
+        assert mine.miner in (rec.weights or {}), (rec.weights, mine.miner)
+
+
+def test_a_reference_spec_is_parsed_and_a_typo_never_stops_a_round():
+    """`RALPH_REFERENCES="stock-q4=sub4=hf://x/y@rev"`. A reference is OUR yardstick, so a malformed
+    entry is skipped with a warning — a typo in our own config must not cost eleven miners their
+    round, which is the same rule the king-fetch path already follows."""
+    import io
+    import os
+
+    from eval.run_orchestrated import Config, _parse_references
+
+    buf = io.StringIO()
+    refs = _parse_references(["stock-q4=sub4=hf://prism/x@abc",
+                             "bonsai=ternary=hf://prism-ml/Ternary-Bonsai-8B-gguf@main",
+                             "malformed-no-tier",
+                             "=empty=hf://x/y"], out=buf)
+    assert [r["name"] for r in refs] == ["stock-q4", "bonsai"], refs
+    assert refs[0] == {"name": "stock-q4", "tier": "sub4",
+                       "artifact_uri": "hf://prism/x@abc"}, refs[0]
+    assert "malformed-no-tier" in buf.getvalue(), buf.getvalue()
+    assert "ignored" in buf.getvalue()
+
+    old = os.environ.get("RALPH_REFERENCES")
+    try:
+        os.environ["RALPH_REFERENCES"] = "a=t=hf://x/y@1, b=t2=hf://p/q@2"
+        assert Config.from_env().references == ("a=t=hf://x/y@1", "b=t2=hf://p/q@2")
+        os.environ["RALPH_REFERENCES"] = ""
+        assert Config.from_env().references == ()
+    finally:
+        if old is None:
+            os.environ.pop("RALPH_REFERENCES", None)
+        else:
+            os.environ["RALPH_REFERENCES"] = old
+
+    # and the plan carries them to the rented box
+    from eval.orchestrator import RoundPlan
+    p = RoundPlan(round=1, commit_root="c", round_nonce="n", prev_anchor="")
+    p.references = refs
+    assert p.as_job()["references"] == refs
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,

@@ -250,6 +250,7 @@ def run_observer_round(
     max_step_tokens: int = 256, max_cont_tokens: int = 128,
     noise_safety: float = 3.0, canary=None,
     n_items: int = 64, corpus_spec: str = "", prev_anchor: str = "",
+    references: list | None = None,
 ) -> ObserverRoundOutcome:
     """`trajectory_pool` is a LARGE pool; which items are scored is drawn from the nonce.
 
@@ -260,7 +261,18 @@ def run_observer_round(
 
     `corpus_spec` must identify the pool's ORDERING (source + revision + dedup rule): an index is
     only meaningful against a pinned ordering. `observers`: name -> model; the round's observer is
-    also drawn from the nonce. `canary(sub, runner) -> (ok, info)` is the capability tripwire."""
+    also drawn from the nonce. `canary(sub, runner) -> (ok, info)` is the capability tripwire.
+
+    `references` are `(name, tier, runner, artifact_uri)` — artifacts scored on this round's exam
+    that CANNOT WIN ANYTHING. A stock `llama-quantize` of the parent, or a competitor's published
+    model. They exist because a retention of 0.30 is meaningless without a fixed point: nobody,
+    including us, could say whether the crowns beat what `llama-quantize` gives away for free.
+    Putting the answer IN THE SIGNED RECORD makes it a property an auditor re-derives rather than a
+    claim we assert, and re-measuring it every round turns scoring drift into something visible.
+
+    They are not miners: no hotkey, no commit-reveal, no bond. So they are scored and recorded and
+    then kept out of `by_tier`, which is the single place a crown can come from — a reference can
+    never be crowned, never enter the weight vector, and never dethrone anyone."""
     out = ObserverRoundOutcome()
     out.kings_before = dict(tournament.kings)
 
@@ -480,6 +492,36 @@ def run_observer_round(
         # failed close would turn a scored submission into a rejected one.
         if sub.model_id not in keep_loaded:
             _close_runner(runner)
+
+    # 5b. THE FIXED POINTS. Scored on the same exam, recorded beside the miners, and structurally
+    #     unable to win: they never enter `by_tier`, which is the only list `Tournament.consider`
+    #     reads, so there is no path from a reference to a crown or to a weight. A reference that
+    #     fails to load is a NOTE, never a round failure — it is our artifact, not a miner's, and
+    #     losing our yardstick must not cost eleven people their round.
+    for ref_name, ref_tier, ref_runner, ref_uri in (references or []):
+        _tick("reference", f"{ref_name} tier={ref_tier}", force=True)
+        try:
+            rms = score_submission(shared, ref_runner, observer, max_step_tokens=max_step_tokens)
+        except Exception as e:
+            out.events.append({"round": round_no, "action": "reference_failed", "tier": ref_tier,
+                               "name": ref_name,
+                               "reason": f"{type(e).__name__}: {str(e)[:200]}"})
+            _close_runner(ref_runner)
+            continue
+        rid = f"reference:{ref_name}"
+        rs = Scored(sub=Submission(rid, ref_tier, rid, 0, 0.0),
+                    retention=rms.score, retention_lb=rms.score,
+                    per_point=[v for vs in rms.slice_samples.values() for v in vs],
+                    gates_ok=True, per_axis=dict(rms.slice_samples))
+        rs.role = "reference"
+        rs.artifact_uri = ref_uri
+        rs.steps = _freeze(rms, ref_runner, usable, max_step_tokens)
+        rs.effects = _effects(rms)
+        scored[rid] = rs          # into the RECORD...
+        # ...and deliberately NOT into by_tier. That omission is the whole safety property.
+        out.scores[rid] = rms.as_dict()
+        _tick("reference", f"{ref_name} retention={rms.score:.4f}", force=True)
+        _close_runner(ref_runner)
 
     # 6. crown per tier, re-scoring AND re-gating the incumbent on the same samples
     for t in tiers:

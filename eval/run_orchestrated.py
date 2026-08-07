@@ -67,6 +67,10 @@ class Config:
     # (cloud/region) pairs whose IMAGE cannot run a round — e.g. no CUDA toolkit, so llama.cpp
     # falls back to the CPU wheel and every submission scores ~6x slower on a GPU we are paying for.
     exclude_regions: tuple = ()
+    # RALPH_REFERENCES="name=tier=hf://repo@rev,name2=tier2=hf://..." — fixed points scored every
+    # round and never crowned. Without one, a retention of 0.30 is a number with nothing to be
+    # measured against, including for us.
+    references: tuple = ()
     n_items: int = 72
     pool_size: int = 900
     commit_window: int = 100
@@ -95,8 +99,24 @@ class Config:
             set_weights=e("RALPH_SET_WEIGHTS", "1") != "0",
             exclude_regions=tuple(x.strip() for x in e("RALPH_GPU_EXCLUDE", "").split(",")
                                   if x.strip()),
+            references=tuple(x.strip() for x in e("RALPH_REFERENCES", "").split(",") if x.strip()),
             gpu_type=e("RALPH_GPU_TYPE", "H100"), require_gpu=e("RALPH_REQUIRE_GPU", ""),
             max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
+
+
+def _parse_references(specs, out=None) -> list:
+    """`name=tier=uri` -> `[{"name", "tier", "artifact_uri"}]`. A malformed entry is SKIPPED with a
+    warning, never fatal: a reference is our own yardstick, and a typo in it must not stop eleven
+    miners being scored."""
+    refs = []
+    for raw in (specs or []):
+        parts = [p.strip() for p in str(raw).split("=", 2)]
+        if len(parts) != 3 or not all(parts):
+            if out is not None:
+                out.write(f"  reference {raw!r} ignored — expected name=tier=uri\n")
+            continue
+        refs.append({"name": parts[0], "tier": parts[1], "artifact_uri": parts[2]})
+    return refs
 
 
 def _supervisor_deadline_problems(spec) -> list:
@@ -319,6 +339,7 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
                     "declared_compute_h100h": c.declared_compute_h100h,
                     "bond_posted": c.bond_posted} for c in commits])
     plan.kings = {t: vars(r) for t, r in kings.items()}
+    plan.references = _parse_references(cfg.references, out)
 
     spec = GpuSpec(gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,
                    max_price_per_hour=cfg.max_price_per_hour,

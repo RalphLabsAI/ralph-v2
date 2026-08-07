@@ -137,6 +137,24 @@ def score(job: dict, out_dir: str) -> dict:
         else:
             skipped.append((f"king:{tier}", f"incumbent artifact not fetchable: {r.artifact_uri}"))
 
+    # THE FIXED POINTS. Fetched exactly like a king's artifact, and like a king's artifact a
+    # failure here is a NOTE rather than a round failure — a reference is our yardstick, not a
+    # miner's livelihood, and losing it must not cost anyone their round.
+    references = []
+    for r in (job.get("references") or []):
+        name, tier, uri = r.get("name", ""), r.get("tier", ""), r.get("artifact_uri", "")
+        if not (name and tier and uri):
+            continue
+        tick("fetch reference", f"{name} {uri[:48]}", force=True)
+        rd = fetch_dir_for(f"reference:{name}", uri)
+        if not rd:
+            skipped.append((f"reference:{name}", f"not fetchable: {uri}"))
+            continue
+        try:
+            references.append((name, tier, student_runner(rd), uri))
+        except Exception as e:
+            skipped.append((f"reference:{name}", f"not loadable: {type(e).__name__}: {e}"))
+
     tick("round", f"{len(committed)} accepted, {len(skipped)} skipped", force=True)
     out = run_observer_round(
         int(job["round"]), job["commit_root"], job["round_nonce"], committed, pool, parent,
@@ -144,7 +162,8 @@ def score(job: dict, out_dir: str) -> dict:
         RegistrationLedger(), registry, parent_id=spec.name,
         prev_anchor=job.get("prev_anchor", ""),
         signer=None,                       # UNSIGNED, deliberately: the key is not on this box
-        n_items=int(job["n_items"]), corpus_spec=pspec.as_corpus_spec())
+        n_items=int(job["n_items"]), corpus_spec=pspec.as_corpus_spec(),
+        references=references)
 
     with open(os.path.join(out_dir, "record.json"), "w") as fh:
         json.dump(asdict(out.record) if out.record else None, fh)
