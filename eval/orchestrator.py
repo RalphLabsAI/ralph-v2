@@ -1137,12 +1137,35 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
         "(sudo -n apt-get install -y -q cuda-toolkit >/dev/null 2>&1 "
         "|| sudo -n apt-get install -y -q nvidia-cuda-toolkit >/dev/null 2>&1 || true); "
         "NVCC=$(command -v nvcc || ls -1 /usr/local/cuda*/bin/nvcc 2>/dev/null | head -1); "
+        # THE IMAGE IS NOT THE ONLY PLACE NVCC LIVES. Two providers in a row shipped H100s with no
+        # CUDA toolkit and no NVIDIA apt repo, so the source build fell back to the CPU wheel and
+        # the round had to be refused. But torch's cu13 wheels already pull `cuda-toolkit` INTO THE
+        # VENV — nvcc, the runtime headers and cuBLAS are all sitting in site-packages/nvidia. This
+        # searches there before giving up, and installs the nvcc wheel if even that is absent, so
+        # the build stops depending on which image the cheapest region happens to hand us.
+        "if [ -z \"$NVCC\" ]; then "
+        "NVCC=$(ls -1 .venv/lib/python*/site-packages/nvidia/cuda_nvcc/bin/nvcc 2>/dev/null "
+        "| head -1); fi; "
+        "if [ -z \"$NVCC\" ]; then "
+        "(.venv/bin/pip install --no-cache-dir -q nvidia-cuda-nvcc-cu13 >/dev/null 2>&1 "
+        "|| .venv/bin/pip install --no-cache-dir -q nvidia-cuda-nvcc-cu12 >/dev/null 2>&1 "
+        "|| true); "
+        "NVCC=$(ls -1 .venv/lib/python*/site-packages/nvidia/cuda_nvcc/bin/nvcc 2>/dev/null "
+        "| head -1); fi; "
         "if [ -n \"$NVCC\" ]; then "
-        "export CUDACXX=$NVCC; export PATH=$(dirname $NVCC):$PATH; "
+        "echo \"nvcc: $NVCC\"; export CUDACXX=$NVCC; export PATH=$(dirname $NVCC):$PATH; "
+        # point the build at the pip CUDA tree too: when nvcc came from a wheel, the headers and
+        # cuBLAS are in sibling site-packages/nvidia/* directories, not under /usr/local/cuda.
+        "NVROOT=$(cd $(dirname $NVCC)/../.. 2>/dev/null && pwd); "
+        "if [ -n \"$NVROOT\" ] && [ -d \"$NVROOT/cuda_runtime/include\" ]; then "
+        "export CUDA_HOME=$NVROOT/cuda_nvcc; "
+        "export CPATH=$NVROOT/cuda_runtime/include:$NVROOT/cublas/include:${CPATH:-}; "
+        "export LIBRARY_PATH=$NVROOT/cuda_runtime/lib:$NVROOT/cublas/lib:${LIBRARY_PATH:-}; "
+        "fi; "
         "CMAKE_ARGS='-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=90' "
         ".venv/bin/pip install --no-cache-dir --no-binary llama-cpp-python llama-cpp-python "
         "|| .venv/bin/pip install --no-cache-dir llama-cpp-python; "
-        "else echo 'no nvcc on this image - CPU wheel, scoring will be slower'; "
+        "else echo 'no nvcc anywhere - CPU wheel, scoring will be slower'; "
         ".venv/bin/pip install --no-cache-dir llama-cpp-python; fi && ")
 
     # AND THEN CHECK WHAT WE ACTUALLY BUILT. The CPU wheel accepts `n_gpu_layers` and silently
