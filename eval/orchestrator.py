@@ -1141,9 +1141,20 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
         # host compiler, and gcc dies with `cannot execute 'cc1plus'` — so the log says "nvcc fatal"
         # on a box where nvcc is fine and `cc1plus` is simply absent. Cost two rounds of chasing
         # CUDA when the missing package was g++.
-        "(sudo -n apt-get install -y -q build-essential g++ >/dev/null 2>&1 "
-        "|| sudo -n apt-get install -y -q g++ >/dev/null 2>&1 || true); "
-        "command -v g++ >/dev/null 2>&1 || echo 'WARNING: no g++ - the CUDA build cannot run'; "
+        "(sudo -n apt-get install -y -q build-essential g++ 2>&1 | tail -2 "
+        "|| echo 'apt: could not install g++ (no passwordless sudo?)'); "
+        # PROVE THE TOOLCHAIN, DO NOT ASSUME IT. `command -v g++` said yes on an image whose g++
+        # was a broken install: the driver existed and `cc1plus`, the actual C++ backend, did not.
+        # cmake happily reported "Check for working CXX compiler - skipped", nvcc then shelled out
+        # and died with `cannot execute cc1plus`, and the whole thing read as a CUDA problem. The
+        # only honest test of a compiler is compiling something.
+        "printf 'int main(){return 0;}' > /tmp/_cxx.cpp; "
+        "if g++ /tmp/_cxx.cpp -o /tmp/_cxx 2>/tmp/_cxx.err; then echo 'cxx: ok'; else "
+        "echo 'cxx: BROKEN -' $(head -1 /tmp/_cxx.err); "
+        "(sudo -n apt-get install -y -q --reinstall build-essential g++ cpp 2>&1 | tail -2 "
+        "|| true); "
+        "g++ /tmp/_cxx.cpp -o /tmp/_cxx 2>/tmp/_cxx.err && echo 'cxx: repaired' "
+        "|| echo 'cxx: STILL BROKEN -' $(head -1 /tmp/_cxx.err); fi; "
         "NVCC=$(command -v nvcc || ls -1 /usr/local/cuda*/bin/nvcc 2>/dev/null | head -1); "
         # THE IMAGE IS NOT THE ONLY PLACE NVCC LIVES. Two providers in a row shipped H100s with no
         # CUDA toolkit and no NVIDIA apt repo, so the source build fell back to the CPU wheel and
