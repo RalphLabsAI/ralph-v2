@@ -532,6 +532,36 @@ class GGUFStudentRunner:
                           logits_all=False, verbose=False, seed=0)
         return self._llm
 
+    def close(self) -> None:
+        """Free the llama.cpp context and its VRAM. IDEMPOTENT, and never raises.
+
+        Reported by a miner on 2026-08-07 against round 1 and confirmed: the scoring loop kept
+        every challenger's runner alive in `registry` for the whole round, and nothing here ever
+        released one. Nine retained students were ~30 GB of weights plus ~1.7 GB each of KV and
+        compute buffer at n_ctx=8192 — roughly 45 GB held for models that would never be used
+        again, next to the bf16 parent and observer on an 80 GB card. The tenth load then failed
+        with a bare `ValueError: Failed to load model from file`, which reads exactly like a
+        corrupt artifact and is not one. Python's GC would not have saved us: `registry` held a
+        strong reference deliberately.
+
+        Nothing must escape from here. A cleanup that raises would convert a scored submission
+        into a rejected one — the very failure this is fixing."""
+        llm, self._llm = self._llm, None
+        if llm is None:
+            return
+        try:
+            close = getattr(llm, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        try:
+            del llm
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
     def generate(self, prompts, max_new_tokens: int = 512) -> list[str]:
         """Greedy continuation per prompt. Same contract as HFRunner.generate."""
         from .progress import tick

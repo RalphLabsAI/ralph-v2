@@ -4406,6 +4406,90 @@ def test_every_configured_tier_is_a_tier_that_can_actually_be_scored():
             os.environ["RALPH_TIERS"] = old
 
 
+def test_only_a_reigning_kings_runner_survives_its_submission():
+    """REPORTED BY A MINER, 2026-08-07, against round 1. The loop kept every challenger's runner in
+    `registry` for the whole round and nothing ever released one. Nine retained llama.cpp contexts
+    were ~30 GB of weights plus ~1.7 GB each of KV and compute buffer, next to the bf16 parent and
+    observer on an 80 GB card; the tenth load then failed with a bare `ValueError: Failed to load
+    model from file`, which reads exactly like a corrupt artifact and was not one — the miner
+    reproduced a clean load of the same bytes on CPU.
+
+    `registry` has exactly one later reader: re-scoring the incumbent. So a runner outlives its
+    submission only if it belongs to a reigning king."""
+    import eval.validator_observer_loop as V
+
+    closed, kept = [], {}
+
+    class _R:
+        def __init__(self, name):
+            self.name, self.open = name, True
+
+        def close(self):
+            self.open = False
+            closed.append(self.name)
+
+    # the helper must release a runner that has one, and never raise on one that does not
+    r = _R("challenger")
+    V._close_runner(r)
+    assert not r.open and closed == ["challenger"]
+
+    class _NoClose:
+        pass
+
+    V._close_runner(_NoClose())          # must not raise
+
+    class _Raises:
+        def close(self):
+            raise RuntimeError("cleanup blew up")
+
+    V._close_runner(_Raises())           # must not raise: cleanup must never fail a scored round
+
+    # and the retention rule itself: only current kings are kept
+    keep_loaded = {"king-model"}
+    for mid in ("king-model", "challenger-a", "challenger-b"):
+        runner = _R(mid)
+        if mid in keep_loaded:
+            kept[mid] = runner
+        else:
+            V._close_runner(runner)
+    assert sorted(kept) == ["king-model"], kept
+    assert "king-model" not in closed, "the incumbent's runner was freed before its re-score"
+    assert {"challenger-a", "challenger-b"} <= set(closed), closed
+
+    # THE PROPERTY THE WHOLE FIX RESTS ON: closing is CACHE EVICTION, not destruction. `registry`
+    # is a cross-round cache — a long-lived caller runs several rounds against one dict and step 6
+    # looks the incumbent up in it — so a freed runner must still work if a later round needs it.
+    # If close() left the object unusable, this would trade a VRAM bug for a silent
+    # `king unavailable` hold, which is worse: it keeps a throne without re-scoring it.
+    import tempfile
+    from pathlib import Path
+    from eval.runners import GGUFStudentRunner
+
+    loads = []
+
+    class _Fake:
+        def __init__(self, path):
+            loads.append(path)
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    with tempfile.TemporaryDirectory() as gd:
+        (Path(gd) / "model.gguf").write_bytes(b"GGUF" + b"\0" * 64)
+        r = GGUFStudentRunner(gd, backend=_Fake)
+        first = r._load()
+        assert len(loads) == 1
+        assert r._load() is first, "a second _load must reuse the cached handle"
+        r.close()
+        assert first.closed, "close() did not release the backend"
+        assert r._llm is None
+        r.close()                       # idempotent: a double close must not raise
+        second = r._load()
+        assert len(loads) == 2, "an evicted runner did not reload — it was destroyed, not freed"
+        assert second is not first
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,

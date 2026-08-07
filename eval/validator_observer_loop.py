@@ -49,6 +49,17 @@ def _pool_sha(trajectory_pool) -> str:
         return ""
 
 
+def _close_runner(runner) -> None:
+    """Release a student's backend if it has one. Never raises: cleanup that throws would convert
+    a scored submission into a rejected one, which is the failure this exists to prevent."""
+    try:
+        close = getattr(runner, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
 def _freeze(ms, runner, usable, max_step_tokens: int) -> list:
     """The model's steps as literal text for the record, so an audit is a pure forward pass over
     recorded strings rather than a reproduction of greedy generation — the noisiest part of the
@@ -340,6 +351,20 @@ def run_observer_round(
                      f"({len(out.rejected)} rejected)", force=True)
     scored: dict[str, Scored] = {}
     by_tier: dict[str, list[Scored]] = {t.name: [] for t in tiers}
+    # RELEASE EACH CHALLENGER'S WEIGHTS AS SOON AS NOTHING NEEDS THEM. Reported by a miner on
+    # 2026-08-07 and confirmed: every challenger's runner stayed resident for the whole round, so
+    # by the tenth submission nine llama.cpp contexts were holding ~45 GB of weights, KV and
+    # compute buffer on an 80 GB card, beside the bf16 parent and observer. The tenth load failed
+    # with a bare `ValueError: Failed to load model from file`, which reads exactly like a corrupt
+    # artifact and was not one — the miner reproduced a clean load of the same bytes on CPU.
+    #
+    # `registry` STILL RECEIVES EVERY CHALLENGER. It is a cross-round cache: a long-lived caller
+    # runs several rounds against one dict, and step 6 looks the incumbent up in it. Evicting
+    # entries here would turn a re-score into a silent `king unavailable` hold. What changes is
+    # that the runner's WEIGHTS are dropped — `close()` clears the cached handle and `_load()` is
+    # lazy, so the object stays valid and transparently reloads if a later round needs it. Cache
+    # eviction, not destruction.
+    keep_loaded = {k.model_id for k in tournament.kings.values()}
     for n, (sub, runner, art_uri) in enumerate(subs, 1):
         _tick("submission", f"[{n}/{len(subs)}] {sub.miner[:12]}… tier={sub.tier}", force=True)
         registry[sub.model_id] = runner
@@ -352,6 +377,10 @@ def run_observer_round(
         except Exception as e:
             out.rejected.append((c_hotkey_of(sub), [f"scoring raised {type(e).__name__}: "
                                                     f"{str(e)[:200]}"]))
+            # A submission that FAILED may still have loaded a model before it raised, and the
+            # failure path is exactly when the card is already under pressure.
+            if sub.model_id not in keep_loaded:
+                _close_runner(runner)
             continue
         ok, reasons = True, list(ms.reasons)
         if canary is not None and ms.score > 0:
@@ -380,6 +409,11 @@ def run_observer_round(
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
         out.scores[sub.model_id] = ms.as_dict()
+        # EVERYTHING THAT NEEDED THIS RUNNER HAS RUN: scoring, the capability canary, and the
+        # freeze. Release it unless it is a reigning king's, and never let cleanup raise — a
+        # failed close would turn a scored submission into a rejected one.
+        if sub.model_id not in keep_loaded:
+            _close_runner(runner)
 
     # 6. crown per tier, re-scoring AND re-gating the incumbent on the same samples
     for t in tiers:
