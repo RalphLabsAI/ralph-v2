@@ -1136,6 +1136,14 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
         "(sudo -n apt-get update -q >/dev/null 2>&1 || true); "
         "(sudo -n apt-get install -y -q cuda-toolkit >/dev/null 2>&1 "
         "|| sudo -n apt-get install -y -q nvidia-cuda-toolkit >/dev/null 2>&1 || true); "
+        # NVCC NEEDS A HOST C++ COMPILER, and this image had gcc without g++. The failure surfaces
+        # three layers away from its cause: cmake probes the CUDA compiler, nvcc shells out to the
+        # host compiler, and gcc dies with `cannot execute 'cc1plus'` — so the log says "nvcc fatal"
+        # on a box where nvcc is fine and `cc1plus` is simply absent. Cost two rounds of chasing
+        # CUDA when the missing package was g++.
+        "(sudo -n apt-get install -y -q build-essential g++ >/dev/null 2>&1 "
+        "|| sudo -n apt-get install -y -q g++ >/dev/null 2>&1 || true); "
+        "command -v g++ >/dev/null 2>&1 || echo 'WARNING: no g++ - the CUDA build cannot run'; "
         "NVCC=$(command -v nvcc || ls -1 /usr/local/cuda*/bin/nvcc 2>/dev/null | head -1); "
         # THE IMAGE IS NOT THE ONLY PLACE NVCC LIVES. Two providers in a row shipped H100s with no
         # CUDA toolkit and no NVIDIA apt repo, so the source build fell back to the CPU wheel and
@@ -1184,7 +1192,14 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
         "while the GPU bills. Rent an image with the CUDA toolkit, or set "
         "RALPH_ALLOW_CPU_STUDENTS=1 to accept ~6x time and cost.'; exit 9; } && "
     ) if gpu_students else ""
-    _ssh_stream(inst, spec, f"cd {remote_dir} && {_VENV_CMD}"
+    # PYPI IS A DEPENDENCY OF EVERY ROUND, and it times out. `files.pythonhosted.org` dropped a
+    # read mid-torch on 2026-08-07 and the install had no retry policy at all — pip's defaults are
+    # 5 retries with a 15 s timeout, which is thin for a 2 GB wheel on a fresh box. Set once via
+    # the environment so every pip call in this leg inherits it, rather than flagging ten sites and
+    # missing one.
+    pip_env = ("export PIP_RETRIES=10 PIP_TIMEOUT=60 PIP_DEFAULT_TIMEOUT=60 "
+               "PIP_DISABLE_PIP_VERSION_CHECK=1; ")
+    _ssh_stream(inst, spec, f"cd {remote_dir} && {pip_env}{_VENV_CMD}"
                             f"{torch_cmd}"
                             f".venv/bin/pip install transformers safetensors datasets "
                             f"huggingface_hub pynacl accelerate && "
