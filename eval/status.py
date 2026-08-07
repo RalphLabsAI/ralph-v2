@@ -180,7 +180,11 @@ def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err)
     # anti-circularity reason the audit gives.
     by_model = {}
     for sub in (rec.get("submissions") or []):
-        by_model.setdefault(str(sub.get("model_id")), sub)
+        mid_ = str(sub.get("model_id"))
+        prior = by_model.get(mid_)
+        # prefer the INCUMBENT entry: for a held crown that is the score it defended with
+        if prior is None or str(sub.get("role")) == "incumbent":
+            by_model[mid_] = sub
 
     crowns = {}
     for e in (rec.get("events") or []):
@@ -194,8 +198,15 @@ def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err)
         crowns[str(tier)] = {
             "miner": sub.get("miner") or e.get("miner"),
             "model_id": mid,
+            # THE DEFENDED NUMBER, which for a hold is the incumbent's re-score on THIS round's
+            # exam — not the same model's challenger entry, which is a different measurement.
             "retention": sub.get("retention", e.get("retention")),
             "held": action == "hold",
+            # WHY IT HELD, because the page was showing the number that does not decide. The best
+            # challenger led on raw retention (0.3033 vs 0.3030) and lost by 0.064 on the worst
+            # -slice paired bootstrap, so a reader saw a higher number next to a miner who did not
+            # get the crown and had nothing to explain it.
+            "margin_lcb": e.get("margin_lcb"),
         }
     if not crowns:
         return unmeasured(f"round {rec_round} published but no tier has a crown")
@@ -249,9 +260,18 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
     if latest_record:
         rec_round = latest_record.get("round")
         rec_uri = str(latest_record.get("uri") or "")
+        # A MINER CAN APPEAR TWICE: once as their challenger submission, once as a re-scored
+        # incumbent if they hold a crown. The two are different measurements of different bytes (or
+        # of the same bytes at different moments), so which one this table shows has to be a
+        # decision, not whichever the loop happened to overwrite last. It showed 0.2875 while the
+        # crowns panel showed 0.3030 for the same miner on the same page.
+        # This table answers "what did YOUR SUBMISSION score this round" -> the challenger.
         for sub in (latest_record.get("submissions") or []):
             hk = str(sub.get("miner", ""))
-            if hk:
+            if not hk:
+                continue
+            prior = scored_by_hk.get(hk)
+            if prior is None or str(sub.get("role")) == "challenger":
                 scored_by_hk[hk] = sub
         # WHY A MINER IS NOT IN `submissions`, straight from the signed record. Round 1 dropped two
         # and the reasons lived only on the orchestrator, so from the miner's side they vanished

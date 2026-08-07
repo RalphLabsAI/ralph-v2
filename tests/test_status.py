@@ -360,6 +360,35 @@ def test_a_held_throne_is_a_crown_not_an_empty_tier():
     assert 'binary' not in cr['value'], cr['value']
 
 
+def test_one_miner_two_entries_is_not_two_different_answers():
+    """A miner who holds a crown appears TWICE: their challenger submission, and the re-scored
+    incumbent. The crowns panel read the first match and the submissions table read the last, so
+    the page showed 0.3030 and 0.2875 for the same miner and the same model_id at the same time.
+
+    The split has to be a decision: the table answers "what did YOUR SUBMISSION score", the crown
+    answers "what did the throne DEFEND with"."""
+    rec = _rec(round=2,
+               events=[{"action": "hold", "tier": "sub4", "king": "KS", "margin_lcb": -0.0637}],
+               submissions=[{"miner": "5KING", "tier": "sub4", "model_id": "KS",
+                             "retention": 0.3030, "retention_lb": 0.3030, "gates_ok": True,
+                             "reasons": [], "role": "challenger"},
+                            {"miner": "5KING", "tier": "sub4", "model_id": "KS",
+                             "retention": 0.2875, "retention_lb": 0.2875, "gates_ok": True,
+                             "reasons": [], "role": "incumbent"}])
+    doc = _build(trail_index={"rounds": [{"round": 2}]}, latest_record=rec,
+                 commitments=[{"hotkey": "5KING", "tier": "sub4", "artifact_uri": "hf://k/k@1"}])
+
+    row = doc["chain"]["miners"]["value"][0]["outcome"]
+    assert row["state"] == "MEASURED"
+    assert row["value"]["retention"] == 0.3030, "the table must show the miner's own submission"
+
+    crown = doc["trail"]["crowns"]["value"]["sub4"]
+    assert crown["retention"] == 0.2875, "the crown must show what it DEFENDED with"
+    assert crown["held"] is True
+    # and the number that actually decided the crown has to be on the page
+    assert crown["margin_lcb"] == -0.0637, crown
+
+
 def test_a_rejected_miner_reads_the_reason_from_the_signed_record():
     """Round 1 dropped two miners: one never revealed, one shipped a GGUF llama.cpp cannot open.
     Both reasons existed only in a summary file on the orchestrator — a box the miner cannot see —
