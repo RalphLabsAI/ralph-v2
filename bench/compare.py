@@ -100,19 +100,25 @@ def load_questions(limit: int):
     return [(ds[i]["question"], _gold(ds[i]["answer"])) for i in range(min(limit, len(ds)))]
 
 
-def run_gguf(repo, rev, prompts, max_new):
+def run_gguf(repo, rev, questions, max_new):
     from huggingface_hub import snapshot_download
     from llama_cpp import Llama
     d = snapshot_download(repo_id=repo, revision=rev, allow_patterns=["*.gguf"])
     path = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".gguf")][0]
-    llm = Llama(model_path=path, n_ctx=4096, n_gpu_layers=-1, logits_all=False,
+    llm = Llama(model_path=path, n_ctx=8192, n_gpu_layers=-1, logits_all=False,
                 verbose=False, seed=0)
     out = []
-    for i, p in enumerate(prompts, 1):
-        r = llm(p, max_tokens=max_new, temperature=0.0, echo=False)
-        out.append(r["choices"][0]["text"])
+    for i, q in enumerate(questions, 1):
+        msgs = [{"role": "user", "content": INSTRUCTION.format(q=q)}]
+        try:
+            # the GGUF carries its own chat template; llama.cpp applies it
+            r = llm.create_chat_completion(messages=msgs, max_tokens=max_new, temperature=0.0)
+            out.append(r["choices"][0]["message"]["content"] or "")
+        except Exception:
+            r = llm(PROMPT.format(q=q), max_tokens=max_new, temperature=0.0, echo=False)
+            out.append(r["choices"][0]["text"])
         if i % 20 == 0:
-            sys.stderr.write(f"    {i}/{len(prompts)}\n")
+            sys.stderr.write(f"    {i}/{len(questions)}\n")
     try:
         llm.close()
     except Exception:
@@ -120,10 +126,11 @@ def run_gguf(repo, rev, prompts, max_new):
     return out
 
 
-def run_hf(repo, rev, prompts, max_new):
+def run_hf(repo, rev, questions, max_new):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(repo, revision=rev)
+    prompts = [_chat_text(tok, q) for q in questions]
     model = AutoModelForCausalLM.from_pretrained(repo, revision=rev, torch_dtype=torch.bfloat16,
                                                  device_map="auto",
                                                  attn_implementation="eager")
@@ -145,14 +152,39 @@ def run_hf(repo, rev, prompts, max_new):
     return out
 
 
-PROMPT = ("Solve the problem. Show your reasoning, then give the final numeric answer on its own "
-          "line after '####'.\n\nProblem: {q}\n\nSolution:")
+INSTRUCTION = ("Solve the problem. Reason briefly, then give the final numeric answer on its own "
+               "line after '####'.\n\nProblem: {q}")
+
+# THE RAW-COMPLETION VERSION SCORED THE PARENT AT 35.5%. Qwen3-8B does not do that badly on GSM8K —
+# it is a hybrid-reasoning model that expects its own chat format, and fed a bare completion prompt
+# it never reliably enters the mode where it does the arithmetic. Every model here therefore gets
+# ITS OWN template, applied by its own tokenizer, which is the only way "same treatment" means
+# anything across models trained by different people.
+#
+# Thinking is disabled where the template supports it. That is a fairness decision, not a
+# performance one: a reasoning trace that overruns max_new leaves the parser reading whatever
+# number came last, and it would penalise whichever model reasons longest rather than whichever
+# reasons better.
+PROMPT = INSTRUCTION + "\n\nSolution:"     # fallback for a tokenizer with no chat template
+
+
+def _chat_text(tok, q):
+    msgs = [{"role": "user", "content": INSTRUCTION.format(q=q)}]
+    for kwargs in ({"enable_thinking": False}, {}):
+        try:
+            return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                           **kwargs)
+        except Exception:
+            continue
+    return PROMPT.format(q=q)
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--limit", type=int, default=200)
-    ap.add_argument("--max-new", type=int, default=320)
+    # 320 TRUNCATED THE REASONING and the parser then read whichever number came last. Qwen3
+    # reasons at length; the fix is to give it room rather than to make the parser cleverer.
+    ap.add_argument("--max-new", type=int, default=1024)
     ap.add_argument("--only", default="")
     ap.add_argument("--out", default="bench-results.json")
     a = ap.parse_args(argv)

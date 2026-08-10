@@ -48,7 +48,7 @@ def _stream(inst, spec, cmd, timeout=None):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--limit", type=int, default=200)
-    ap.add_argument("--max-new", type=int, default=320)
+    ap.add_argument("--max-new", type=int, default=1024)
     ap.add_argument("--only", default="")
     ap.add_argument("--max-hours", type=float, default=5.0)
     ap.add_argument("--out", default="bench-results.json")
