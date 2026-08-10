@@ -135,8 +135,11 @@ def main(argv=None) -> int:
             install = (
                 "cd ~/ralph-v2 && export PIP_RETRIES=10 PIP_TIMEOUT=60 "
                 "PIP_DISABLE_PIP_VERSION_CHECK=1; " + _VENV_CMD + torch_cmd +
+                # jinja2 EXPLICITLY: apply_chat_template needs it, and without it every model
+                # silently falls back to a raw completion prompt. torch happens to pull it today,
+                # which is not a guarantee worth relying on.
                 ".venv/bin/pip install --no-cache-dir transformers safetensors datasets "
-                "huggingface_hub accelerate && "
+                "huggingface_hub accelerate jinja2 && "
                 "(sudo -n apt-get update -q >/dev/null 2>&1 || true); "
                 "(sudo -n apt-get install -y -q build-essential g++ >/dev/null 2>&1 || true); "
                 "NVCC=$(command -v nvcc || ls -1 /usr/local/cuda*/bin/nvcc 2>/dev/null | head -1); "

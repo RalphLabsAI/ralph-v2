@@ -130,7 +130,7 @@ def run_hf(repo, rev, questions, max_new):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(repo, revision=rev)
-    prompts = [_chat_text(tok, q) for q in questions]
+    prompts = [_chat_text(tok, q, repo) for q in questions]
     model = AutoModelForCausalLM.from_pretrained(repo, revision=rev, torch_dtype=torch.bfloat16,
                                                  device_map="auto",
                                                  attn_implementation="eager")
@@ -168,14 +168,28 @@ INSTRUCTION = ("Solve the problem. Reason briefly, then give the final numeric a
 PROMPT = INSTRUCTION + "\n\nSolution:"     # fallback for a tokenizer with no chat template
 
 
-def _chat_text(tok, q):
+# Set when any model had to fall back to the raw prompt. A silent fallback here produces numbers
+# that look fine and measure the prompt instead of the model — the parent scored 35.5% and a crown
+# scored 0/200 that way. If it happens, every result in the run is suspect and must say so.
+TEMPLATE_FALLBACKS: dict = {}
+
+
+def _chat_text(tok, q, label=""):
     msgs = [{"role": "user", "content": INSTRUCTION.format(q=q)}]
+    last = ""
     for kwargs in ({"enable_thinking": False}, {}):
         try:
             return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                            **kwargs)
-        except Exception:
-            continue
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+    # LOUD, ONCE PER MODEL. `except: continue` used to swallow this — and the first time it fired
+    # for real the cause was a missing jinja2, which no result would have hinted at.
+    if label not in TEMPLATE_FALLBACKS:
+        TEMPLATE_FALLBACKS[label] = last
+        sys.stderr.write(f"  !! {label}: NO CHAT TEMPLATE APPLIED ({last}). Falling back to a raw "
+                         f"completion prompt — this model's score measures the prompt, not the "
+                         f"model.\n")
     return PROMPT.format(q=q)
 
 
@@ -226,8 +240,14 @@ def main(argv=None) -> int:
         elif r:
             print(f"  {label:<20} {r['accuracy']:>7.1%}   {r['correct']:>3}/{r['n']:<5} "
                   f"{r['seconds'] / 60:>5.1f}m")
+    if TEMPLATE_FALLBACKS:
+        print("\n  !! SOME MODELS RAN WITHOUT THEIR CHAT TEMPLATE — those scores measure the "
+              "prompt, not the model:")
+        for k, v in TEMPLATE_FALLBACKS.items():
+            print(f"     {k}: {v}")
     with open(a.out, "w") as fh:
-        json.dump({"limit": a.limit, "max_new": a.max_new, "results": results}, fh, indent=2)
+        json.dump({"limit": a.limit, "max_new": a.max_new, "results": results,
+                   "template_fallbacks": TEMPLATE_FALLBACKS}, fh, indent=2)
     print(f"\nwrote {a.out}")
     return 0
 
