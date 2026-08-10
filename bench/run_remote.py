@@ -60,6 +60,17 @@ def main(argv=None) -> int:
                    exclude_regions=tuple(x.strip() for x in
                                          os.environ.get("RALPH_GPU_EXCLUDE", "").split(",")
                                          if x.strip()))
+    # BEFORE A CENT. Every repo and revision this run will fetch is checked from here, where the
+    # only cost of being wrong is two seconds. Three launches died on things a HEAD knew.
+    from bench.compare import preflight
+    problems = preflight()
+    for p_ in problems:
+        print(f"  PREFLIGHT: {p_}")
+    if problems:
+        print(f"\nrefusing to rent — {len(problems)} artifact(s) unreachable")
+        return 2
+    print("preflight OK — every model and the dataset resolve")
+
     prov = ShadeformProvider()
 
     # A RENTAL CAN BE "READY" WITH NO GPU. Seen 2026-08-10: nvidia modules loaded, nvidia-smi

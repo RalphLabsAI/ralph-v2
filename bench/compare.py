@@ -53,9 +53,50 @@ def _pred(text: str) -> str:
     return hits[-1].strip(".") if hits else ""
 
 
+# `openai/gsm8k`, NOT the bare `gsm8k`. The legacy unnamespaced id no longer resolves — the hub
+# rejects it before any download with `Repository id must be 'namespace/name'` — so the benchmark
+# died on its first line after a clean fifteen-minute install.
+GSM8K = "openai/gsm8k"
+
+
+def preflight() -> list:
+    """Everything checkable WITHOUT a GPU, checked before one is rented.
+
+    Three launches died on things a HEAD request knew: a legacy dataset id the hub no longer
+    resolves, and before that an ssh line and a card that was not there. Each cost a rental and
+    fifteen minutes to discover something that takes two seconds to ask. `run_orchestrated` already
+    HEADs every observer before renting for exactly this reason; this file simply did not.
+
+    Returns a list of problems. Empty means every repo and revision named here exists."""
+    import urllib.error
+    import urllib.request
+
+    def head(url):
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(url, method="GET",
+                                       headers={"User-Agent": "ralph-bench-preflight"}),
+                timeout=45).read(1)
+            return ""
+        except urllib.error.HTTPError as e:
+            return f"HTTP {e.code}"
+        except Exception as e:
+            return f"{type(e).__name__}"
+
+    bad = []
+    why = head(f"https://huggingface.co/api/datasets/{GSM8K}")
+    if why:
+        bad.append(f"dataset {GSM8K} does not resolve ({why})")
+    for label, (kind, repo, rev) in MODELS.items():
+        why = head(f"https://huggingface.co/api/models/{repo}/tree/{rev}")
+        if why:
+            bad.append(f"{label}: {repo}@{rev[:12]} does not resolve ({why})")
+    return bad
+
+
 def load_questions(limit: int):
     from datasets import load_dataset
-    ds = load_dataset("gsm8k", "main", split="test")
+    ds = load_dataset(GSM8K, "main", split="test")
     return [(ds[i]["question"], _gold(ds[i]["answer"])) for i in range(min(limit, len(ds)))]
 
 
@@ -117,6 +158,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     want = [x.strip() for x in a.only.split(",") if x.strip()] or list(MODELS)
+    for problem in preflight():
+        print(f"  PREFLIGHT: {problem}")
     qs = load_questions(a.limit)
     prompts = [PROMPT.format(q=q) for q, _ in qs]
     golds = [g for _, g in qs]
