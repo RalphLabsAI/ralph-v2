@@ -1,0 +1,47 @@
+{
+  "limit": 200,
+  "max_new": 1024,
+  "results": {
+    "parent-qwen3-8b": {
+      "correct": 180,
+      "n": 200,
+      "accuracy": 0.9,
+      "seconds": 829.3,
+      "repo": "Qwen/Qwen3-8B",
+      "revision": "main"
+    },
+    "ralph-ternary": {
+      "correct": 45,
+      "n": 200,
+      "accuracy": 0.225,
+      "seconds": 1330.9,
+      "repo": "tensor-tailor/ralph-qwen3-8b-ternary",
+      "revision": "301e4db4e8889831856eabd58e0824034d4ed236"
+    },
+    "ralph-sub4": {
+      "correct": 173,
+      "n": 200,
+      "accuracy": 0.865,
+      "seconds": 686.4,
+      "repo": "tensor-tailor/ralph-qwen3-8b-sub4",
+      "revision": "2a2e1bcf9fa9e53165c78be66c9be14d3f9cc1c7"
+    },
+    "bonsai-ternary": {
+      "correct": 177,
+      "n": 200,
+      "accuracy": 0.885,
+      "seconds": 823.6,
+      "repo": "prism-ml/Ternary-Bonsai-8B-unpacked",
+      "revision": "main"
+    },
+    "bonsai-1bit": {
+      "correct": 163,
+      "n": 200,
+      "accuracy": 0.815,
+      "seconds": 810.6,
+      "repo": "prism-ml/Bonsai-8B-unpacked",
+      "revision": "main"
+    }
+  },
+  "template_fallbacks": {}
+}
