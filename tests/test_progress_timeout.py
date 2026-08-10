@@ -407,6 +407,36 @@ def test_the_supervisor_deadline_must_be_outside_our_own():
         subprocess.run = real
 
 
+def test_every_remote_call_carries_the_ssh_identity():
+    """A RENTED BOX HAS NO KEY IN YOUR AGENT. `_SSH_OPTS` is options only — the identity and the
+    port live beside it, and `eval.orchestrator._ssh` has always passed all three. bench/run_remote
+    copied the options and not the rest, so every command came back `Permission denied (publickey)`
+    and an H100 was rented, failed and destroyed inside three minutes for nothing.
+
+    Cheap to lose, trivially avoidable, and exactly the class of thing a test should hold."""
+    import inspect
+
+    from bench import run_remote as B
+    from eval.orchestrator import GpuSpec, Instance
+
+    inst = Instance(id="i", ip="1.2.3.4", ssh_user="shadeform", ssh_port=2222)
+    argv = B._ssh_argv(inst, GpuSpec())
+    assert argv[0] == "ssh"
+    assert "-i" in argv and GpuSpec().ssh_key in argv, argv
+    assert "-p" in argv and "2222" in argv, argv
+    for opt in ("StrictHostKeyChecking=no", "ConnectTimeout=15"):
+        assert opt in argv, (opt, argv)
+
+    # and no remote call may be built any other way
+    src = inspect.getsource(B)
+    body = src[src.index("def main("):]
+    for bad in ('["ssh", *_SSH_OPTS', '"ssh " + " ".join(_SSH_OPTS)'):
+        assert bad not in body, f"a remote call bypasses _ssh_argv: {bad}"
+    # scp takes -P (capital) for the port, not -p — a silent difference from ssh
+    scp = body[body.index('"scp"'):body.index('"scp"') + 200]
+    assert '"-i"' in scp and '"-P"' in scp, scp
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

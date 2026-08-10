@@ -22,13 +22,21 @@ from eval.orchestrator import (_SSH_OPTS, _VENV_CMD, GpuSpec, ShadeformProvider,
 NAME_PREFIX = "ralph-bench-"
 
 
-def _sh(inst, cmd, timeout=None):
-    full = ["ssh", *_SSH_OPTS, f"{inst.ssh_user}@{inst.ip}", cmd]
-    return subprocess.run(full, timeout=timeout)
+def _ssh_argv(inst, spec):
+    """THE IDENTITY AND THE PORT, which `_SSH_OPTS` does not carry. Leaving them off cost a rented
+    H100 and three minutes: every command came back `Permission denied (publickey)` because the
+    agent has no key for a box created seconds earlier. `eval.orchestrator._ssh` has always built
+    it this way; this file just did not copy the whole line."""
+    return ["ssh", "-i", spec.ssh_key, "-p", str(inst.ssh_port), *_SSH_OPTS]
 
 
-def _stream(inst, cmd, timeout=None):
-    full = ["ssh", *_SSH_OPTS, f"{inst.ssh_user}@{inst.ip}", cmd]
+def _sh(inst, spec, cmd, timeout=None):
+    return subprocess.run([*_ssh_argv(inst, spec), f"{inst.ssh_user}@{inst.ip}", cmd],
+                          timeout=timeout)
+
+
+def _stream(inst, spec, cmd, timeout=None):
+    full = [*_ssh_argv(inst, spec), f"{inst.ssh_user}@{inst.ip}", cmd]
     p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in p.stdout:
         sys.stdout.write("  | " + line)
@@ -63,8 +71,9 @@ def main(argv=None) -> int:
             prov.wait_ready(inst, out=sys.stdout)
             print(f"ready at {inst.ip}")
             here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            _sh(inst, "mkdir -p ~/ralph-v2", timeout=120)
-            subprocess.run(["rsync", "-az", "-e", "ssh " + " ".join(_SSH_OPTS),
+            _sh(inst, spec, "mkdir -p ~/ralph-v2", timeout=120)
+            subprocess.run(["rsync", "-az",
+                            "-e", " ".join(_ssh_argv(inst, spec)),
                             "--exclude", ".venv/", "--exclude", "__pycache__/",
                             "--exclude", "wallets/", "--exclude", ".env",
                             f"{here}/eval", f"{here}/bench",
@@ -74,7 +83,7 @@ def main(argv=None) -> int:
             # CUDA than these images ship, and the mismatch does not raise — `is_available()` just
             # returns False and everything silently runs on CPU. Same trap the round hit.
             cuda = subprocess.run(
-                ["ssh", *_SSH_OPTS, f"{inst.ssh_user}@{inst.ip}",
+                [*_ssh_argv(inst, spec), f"{inst.ssh_user}@{inst.ip}",
                  # RAW STRING. Without it `\1` is a control character, sed matches nothing, the
                  # CUDA version reads empty, and we install pip's default torch — which is the
                  # silent-CPU trap this line exists to avoid.
@@ -102,15 +111,15 @@ def main(argv=None) -> int:
                 ".venv/bin/python -m eval.gpu_check || echo 'WARNING: llama.cpp is CPU-only, "
                 "the GGUF models will be slow'")
             print("installing…")
-            if _stream(inst, install, timeout=5400) != 0:
+            if _stream(inst, spec, install, timeout=5400) != 0:
                 raise RuntimeError("the remote install failed")
 
             only = f" --only {a.only}" if a.only else ""
             print("benchmarking…")
-            rc = _stream(inst, f"cd ~/ralph-v2 && .venv/bin/python -m bench.compare "
+            rc = _stream(inst, spec, f"cd ~/ralph-v2 && .venv/bin/python -m bench.compare "
                                f"--limit {a.limit} --max-new {a.max_new}{only} "
                                f"--out {a.out} 2>&1", timeout=int(a.max_hours * 3600))
-            subprocess.run(["scp", *_SSH_OPTS,
+            subprocess.run(["scp", "-i", spec.ssh_key, "-P", str(inst.ssh_port), *_SSH_OPTS,
                             f"{inst.ssh_user}@{inst.ip}:~/ralph-v2/{a.out}", a.out], timeout=300)
             print(f"\nresults -> {a.out}")
     finally:
