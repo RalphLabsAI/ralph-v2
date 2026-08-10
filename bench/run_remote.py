@@ -16,8 +16,9 @@ import subprocess
 import sys
 import time
 
-from eval.orchestrator import (_SSH_OPTS, _VENV_CMD, GpuSpec, ShadeformProvider,
-                               _teardown_on_signal, _torch_index)
+from eval.orchestrator import (_SSH_OPTS, _VENV_CMD, GpuSpec, RemoteRoundError,
+                               ShadeformProvider, _teardown_on_signal, _torch_index,
+                               gpu_devices)
 
 NAME_PREFIX = "ralph-bench-"
 
@@ -60,15 +61,41 @@ def main(argv=None) -> int:
                                          os.environ.get("RALPH_GPU_EXCLUDE", "").split(",")
                                          if x.strip()))
     prov = ShadeformProvider()
-    name = f"{NAME_PREFIX}{int(time.time()) % 100000}"
-    inst = prov.rent(spec, name)
-    print(f"rented {inst.id} {inst.instance_type} @ ${inst.price_per_hour:.2f}/hr "
-          f"({inst.cloud}/{inst.region})")
+
+    # A RENTAL CAN BE "READY" WITH NO GPU. Seen 2026-08-10: nvidia modules loaded, nvidia-smi
+    # answering "No devices were found", zero NVIDIA devices on the PCI bus. One ssh catches it;
+    # the alternative is discovering it after a fifteen-minute install. Retry into a DIFFERENT
+    # (cloud, region) rather than the same broken one, which is what `exclude` is for.
+    tried: tuple = ()
+    inst = None
+    for attempt in range(1, 4):
+        cand = prov.rent(spec, f"{NAME_PREFIX}{int(time.time()) % 100000}", exclude=tried)
+        print(f"rented {cand.id} {cand.instance_type} @ ${cand.price_per_hour:.2f}/hr "
+              f"({cand.cloud}/{cand.region})")
+        try:
+            prov.wait_ready(cand, out=sys.stdout)
+            devs = gpu_devices(cand, spec)
+        except Exception as e:
+            print(f"  not usable: {type(e).__name__}: {e}")
+            devs = []
+        if devs:
+            print(f"  gpus: {', '.join(devs)}")
+            inst = cand
+            break
+        print(f"  NO GPU on {cand.cloud}/{cand.region} — destroying and trying elsewhere "
+              f"(attempt {attempt}/3)")
+        tried += ((cand.cloud, cand.region),)
+        try:
+            prov.destroy(cand)
+        except Exception as e:
+            print(f"  !! could not destroy {cand.id}: {e}")
+    if inst is None:
+        print("no rental with a working GPU after 3 attempts")
+        return 2
     t0 = time.time()
     rc = 1
     try:
         with _teardown_on_signal():
-            prov.wait_ready(inst, out=sys.stdout)
             print(f"ready at {inst.ip}")
             here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             _sh(inst, spec, "mkdir -p ~/ralph-v2", timeout=120)

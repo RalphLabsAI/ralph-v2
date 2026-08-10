@@ -437,6 +437,55 @@ def test_every_remote_call_carries_the_ssh_identity():
     assert '"-i"' in scp and '"-P"' in scp, scp
 
 
+def test_a_rental_with_no_gpu_is_refused_before_the_install():
+    """`wait_ready` reports the PROVIDER's view — created, running, reachable — and a box can
+    satisfy all three with no card attached. Seen 2026-08-10 on a latitude H100: six nvidia kernel
+    modules loaded, `nvidia-smi` answering "No devices were found", zero NVIDIA devices on the PCI
+    bus. The driver was fine; the GPU simply was not there.
+
+    `_assert_gpu` in score_job would eventually catch it — after torch and a llama.cpp source
+    build, fifteen minutes in. One ssh catches it in seconds."""
+    import eval.orchestrator as O
+
+    inst, spec = O.Instance(id="i", ip="1.2.3.4"), O.GpuSpec()
+    real = O._ssh
+    try:
+        O._ssh = lambda *a, **k: "GPU 0: NVIDIA H100 PCIe (UUID: GPU-abc)\n"
+        assert O.gpu_devices(inst, spec) == ["GPU 0: NVIDIA H100 PCIe (UUID: GPU-abc)"]
+        assert O.assert_gpu_present(inst, spec)
+
+        # the exact output the broken box gave
+        O._ssh = lambda *a, **k: "No devices were found\n"
+        assert O.gpu_devices(inst, spec) == []
+        try:
+            O.assert_gpu_present(inst, spec)
+            raise AssertionError("a GPU-less rental was accepted")
+        except O.RemoteRoundError as e:
+            assert "NO GPU" in str(e), e
+
+        # an ssh that fails is NOT evidence of a GPU — fail closed
+        def _boom(*a, **k):
+            raise RuntimeError("ssh died")
+
+        O._ssh = _boom
+        assert O.gpu_devices(inst, spec) == []
+    finally:
+        O._ssh = real
+
+    # and the round asks BEFORE installing
+    import inspect
+    src = inspect.getsource(O.run_remote_round)
+    i_ready, i_gpu = src.index("wait_ready"), src.index("assert_gpu_present")
+    assert i_gpu > i_ready, "the GPU check must follow wait_ready"
+    # ...and precede the delegation to `_run_on`, which is what installs and scores. If the check
+    # ran after that, it would save nothing — the fifteen minutes are already spent.
+    assert i_gpu < src.index("_run_on"), \
+        "the GPU check must precede the install, or it saves nothing"
+    # a GPU-less box goes through the rent-retry loop rather than failing the round outright:
+    # the region is excluded and another is tried, exactly as for a box that never booted
+    assert "exclude=tuple(tried)" in src
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

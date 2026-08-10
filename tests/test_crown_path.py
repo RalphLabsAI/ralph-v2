@@ -4086,12 +4086,21 @@ def test_orchestrator_audits_its_own_scorer_before_signing():
         def _boom(*a, **k):
             raise RemoteRoundError("scoring blew up")
 
+        # the fake box has no nvidia-smi, and `assert_gpu_present` correctly refuses a rental it
+        # cannot see a GPU on — which would send this through the rent-retry loop three times.
+        # That behaviour has its own test; here we are exercising teardown, so hand it a GPU.
+        import eval.orchestrator as _O
+        _real_gpus = _O.gpu_devices
+        _O.gpu_devices = lambda *a, **k: ["GPU 0: NVIDIA H100 PCIe"]
         try:
-            run_remote_round(plan, _Provider(), spec, str(Path(dd) / "w"),
-                             runner=_boom, out=io.StringIO())
-            raise AssertionError("a failed round must not return quietly")
-        except RemoteRoundError:
-            pass
+            try:
+                run_remote_round(plan, _Provider(), spec, str(Path(dd) / "w"),
+                                 runner=_boom, out=io.StringIO())
+                raise AssertionError("a failed round must not return quietly")
+            except RemoteRoundError:
+                pass
+        finally:
+            _O.gpu_devices = _real_gpus
         assert events == ["rent", "ready", "destroy"], events
 
         # ---- 5b. AND TEARDOWN IS VERIFIED, NOT ASSUMED. The first version of destroy() used the

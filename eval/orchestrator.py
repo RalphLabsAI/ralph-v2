@@ -496,6 +496,35 @@ class RemoteRoundError(RuntimeError):
     """Raised INSTEAD of signing. Nothing is published and no weights are set."""
 
 
+def gpu_devices(inst: Instance, spec: GpuSpec, timeout: int = 120) -> list:
+    """What GPUs the box can actually see, from `nvidia-smi -L`. Empty means none.
+
+    `wait_ready` reports the PROVIDER's view — created, running, reachable — and a box can satisfy
+    all three with no GPU attached. Observed 2026-08-10 on a latitude H100: six nvidia kernel
+    modules loaded, `nvidia-smi` answering "No devices were found", and zero NVIDIA devices on the
+    PCI bus. The driver was fine; the card was simply not there.
+
+    Asking costs one ssh. Not asking costs the whole install — fifteen minutes of torch and a
+    llama.cpp source build — before anything notices, and on a bad image the CUDA detection quietly
+    falls back to a CPU wheel so even that failure is soft."""
+    try:
+        out = _ssh(inst, spec, "nvidia-smi -L 2>/dev/null || true", timeout=timeout)
+    except Exception:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip().startswith("GPU ")]
+
+
+def assert_gpu_present(inst: Instance, spec: GpuSpec) -> list:
+    """Refuse a rental with no GPU, in seconds rather than after the install."""
+    devs = gpu_devices(inst, spec)
+    if not devs:
+        raise RemoteRoundError(
+            "this rental reports NO GPU (`nvidia-smi -L` lists none). The provider called it ready "
+            "and it is reachable, but there is no card attached — installing on it would cost "
+            "fifteen minutes and produce a CPU-only box. Destroy it and rent elsewhere.")
+    return devs
+
+
 def _ssh(inst: Instance, spec: GpuSpec, cmd: str, timeout: int = 3600, stdin: str = "") -> str:
     """A SHORT remote command, awaited. Anything that can run for minutes goes through
     `_ssh_stream` instead — a wall-clock timeout on a long step is exactly the bug that burned an
@@ -882,6 +911,10 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
             t0 = time.time()
             try:
                 inst = provider.wait_ready(inst, out=_Out(w))
+                # BEFORE THE INSTALL, NOT AFTER IT. `_assert_gpu` in score_job is the real guard,
+                # but it only runs once torch is installed — fifteen minutes and a llama.cpp build
+                # later. A box with no card can be caught in one ssh.
+                w(f"  gpus      : {', '.join(assert_gpu_present(inst, spec))}\n")
                 break
             except Exception as e:
                 # DESTROY BEFORE RETRYING. A box stuck in `pending_provider` is still billing, and
