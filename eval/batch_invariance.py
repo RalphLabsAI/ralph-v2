@@ -47,7 +47,7 @@ def log(*a):
 def main() -> int:
     os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
     from .observer_round import build_shared, score_submission
-    from .runners import HFRunner
+    from .runners import HFRunner, continuation
     from .shakedown_round_noise import _gpu, _sha, load_trajectories
 
     rep = {"tag": TAG, "gpu": _gpu(), "parent": PARENT, "observer": OBSERVER,
@@ -74,7 +74,9 @@ def main() -> int:
         t0 = time.time()
         # capture the miner's generated text as well as the score: if the TEXT moves, the cause is
         # padding-dependent decoding, not float accumulation order, and the fix is different
-        steps = student.generate([s.prefix for s in shared if s.usable], 256)
+        # chat=False to match the scoring path — this check compares re-generated steps against
+        # scored ones, so prompting differently here would report drift that is entirely its own.
+        steps = continuation(student, [s.prefix for s in shared if s.usable], 256)
         ms = score_submission(shared, student, observer)
         scores[str(bs)] = round(ms.score, 6)
         step_hashes[str(bs)] = _sha(steps)

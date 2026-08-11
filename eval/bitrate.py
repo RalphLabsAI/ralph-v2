@@ -301,6 +301,30 @@ TIERS = (
     BitTier("sub4", max_code_bits=4.0, max_container_bits=5.0),
 )
 
+# Share of emission per tier. NOT UNIFORM, because the tiers are not equally hard and miners price
+# effort correctly: the first two rounds drew 9 sub4 and 6 ternary submissions and nothing at all in
+# binary or sub2, which is exactly what an equal split should be expected to produce. Sub-2-bit is a
+# research problem; 4-bit is one `llama-quantize` invocation, and the sub4 crown came in at 4.61 GB
+# against a 5.0 GB cap — a stock Q4_K_M, of which thousands already exist.
+#
+# The numbers below are a judgement, not a measurement. What they encode: binary and ternary are
+# where an artifact small enough to run on a phone lives (2.5 container bits x 8.19B params = 2.56
+# GB), and that is the only place a compression subnet can produce something nobody can already
+# download. Paired with `Tournament.weights` no longer redistributing an empty tier's share, this
+# makes an unentered binary tier a standing bounty rather than a bonus for whoever entered sub4.
+TIER_EMISSION_WEIGHT = {
+    "binary": 0.40,
+    "ternary": 0.30,
+    "sub2": 0.20,
+    "sub4": 0.10,
+}
+
+
+def emission_weight(tier_name: str, n_tiers: int = 4) -> float:
+    """Emission share for a tier, falling back to an equal split for tiers not in the table
+    (`rehearsal`, `open`, and the simulation tiers, which run one tier at a time anyway)."""
+    return TIER_EMISSION_WEIGHT.get(tier_name, 1.0 / max(1, n_tiers))
+
 
 def bit_tier_gate(rep: BitReport, tier: BitTier) -> tuple[bool, list[str]]:
     """Fail-closed. Both budgets bind: the achievement AND the artifact."""

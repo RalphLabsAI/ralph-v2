@@ -226,12 +226,24 @@ class HFRunner:
                         for v, i in zip(vals.tolist(), idx.tolist())})
         return out
 
-    def generate(self, prompts: Sequence[str], max_new_tokens: int = 512) -> list[str]:
+    def generate(self, prompts: Sequence[str], max_new_tokens: int = 512,
+                 chat: bool = True) -> list[str]:
+        """`chat=True` wraps each prompt as a user turn; `chat=False` continues it verbatim.
+
+        THE CHOICE BELONGS TO THE TASK, NOT THE RUNNER. An axis item is a question, so wrapping it
+        is right. A trajectory prefix is a transcript or a half-written reasoning block, and the
+        thing being asked for is the NEXT step of it — wrapping that says "a user said this whole
+        transcript to you, now reply", which is a different task from the one the corpus holds the
+        ground truth for.
+
+        It also has to match whatever the other runner does. `GGUFStudentRunner` has no chat path at
+        all, so while this defaulted to True for every caller, a miner who uploaded safetensors and a
+        miner who uploaded GGUF were asked different questions and scored against each other."""
         self._load()
         import torch
         from .progress import tick
 
-        texts = [self._render(p) for p in prompts]
+        texts = [self._render(p) if chat else p for p in prompts]
         outs: list[str] = []
         for i in range(0, len(texts), self._batch_size):
             batch = texts[i:i + self._batch_size]
@@ -256,6 +268,36 @@ class HFRunner:
 # --------------------------------------------------------------------------
 # Simulated students — the adversarial cast for Phase 2
 # --------------------------------------------------------------------------
+
+_TAKES_CHAT: dict = {}
+
+
+def continuation(runner, prompts, max_new_tokens: int = 512) -> list[str]:
+    """Generate a CONTINUATION of each prompt, from any runner.
+
+    A trajectory prefix is a transcript or a half-written reasoning block, and the thing being asked
+    for is its next step. `HFRunner` alone has a chat path — it wrapped every prompt as a user turn,
+    which asks a different question — so this turns that off. `GGUFStudentRunner`, the simulation
+    students and the test doubles have no template and are already doing exactly this, so for them
+    the request is a no-op and their signatures are left alone.
+
+    THE ASYMMETRY THIS CLOSES: a miner who uploaded safetensors was scored through HFRunner and got
+    the chat wrapping; a miner who uploaded GGUF was not. Two numerically identical models scored
+    differently by file extension, and both were compared against a parent prompted like only one of
+    them. The capability is inspected rather than assumed, because a `try/except TypeError` here
+    would also swallow a TypeError raised from inside a runner's own generate."""
+    fn = runner.generate
+    key = type(runner)
+    if key not in _TAKES_CHAT:
+        import inspect
+        try:
+            _TAKES_CHAT[key] = "chat" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            _TAKES_CHAT[key] = False
+    if _TAKES_CHAT[key]:
+        return list(fn(prompts, max_new_tokens, chat=False))
+    return list(fn(prompts, max_new_tokens))
+
 
 class SimOracle:
     """Stands in for the pinned TEACHER: solves at a fixed competence rate."""
@@ -563,10 +605,22 @@ class GGUFStudentRunner:
         except Exception:
             pass
 
-    def generate(self, prompts, max_new_tokens: int = 512) -> list[str]:
-        """Greedy continuation per prompt. Same contract as HFRunner.generate."""
+    def generate(self, prompts, max_new_tokens: int = 512, chat: bool = False) -> list[str]:
+        """Greedy continuation per prompt. Same contract as HFRunner.generate.
+
+        `chat` defaults to False because that is what this path has always done — it feeds the
+        prompt to llama.cpp verbatim, with no template. The parameter exists so the difference is
+        visible at the call site instead of being a silent property of which file format a miner
+        happened to upload. `chat=True` is refused rather than approximated: llama.cpp would apply
+        the template embedded in the GGUF, which for a Qwen3 derivative also switches reasoning on,
+        so "the same thing HFRunner does" is not something this path can honestly claim to do."""
         from .progress import tick
 
+        if chat:
+            raise NotImplementedError(
+                "GGUFStudentRunner has no chat path. Applying the GGUF's embedded template here "
+                "would also enable Qwen3 reasoning, which HFRunner's chat path does not do — the "
+                "two would still not match. Score trajectory steps with chat=False on both runners.")
         llm = self._load()
         out = []
         for n, p in enumerate(prompts, 1):

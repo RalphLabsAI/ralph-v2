@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, Sequence
 
 from .observer_kl import MIN_TEACHER_EFFECT, StepEffect, score_miner, step_effect
+from .runners import continuation
 
 
 
@@ -74,7 +75,10 @@ def build_shared(trajectories, parent: Stepper, observer: Observer, observer_nam
     trajectories = list(trajectories)
     if not trajectories:
         return []
-    steps = parent.generate([t.prefix for t in trajectories], max_step_tokens)
+    # chat=False ON BOTH LEGS — see score_submission. A prefix is text to be continued, and the
+    # parent's step is the reference every miner is measured against, so this is the leg that
+    # defines what the question even is.
+    steps = continuation(parent, [t.prefix for t in trajectories], max_step_tokens)
     out: list[SharedSample] = []
     for n, (t, parent_step) in enumerate(zip(trajectories, steps), 1):
         # Two observer passes and a continuation per sample, none of them batched. This is the
@@ -139,7 +143,13 @@ def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: O
         ms = MinerScore()
         ms.reasons.append("no usable samples this round (parent effect too small everywhere)")
         return ms
-    miner_steps = miner.generate([s.prefix for s in usable], max_step_tokens)
+    # chat=False, EXPLICITLY AND ON BOTH LEGS. `HFRunner.generate` defaulted to wrapping the prompt
+    # as a user turn and `GGUFStudentRunner.generate` has never had a chat path, so a safetensors
+    # submission and a GGUF submission were handed different prompts and then ranked against each
+    # other — two miners with numerically identical models scored differently by file extension.
+    # The parent was prompted the safetensors way, so GGUF submissions were also being compared to
+    # a reference step produced under a prompt they never saw.
+    miner_steps = continuation(miner, [s.prefix for s in usable], max_step_tokens)
     samples: list[tuple[str, StepEffect]] = []
     for n, (s, a_step) in enumerate(zip(usable, miner_steps), 1):
         tick("score", f"{getattr(miner, 'name', '?')} {n}/{len(usable)}")

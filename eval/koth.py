@@ -273,13 +273,35 @@ class Tournament:
         return event
 
     def weights(self) -> dict[str, float]:
-        """Emission per miner: each tier's weight goes to its king. Normalized to sum 1
-        over tiers that have a king."""
-        live = {t: k for t, k in self.kings.items() if t in self.tiers}
-        total_w = sum(self.tiers[t].weight for t in live)
+        """Emission per miner: each tier's weight goes to its king.
+
+        NORMALIZED OVER EVERY TIER, NOT ONLY THE OCCUPIED ONES, so the result may sum to less than
+        1 — see `unclaimed()`. This used to divide by the weight of tiers that had a king, which
+        meant an empty tier handed its share to whoever had shown up elsewhere. With binary and
+        sub2 empty, the ternary and sub4 kings split the whole emission, and sub4 — the tier a
+        miner can enter with one `llama-quantize` invocation — collected half of everything.
+
+        That is precisely backwards. The hard tiers are the ones worth paying for, and under the old
+        rule the surest way to raise your income was for nobody to attempt them. An unclaimed tier
+        now pays nobody, so the reward for entering an empty hard tier is the whole of its share
+        rather than a slice of it."""
+        total_w = sum(t.weight for t in self.tiers.values())
         if total_w <= 0:
             return {}
         out: dict[str, float] = {}
-        for t, k in live.items():
-            out[k.miner] = out.get(k.miner, 0.0) + self.tiers[t].weight / total_w
+        for t, k in self.kings.items():
+            if t in self.tiers:
+                out[k.miner] = out.get(k.miner, 0.0) + self.tiers[t].weight / total_w
         return out
+
+    def unclaimed(self) -> float:
+        """The share of emission belonging to tiers with no king.
+
+        Returned rather than silently redistributed, because what to do with it is a protocol
+        decision — burn it, or hold it — and not one the tournament should make by accident. The
+        caller must handle it explicitly; `weights()` summing to less than 1 is the signal."""
+        total_w = sum(t.weight for t in self.tiers.values())
+        if total_w <= 0:
+            return 0.0
+        held = sum(self.tiers[t].weight for t in self.kings if t in self.tiers)
+        return max(0.0, (total_w - held) / total_w)

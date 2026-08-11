@@ -32,6 +32,7 @@ from .koth import MIN_CROWN_LB, Scored, Submission, Tier, Tournament
 from .observer_round import build_shared, pick_observer, score_submission, select_trajectories
 from .progress import tick as _tick
 from .round_record import RoundRecord, build_round_record
+from .runners import continuation
 
 
 def _sha(text: str) -> str:
@@ -94,7 +95,9 @@ def _freeze(ms, runner, usable, max_step_tokens: int) -> list:
     if steps:
         return steps
     try:
-        return list(runner.generate([x.prefix for x in usable], max_step_tokens))
+        # chat=False to match observer_round's scoring legs. A freeze recorded under a different
+        # prompt than the score would be a record of something that never happened.
+        return continuation(runner, [x.prefix for x in usable], max_step_tokens)
     except Exception:
         return []
 
@@ -215,6 +218,9 @@ class ObserverRoundOutcome:
     accepted: list = field(default_factory=list)
     rejected: list = field(default_factory=list)
     weights: dict = field(default_factory=dict)
+    # share of emission with no king this round; burned rather than given to the
+    # kings that exist, so an unentered hard tier never subsidises an easy one
+    unclaimed: float = 0.0
     record: RoundRecord | None = None
     refunds: dict = field(default_factory=dict)
     observer: str = ""
@@ -476,6 +482,16 @@ def run_observer_round(
         s.code_bits = float(getattr(_b, "code_bits", 0.0) or 0.0)
         s.container_bits = float(getattr(_b, "container_bits", 0.0) or 0.0)
         s.steps = _freeze(ms, runner, usable, max_step_tokens)
+        # IS THIS OUTPUT LANGUAGE AT ALL. `degeneracy_flags` was imported by this module and never
+        # called — `round_engine` and `axis_round` both gate on it, the live v2 path did not. So
+        # round 2's ternary tier took four entries, three of them token soup, and only one miner
+        # uploading a working model kept `retention_lb > 0.02` from crowning a broken quantiser.
+        # Retention cannot refuse that on its own: soup still shifts an observer's distribution a
+        # little, and a little is all the floor ever asked for.
+        deg_ok, dflags = degeneracy_flags(s.steps)
+        if not deg_ok:
+            s.gates_ok = False
+            s.reasons.extend(dflags)
         s.effects = _effects(ms)
         # PROVISIONAL, and it says so. The signed record is still the only authority — this number
         # has not been audited, signed or anchored, and the round can still be WITHHELD after it is
@@ -586,6 +602,7 @@ def run_observer_round(
         if refund:
             out.refunds[s.sub.miner] = refund
     out.weights = tournament.weights()
+    out.unclaimed = tournament.unclaimed()
     # POINTS: every usable sample, not a truncated 64, and each carries the FROZEN parent step
     # and continuation C. That is what turns a re-run into a pure forward pass: the auditor does
     # not have to reproduce batched greedy generation (the noisiest part of the round, and the
@@ -619,6 +636,7 @@ def run_observer_round(
                                     f"trajectories:{len(usable)}", pts, scored, out.events,
                                     out.weights, manifest=manifest, noise=out.noise,
                                     safety=noise_safety, prev_anchor=prev_anchor,
+                                    unclaimed=out.unclaimed,
                                     # so a dropped miner learns why from the SIGNED record rather
                                     # than from a file on a box they cannot see
                                     rejected=out.rejected)

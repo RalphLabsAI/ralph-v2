@@ -374,7 +374,9 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
           f"  weights   : NOT SET — RALPH_SET_WEIGHTS=0. The round is scored, signed, published "
           f"and anchored; only the payout is withheld.\n")
     else:
-        ok = chain.set_weights(rec.weights)
+        # The unclaimed share goes to the burn uid. Without it `set_weights` renormalises and
+        # hands an empty tier's emission straight back to the kings that do exist.
+        ok = chain.set_weights(rec.weights, burn=getattr(rec, 'unclaimed', 0.0) or 0.0)
         w(f"  weights   : {rec.weights} -> set={ok} (live={cfg.live})\n")
     w(f"  cost      : ~${res['cost']:.2f}\n")
     return 0
