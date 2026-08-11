@@ -176,6 +176,18 @@ def run_hf(repo, rev, contents, max_new):
     return out
 
 
+def _save(path, payload):
+    """Write after EVERY completed (model, task), not once at the end.
+
+    A run that hits its deadline mid-suite used to lose every result it had already produced —
+    hours of GPU, recoverable only by scraping the log. The file is written to a temp path and
+    renamed, so a kill during the write cannot leave a truncated JSON behind either."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(tmp, path)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tasks", default=",".join(TASKS))
@@ -183,6 +195,8 @@ def main(argv=None) -> int:
                     help="multiply every task's default n (0.05 for a smoke run)")
     ap.add_argument("--only", default="")
     ap.add_argument("--out", default="bench-results-v2.json")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip (model, task) pairs already present in --out")
     a = ap.parse_args(argv)
 
     for p in preflight():
@@ -201,13 +215,30 @@ def main(argv=None) -> int:
     print()
 
     results: dict = {}
+    if a.resume and os.path.exists(a.out):
+        try:
+            results = json.load(open(a.out)).get("results", {})
+            done = sum(len(v.get("tasks", {})) for v in results.values())
+            print(f"  resuming: {done} (model, task) pair(s) already done\n")
+        except Exception as e:
+            print(f"  could not read {a.out} to resume ({type(e).__name__}); starting clean\n")
+            results = {}
+
+    def payload():
+        return {"limit_scale": a.limit_scale, "tasks": want_tasks, "results": results,
+                "template_fallbacks": TEMPLATE_FALLBACKS}
+
     for label in want_models:
         if label not in MODELS:
             print(f"  ! unknown model {label!r}")
             continue
         kind, repo, rev = MODELS[label]
-        results[label] = {"repo": repo, "revision": rev, "tasks": {}}
+        results.setdefault(label, {"repo": repo, "revision": rev, "tasks": {}})
         for t in want_tasks:
+            if a.resume and t in results[label]["tasks"] \
+                    and "error" not in results[label]["tasks"][t]:
+                print(f"== {label} / {t}  (already done, skipping)")
+                continue
             items = loaded[t]
             print(f"== {label} / {t}  ({len(items)} items)")
             t0 = time.time()
@@ -217,6 +248,7 @@ def main(argv=None) -> int:
             except Exception as e:
                 print(f"   FAILED: {type(e).__name__}: {e}\n")
                 results[label]["tasks"][t] = {"error": f"{type(e).__name__}: {e}"}
+                _save(a.out, payload())
                 continue
             ok = fmt = 0
             per_slice: dict = {}
@@ -233,6 +265,7 @@ def main(argv=None) -> int:
                 "ci95": [lo, hi], "format_fail": fmt,
                 "per_slice": {k: {"correct": v[0], "n": v[1]} for k, v in per_slice.items()},
                 "seconds": round(time.time() - t0, 1)}
+            _save(a.out, payload())        # survive a deadline, by design rather than by luck
             print(f"   {ok}/{len(items)} = {ok / len(items):.1%}  [{lo:.1%}, {hi:.1%}]   "
                   f"format-fail {fmt}   ({(time.time() - t0) / 60:.1f} min)\n")
 
@@ -278,9 +311,7 @@ def main(argv=None) -> int:
         for k, v in TEMPLATE_FALLBACKS.items():
             print(f"     {k}: {v}")
 
-    with open(a.out, "w") as fh:
-        json.dump({"limit_scale": a.limit_scale, "tasks": want_tasks, "results": results,
-                   "template_fallbacks": TEMPLATE_FALLBACKS}, fh, indent=2)
+    _save(a.out, payload())
     print(f"\nwrote {a.out}")
     return 0
 
