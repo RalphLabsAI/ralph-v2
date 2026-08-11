@@ -427,14 +427,17 @@ def test_every_remote_call_carries_the_ssh_identity():
     for opt in ("StrictHostKeyChecking=no", "ConnectTimeout=15"):
         assert opt in argv, (opt, argv)
 
-    # and no remote call may be built any other way
+    # and no remote call may be built any other way, ANYWHERE IN THE MODULE. This used to scan only
+    # main()'s body; moving the scp into a helper so a failed run's results are fetched before
+    # teardown took it out of the window, and the check silently stopped covering it.
     src = inspect.getsource(B)
-    body = src[src.index("def main("):]
     for bad in ('["ssh", *_SSH_OPTS', '"ssh " + " ".join(_SSH_OPTS)'):
-        assert bad not in body, f"a remote call bypasses _ssh_argv: {bad}"
+        assert bad not in src, f"a remote call bypasses _ssh_argv: {bad}"
     # scp takes -P (capital) for the port, not -p — a silent difference from ssh
-    scp = body[body.index('"scp"'):body.index('"scp"') + 200]
-    assert '"-i"' in scp and '"-P"' in scp, scp
+    assert '"scp"' in src, "no scp call found — results are never retrieved"
+    for at in [i for i in range(len(src)) if src.startswith('"scp"', i)]:
+        scp = src[at:at + 200]
+        assert '"-i"' in scp and '"-P"' in scp, scp
 
 
 def test_a_rental_with_no_gpu_is_refused_before_the_install():
