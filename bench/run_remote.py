@@ -47,11 +47,11 @@ def _stream(inst, spec, cmd, timeout=None):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--limit", type=int, default=200)
-    ap.add_argument("--max-new", type=int, default=1024)
+    ap.add_argument("--limit-scale", type=float, default=1.0)
+    ap.add_argument("--tasks", default="")
     ap.add_argument("--only", default="")
-    ap.add_argument("--max-hours", type=float, default=5.0)
-    ap.add_argument("--out", default="bench-results.json")
+    ap.add_argument("--max-hours", type=float, default=8.0)
+    ap.add_argument("--out", default="bench-results-v2.json")
     a = ap.parse_args(argv)
 
     spec = GpuSpec(max_hours=a.max_hours,
@@ -156,9 +156,10 @@ def main(argv=None) -> int:
                 raise RuntimeError("the remote install failed")
 
             only = f" --only {a.only}" if a.only else ""
+            tasks = f" --tasks {a.tasks}" if a.tasks else ""
             print("benchmarking…")
             rc = _stream(inst, spec, f"cd ~/ralph-v2 && .venv/bin/python -m bench.compare "
-                               f"--limit {a.limit} --max-new {a.max_new}{only} "
+                               f"--limit-scale {a.limit_scale}{tasks}{only} "
                                f"--out {a.out} 2>&1", timeout=int(a.max_hours * 3600))
             subprocess.run(["scp", "-i", spec.ssh_key, "-P", str(inst.ssh_port), *_SSH_OPTS,
                             f"{inst.ssh_user}@{inst.ip}:~/ralph-v2/{a.out}", a.out], timeout=300)
