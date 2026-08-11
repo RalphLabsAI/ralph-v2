@@ -76,16 +76,44 @@ TEMPLATE_FALLBACKS: dict = {}
 # read as a clean bill of health for a fleet half of which it never inspected.
 RAW_FALLBACKS: dict = {}
 
+# label -> the kwargs that were in force when a model was found to be reasoning anyway. Non-empty
+# means the run is not like-for-like and its cross-model numbers must not be published.
+THINKING_ON: dict = {}
+
 
 def _chat_text(tok, content, label=""):
+    """Render this model's own chat template with reasoning suppressed, and CHECK THAT IT WORKED.
+
+    Asking whether the call raised is the wrong question, and asking it is how the asymmetry
+    survived a whole run. Two ways this silently fails and neither throws:
+
+      - `{"enable_thinking": False}` raises, the bare `{}` retry succeeds, and the model runs
+        thinking-ON. The old loop only recorded a fallback when BOTH attempts failed, so this middle
+        branch wrote nothing at all.
+      - the template simply has no `enable_thinking` branch and ignores the kwarg. Both Bonsai repos
+        are in this case: they suppress reasoning unconditionally in their own template, so the flag
+        is inert and the result happens to be right — but a model whose template ignored the flag
+        and defaulted ON would look identical from the call site.
+
+    So the guarantee is taken from the rendered string, which is the thing that actually reaches the
+    model. Same check the GGUF path makes, so both paths are held to one standard."""
+    from bench.tasks import THINK_CLOSE
     msgs = [{"role": "user", "content": content}]
     last = ""
     for kwargs in ({"enable_thinking": False}, {}):
         try:
-            return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+            text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                            **kwargs)
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
+            continue
+        if THINK_CLOSE not in text and label not in THINKING_ON:
+            THINKING_ON[label] = kwargs
+            sys.stderr.write(
+                f"  !! {label}: REASONING IS STILL ENABLED (rendered with {kwargs or 'no kwargs'}; "
+                f"no {THINK_CLOSE} in the prompt). This model gets test-time compute the others do "
+                f"not — its scores are not comparable with theirs.\n")
+        return text
     # LOUD, ONCE PER MODEL. `except: continue` used to swallow this, and the first time it fired
     # for real the cause was a missing jinja2 — which no result would have hinted at.
     if label not in TEMPLATE_FALLBACKS:
@@ -269,10 +297,16 @@ def run_hf(label, spec, contents, max_new):
         # not others puts a precision difference inside a comparison that is supposed to isolate
         # compression.
         dtype = getattr(torch, spec.get("dtype", "bfloat16"))
-        model = AutoModelForCausalLM.from_pretrained(repo, revision=rev, config=cfg,
-                                                     torch_dtype=dtype,
-                                                     device_map="auto",
-                                                     attn_implementation="eager")
+        # `torch_dtype` was renamed to `dtype` in transformers 5, and the runner installs
+        # transformers unpinned — the 2026-08-11 run got 5.15.0. An unrecognised keyword here is
+        # absorbed into the config kwargs rather than raising, so the wrong spelling does not fail,
+        # it loads in float32 and prints a table. Try the current spelling, fall back to the old one,
+        # and let the assertion below be what actually decides.
+        base = dict(revision=rev, config=cfg, device_map="auto", attn_implementation="eager")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(repo, dtype=dtype, **base)
+        except (TypeError, ValueError):
+            model = AutoModelForCausalLM.from_pretrained(repo, torch_dtype=dtype, **base)
         model.eval()
         # ASSERT THE DTYPE RATHER THAN ASSUME IT. `torch_dtype` is being renamed to `dtype` in
         # transformers, and an unrecognised keyword here is absorbed into the config kwargs instead
@@ -280,9 +314,9 @@ def run_hf(label, spec, contents, max_new):
         # and the table still prints. Nothing else in this harness would notice.
         got = next(model.parameters()).dtype
         if got != dtype:
-            raise RuntimeError(f"{label}: asked for {dtype}, model loaded as {got}. "
-                               f"transformers {transformers.__version__} likely renamed the "
-                               f"dtype argument; refusing to score at the wrong precision.")
+            raise RuntimeError(f"{label}: asked for {dtype}, model loaded as {got} under "
+                               f"transformers {transformers.__version__}. Neither dtype spelling "
+                               f"took; refusing to score at a precision nobody chose.")
         RUNTIME.setdefault(label, {}).update(
             {"runtime": "transformers", "transformers": transformers.__version__,
              "torch": torch.__version__, "dtype": str(dtype),
@@ -403,6 +437,7 @@ def main(argv=None) -> int:
     def payload():
         return {"limit_scale": a.limit_scale, "tasks": want_tasks, "results": results,
                 "template_fallbacks": TEMPLATE_FALLBACKS, "raw_fallbacks": RAW_FALLBACKS,
+                "thinking_on": THINKING_ON,
                 # read through the module, not a from-import: select_mgsm_langs rebinds it, and a
                 # from-import would freeze the nine-language default into every restricted run's
                 # provenance record.
@@ -508,6 +543,11 @@ def main(argv=None) -> int:
         print("\n  !! GGUF ITEMS SCORED ON A BARE, UNTEMPLATED PROMPT:")
         for k, v in RAW_FALLBACKS.items():
             print(f"     {k}: {v} item(s)")
+    if THINKING_ON:
+        print("\n  !! THESE MODELS REASONED BEFORE ANSWERING AND THE OTHERS DID NOT.")
+        print("     The run is not like-for-like. Do not publish any cross-model comparison.")
+        for k, v in THINKING_ON.items():
+            print(f"     {k}: rendered with {v or 'no kwargs'}")
 
     # The prompt each model was actually sent, side by side. Every model here shares one parent and
     # one template, so these tails should be identical; when they were not, it took an audit of

@@ -132,6 +132,60 @@ def test_bonsai_template_hardwires_thinking_off():
         assert NO_THINK in _render(tpl, **kw), f"expected unconditional suppression, kwargs={kw}"
 
 
+# --- the HF path's own guarantee, which used to have a hole in the middle -------------------------
+
+class _Tok:
+    """A tokenizer stand-in that renders a REAL vendored template. `raises_on` reproduces a
+    transformers version whose template rejects the kwarg outright."""
+
+    def __init__(self, template, raises_on=()):
+        self.template, self.raises_on = template, raises_on
+
+    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, **kw):
+        for k in self.raises_on:
+            if k in kw:
+                raise TypeError(f"unexpected keyword argument {k!r}")
+        return _render(self.template, messages=msgs, **kw)
+
+
+def _chat_text_fresh(tok, label):
+    from bench import compare
+    compare.THINKING_ON.pop(label, None)
+    compare.TEMPLATE_FALLBACKS.pop(label, None)
+    text = compare._chat_text(tok, "What is 2+2?", label)
+    return text, label in compare.THINKING_ON
+
+
+def test_a_kwarg_that_raises_and_retries_is_not_silent():
+    """THE HOLE. `{"enable_thinking": False}` raises, the bare `{}` retry succeeds, the model runs
+    with reasoning ON — and the old code recorded a fallback only when BOTH attempts failed, so this
+    middle branch wrote nothing anywhere. `template_fallbacks: {}` was then read as proof the flag
+    had been applied."""
+    tok = _Tok(_load("qwen3_chat_template.jinja"), raises_on=("enable_thinking",))
+    text, flagged = _chat_text_fresh(tok, "model-that-retried")
+    assert NO_THINK not in text, "precondition: the retry must produce a thinking-ON prompt"
+    assert flagged, "a model that fell back to reasoning-ON was not recorded"
+
+
+def test_a_template_that_ignores_the_kwarg_is_not_silent_either():
+    """The other way it fails without raising: the template has no `enable_thinking` branch, so the
+    call succeeds, the flag does nothing, and the model reasons. From the call site this is
+    indistinguishable from success — only the rendered string tells them apart."""
+    ignores = "{{- '<|im_start|>assistant\\n' }}"      # no enable_thinking branch at all
+    text, flagged = _chat_text_fresh(_Tok(ignores), "model-that-ignored")
+    assert NO_THINK not in text and flagged
+
+
+def test_the_working_cases_stay_quiet():
+    """Both real templates suppress reasoning — Qwen3 via the kwarg, Bonsai unconditionally — and
+    neither may raise a false alarm, or the warning stops meaning anything."""
+    for name, label in (("qwen3_chat_template.jinja", "qwen3-ok"),
+                        ("bonsai_chat_template.jinja", "bonsai-ok")):
+        text, flagged = _chat_text_fresh(_Tok(_load(name)), label)
+        assert NO_THINK in text, name
+        assert not flagged, f"{name} was flagged despite suppressing reasoning"
+
+
 # --- the scorer, which must survive a reasoning block whichever way this goes ---------------------
 
 def test_strip_think_handles_closed_open_and_absent():
