@@ -31,6 +31,22 @@ def _ssh_argv(inst, spec):
     return ["ssh", "-i", spec.ssh_key, "-p", str(inst.ssh_port), *_SSH_OPTS]
 
 
+def fetch(inst, spec, out):
+    """Pull the results file down. Safe to call twice, and safe to call after a failure.
+
+    `bench.compare` checkpoints after every (model, task) pair specifically so a run that dies
+    part-way still has value. That was worth nothing while the only scp sat on the success path,
+    behind a `_stream` that a deadline could kill — the box was destroyed in the `finally` with
+    every completed result still on it."""
+    try:
+        r = subprocess.run(["scp", "-i", spec.ssh_key, "-P", str(inst.ssh_port), *_SSH_OPTS,
+                            f"{inst.ssh_user}@{inst.ip}:~/ralph-v2/{out}", out], timeout=300)
+        return r.returncode == 0
+    except Exception as e:
+        print(f"  !! could not fetch {out}: {type(e).__name__}: {e}")
+        return False
+
+
 def _sh(inst, spec, cmd, timeout=None):
     return subprocess.run([*_ssh_argv(inst, spec), f"{inst.ssh_user}@{inst.ip}", cmd],
                           timeout=timeout)
@@ -50,6 +66,11 @@ def main(argv=None) -> int:
     ap.add_argument("--limit-scale", type=float, default=1.0)
     ap.add_argument("--tasks", default="")
     ap.add_argument("--only", default="")
+    # Without --langs, extending MGSM_LANGS from six languages to nine re-runs all nine for every
+    # model — "add three languages" priced as a full re-run.
+    ap.add_argument("--langs", default="", help="restrict MGSM to a subset, e.g. bn,te,th")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip (model, task) pairs already complete in --out ON THE REMOTE BOX")
     ap.add_argument("--max-hours", type=float, default=8.0)
     ap.add_argument("--out", default="bench-results-v2.json")
     a = ap.parse_args(argv)
@@ -146,9 +167,12 @@ def main(argv=None) -> int:
                 "if [ -n \"$NVCC\" ]; then export CUDACXX=$NVCC; "
                 "export PATH=$(dirname $NVCC):$PATH; "
                 "CMAKE_ARGS='-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=90' "
+                # --no-binary takes a package NAME; a pinned spec there is not an error pip reports
+                # usefully. The version pin belongs only on the requirement itself.
                 ".venv/bin/pip install --no-cache-dir --no-binary llama-cpp-python "
-                "llama-cpp-python || .venv/bin/pip install --no-cache-dir llama-cpp-python; "
-                "else .venv/bin/pip install --no-cache-dir llama-cpp-python; fi && "
+                "llama-cpp-python==0.3.34 || "
+                ".venv/bin/pip install --no-cache-dir llama-cpp-python==0.3.34; "
+                "else .venv/bin/pip install --no-cache-dir llama-cpp-python==0.3.34; fi && "
                 ".venv/bin/python -m eval.gpu_check || echo 'WARNING: llama.cpp is CPU-only, "
                 "the GGUF models will be slow'")
             print("installing…")
@@ -157,14 +181,25 @@ def main(argv=None) -> int:
 
             only = f" --only {a.only}" if a.only else ""
             tasks = f" --tasks {a.tasks}" if a.tasks else ""
+            langs = f" --langs {a.langs}" if a.langs else ""
+            resume = " --resume" if a.resume else ""
             print("benchmarking…")
             rc = _stream(inst, spec, f"cd ~/ralph-v2 && .venv/bin/python -m bench.compare "
-                               f"--limit-scale {a.limit_scale}{tasks}{only} "
+                               f"--limit-scale {a.limit_scale}{tasks}{only}{langs}{resume} "
                                f"--out {a.out} 2>&1", timeout=int(a.max_hours * 3600))
-            subprocess.run(["scp", "-i", spec.ssh_key, "-P", str(inst.ssh_port), *_SSH_OPTS,
-                            f"{inst.ssh_user}@{inst.ip}:~/ralph-v2/{a.out}", a.out], timeout=300)
+            # FETCH BEFORE THE finally DESTROYS THE BOX, and fetch even when the run failed.
+            # compare.py checkpoints after every (model, task); a run that overruns its deadline or
+            # dies mid-suite still has hours of completed results sitting on a machine that is about
+            # to be deleted. Pulling only on success threw those away.
+            fetch(inst, spec, a.out)
             print(f"\nresults -> {a.out}")
     finally:
+        # LAST CHANCE BEFORE THE MACHINE GOES AWAY. Covers the paths that never reach the fetch
+        # above: an exception mid-suite, a deadline kill, a SIGTERM caught by _teardown_on_signal.
+        if not os.path.exists(a.out):
+            print("retrieving partial results before teardown…")
+            if fetch(inst, spec, a.out):
+                print(f"  recovered {a.out} from a run that did not finish")
         try:
             prov.destroy(inst)
             print(f"destroyed {inst.id} after {(time.time() - t0) / 60:.1f} min "

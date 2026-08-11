@@ -1,0 +1,5 @@
+{
+  "qwen3_chat_template.jinja": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+  "bonsai_chat_template.jinja": "30a75d10e60b57e2f260420163dd59720dacf9f63b9a8de070d65dd80a7b30f7",
+  "_note": "qwen3 template is byte-identical in Qwen/Qwen3-8B's tokenizer_config.json and in the tokenizer.chat_template embedded in tensor-tailor/ralph-qwen3-8b-sub4's GGUF"
+}
