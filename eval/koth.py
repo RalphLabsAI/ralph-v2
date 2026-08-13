@@ -18,6 +18,24 @@ import random
 from dataclasses import dataclass, field
 
 
+def kings_from_events(events) -> dict:
+    """{tier: model_id} for every throne a round leaves occupied.
+
+    `hold` COUNTS. A round where the incumbent survives emits `hold`, not `crown` — the crown did
+    not change hands, so nothing is re-announced — and code that scans only for `crown`/`dethrone`
+    concludes the tier is empty. That reading has already broken the emission audit once and it is
+    the same mistake twice over, so the rule lives in one place: a tier has a king if the last event
+    that named one said `crown`, `dethrone` or `hold`."""
+    kings: dict = {}
+    for e in events or []:
+        tier, king = e.get("tier"), e.get("king")
+        if not tier:
+            continue
+        if e.get("action") in ("crown", "dethrone", "hold") and king:
+            kings[tier] = king
+    return kings
+
+
 @dataclass(frozen=True)
 class Tier:
     name: str

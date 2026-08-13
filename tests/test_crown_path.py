@@ -4358,28 +4358,42 @@ def test_a_sparse_field_cannot_move_an_already_published_digest():
         d.update(kw)
         return RoundRecord(**d)
 
+    # GENERIC OVER `_SPARSE`, not hard-coded to `rejected`. The second sparse field (`unclaimed`,
+    # a float whose empty value is 0.0 rather than []) broke this test while the property itself
+    # still held, because the legacy payload was reconstructed by deleting one known key. Every
+    # future sparse field is now covered the day it is added.
     empty = _rec()
-    assert '"rejected"' not in empty.canonical(), \
-        "an empty sparse field entered the signed payload — every published record just moved"
+    assert RoundRecord._SPARSE, "the sparse mechanism was removed; published digests are unprotected"
+    for f in RoundRecord._SPARSE:
+        assert f'"{f}"' not in empty.canonical(), \
+            f"empty sparse field {f!r} entered the signed payload — every published record moved"
 
-    # the digest a pre-`rejected` record would have had: canonical() minus the sparse key
+    # the digest a record published before ANY of these fields existed would have had
     import json as _j
     from dataclasses import asdict
     legacy = {k: v for k, v in asdict(empty).items()
-              if k not in RoundRecord._SIG_FIELDS and k != "rejected"}
+              if k not in RoundRecord._SIG_FIELDS and k not in RoundRecord._SPARSE}
     assert empty.canonical() == _j.dumps(legacy, sort_keys=True, separators=(",", ":")), \
         "the canonical form drifted from what a record published before this field would digest to"
 
-    # ...and a real rejection IS signed
-    full = _rec(rejected=[["5XYZ", ["committed but not revealed"]]])
-    assert '"rejected"' in full.canonical()
-    assert full.sha256() != empty.sha256(), "a rejection that does not change the digest is unsigned"
+    # ...and a real value IS signed, for each of them
+    NONEMPTY = {"rejected": [["5XYZ", ["committed but not revealed"]]], "unclaimed": 0.6}
+    for f in RoundRecord._SPARSE:
+        assert f in NONEMPTY, f"sparse field {f!r} has no non-empty case in this test"
+        full = _rec(**{f: NONEMPTY[f]})
+        assert f'"{f}"' in full.canonical(), f"{f!r} vanished even when set"
+        assert full.sha256() != empty.sha256(), \
+            f"a {f!r} value that does not change the digest is unsigned"
 
-    # a record round-trips through the reader with the field intact
+    # a record round-trips through the reader with EVERY sparse field intact, set together — the
+    # loop above leaves `full` holding only the last one, and a per-field round-trip would not
+    # catch a reader that drops one of them when several are present
     from eval.rerun import record_from_blob
-    back = record_from_blob(_j.dumps({**asdict(full)}).encode())
-    assert back.rejected == [["5XYZ", ["committed but not revealed"]]], back.rejected
-    assert back.sha256() == full.sha256()
+    loaded = _rec(**NONEMPTY)
+    back = record_from_blob(_j.dumps(asdict(loaded)).encode())
+    for f, v in NONEMPTY.items():
+        assert getattr(back, f) == v, (f, getattr(back, f))
+    assert back.sha256() == loaded.sha256()
 
 
 def test_every_configured_tier_is_a_tier_that_can_actually_be_scored():

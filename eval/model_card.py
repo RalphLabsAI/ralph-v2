@@ -173,17 +173,28 @@ Licensed Apache-2.0, inheriting the parent's terms.
 
 
 def from_record(record, model_id: str, parent: str, parent_params: int,
-                record_url: str = "", benchmarks=None) -> str:
-    """Render straight from a signed round record, so the card cannot disagree with the round."""
+                record_url: str = "", benchmarks=None, tier: str | None = None) -> str:
+    """Render straight from a signed round record, so the card cannot disagree with the round.
+
+    PER TIER, AND `hold` COUNTS. This used to scan for `crown`/`dethrone` only and keep the last one
+    it saw, which is wrong twice: a round that HOLDS both thrones emits neither, so it raised "no
+    crowned challenger" on a perfectly good round — and with several tiers live it kept whichever
+    happened to be last in the list and wrote that model's card for every tier. Pass `tier` when the
+    round has more than one throne."""
     from .density import from_record as density_from
-    king = None
-    for e in record.events:
-        if e.get("action") in ("crown", "dethrone"):
-            king = e.get("king")
-    sub = next((s for s in record.submissions
-                if s.model_id == king and s.role == "challenger"), None)
+    from .koth import kings_from_events
+    kings = kings_from_events(record.events)
+    if tier is None:
+        if len(kings) > 1:
+            raise ValueError(f"record has {len(kings)} thrones ({', '.join(sorted(kings))}); "
+                             f"pass tier= to say which card to write")
+        tier = next(iter(kings), None)
+    king = kings.get(tier)
+    # The incumbent's re-score carries role="incumbent"; a freshly crowned model carries
+    # "challenger". Accept either, or a held crown writes no card at all.
+    sub = next((s for s in record.submissions if s.model_id == king), None)
     if sub is None:
-        raise ValueError("record contains no crowned challenger to write a card for")
+        raise ValueError(f"record contains no submission for the {tier!r} king to write a card for")
     man = record.manifest or {}
     return render(
         model_id=model_id, parent=parent, parent_params=parent_params,
