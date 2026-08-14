@@ -245,24 +245,13 @@ class BittensorChainIO:
 
     # ---- writes (no-ops unless read_only=False) ------------------------------------------
 
-    def set_weights(self, weights: dict, burn: float = 0.0) -> bool:
+    def set_weights(self, weights: dict) -> bool:
         """`{hotkey: score}` -> uids, normalised. Unresolvable hotkeys are DROPPED WITH A REASON,
-        never silently, because a dropped king is a crown that stops being paid.
-
-        `burn` is the share belonging to tiers that HAVE NO KING, and it must be passed or the
-        change that produced it does nothing. `Tournament.weights()` deliberately returns a vector
-        summing to less than 1 when a tier is unclaimed — but this method normalises, so without
-        somewhere for the remainder to go it would be handed straight back to the kings that do
-        exist. That is the bug the tournament change exists to remove: an empty binary tier paying
-        the sub4 king for nobody having attempted it. Routing it to the burn uid makes an unentered
-        hard tier cost the subnet emission rather than subsidise the easy one."""
+        never silently, because a dropped king is a crown that stops being paid."""
         if self.read_only:
-            self.log.append(("set_weights", dict(weights), {"burn": burn}))
+            self.log.append(("set_weights", dict(weights)))
             return False
         uids, vals = [], []
-        if burn > 0:
-            uids.append(int(self.burn_uid))
-            vals.append(float(burn))
         for hk, w in weights.items():
             uid = self.uid_of(hk)
             if uid is None:

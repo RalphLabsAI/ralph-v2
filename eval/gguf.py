@@ -63,6 +63,14 @@ GGML_TYPES: dict[int, tuple[str, int, int]] = {
     30: ("BF16",     1, 2),
     34: ("TQ1_0",  256, 54),      # ternary packing, 1.6875 bpw
     35: ("TQ2_0",  256, 66),      # ternary packing, 2.0625 bpw
+    # THE TWO LOW-BIT FORMATS THAT POST-DATE THE REST OF THIS TABLE. Without them `read_gguf`
+    # returns None for the type and the artifact is refused — so the sub2 tier could not have
+    # accepted a submission in the one format it exists for. Ids and block layouts taken from
+    # llama.cpp's own `ggml.h` / `ggml-common.h`, not inferred from the names:
+    #   block_q1_0 = ggml_half + QK1_0/8 bytes over QK1_0=128 elems -> 18*8/128 = 1.125 bpw
+    #   block_q2_0 = ggml_half + QK2_0/4 bytes over QK2_0=64  elems -> 18*8/64  = 2.25  bpw
+    41: ("Q1_0",   128, 18),      # 1.125 bpw — PrismML's format; needs THEIR fork to run
+    42: ("Q2_0",    64, 18),      # 2.25 bpw — mainline llama.cpp + Metal. The phone-native one.
 }
 
 _NON_WEIGHT = ("norm", "bias", "_scale", "rope_freqs")

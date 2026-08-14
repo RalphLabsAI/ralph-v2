@@ -293,31 +293,36 @@ class Tournament:
     def weights(self) -> dict[str, float]:
         """Emission per miner: each tier's weight goes to its king.
 
-        NORMALIZED OVER EVERY TIER, NOT ONLY THE OCCUPIED ONES, so the result may sum to less than
-        1 — see `unclaimed()`. This used to divide by the weight of tiers that had a king, which
-        meant an empty tier handed its share to whoever had shown up elsewhere. With binary and
-        sub2 empty, the ternary and sub4 kings split the whole emission, and sub4 — the tier a
-        miner can enter with one `llama-quantize` invocation — collected half of everything.
+        SUMS TO 1 OVER THE OCCUPIED TIERS. Nothing is burned: a subnet that writes part of its
+        weight vector to a burn uid is read in this ecosystem as taxing its own miners, and it is
+        not worth the signal it buys.
 
-        That is precisely backwards. The hard tiers are the ones worth paying for, and under the old
-        rule the surest way to raise your income was for nobody to attempt them. An unclaimed tier
-        now pays nobody, so the reward for entering an empty hard tier is the whole of its share
-        rather than a slice of it."""
-        total_w = sum(t.weight for t in self.tiers.values())
+        What fixes the original problem is the WEIGHTS being unequal, not the normalisation. When
+        every tier paid the same, an empty binary tier and an empty sub2 tier handed their halves to
+        the two occupied ones and sub4 — enterable with one `llama-quantize` invocation — collected
+        half of all emission. Under `TIER_EMISSION_WEIGHT` the same field pays the sub4 king 37% and
+        the ternary king 62%, and taking sub2 moves a miner to 50%. Moving up a tier still roughly
+        doubles income, which is the whole property that was missing.
+
+        `unclaimed()` reports how much of the nominal schedule was redistributed this way. It is
+        recorded rather than acted on, so a reader can see that a two-tier round paid out a
+        four-tier schedule."""
+        live = {t: k for t, k in self.kings.items() if t in self.tiers}
+        total_w = sum(self.tiers[t].weight for t in live)
         if total_w <= 0:
             return {}
         out: dict[str, float] = {}
-        for t, k in self.kings.items():
-            if t in self.tiers:
-                out[k.miner] = out.get(k.miner, 0.0) + self.tiers[t].weight / total_w
+        for t, k in live.items():
+            out[k.miner] = out.get(k.miner, 0.0) + self.tiers[t].weight / total_w
         return out
 
     def unclaimed(self) -> float:
-        """The share of emission belonging to tiers with no king.
+        """Share of the NOMINAL schedule that belonged to tiers with no king.
 
-        Returned rather than silently redistributed, because what to do with it is a protocol
-        decision — burn it, or hold it — and not one the tournament should make by accident. The
-        caller must handle it explicitly; `weights()` summing to less than 1 is the signal."""
+        Reporting only — `weights()` redistributes it across the occupied tiers, so this never
+        reduces what is paid out. It exists so the record can say "this round paid a four-tier
+        schedule to two tiers", which is the difference between a concentrated payout that was
+        designed and one that nobody noticed."""
         total_w = sum(t.weight for t in self.tiers.values())
         if total_w <= 0:
             return 0.0

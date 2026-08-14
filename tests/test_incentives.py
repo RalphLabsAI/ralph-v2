@@ -50,11 +50,36 @@ def _tournament(kings: dict):
 
 # --- what a tier pays ----------------------------------------------------------------------------
 
-def test_hard_tiers_pay_more_than_easy_ones():
+def test_the_phone_tier_pays_most_and_the_commodity_tier_least():
+    """WEIGHTED BY PRODUCT VALUE, NOT DIFFICULTY. Binary is the hardest problem on the board and
+    pays third, because a binary winner needs a private fork to run and therefore reaches nobody.
+    sub2 pays most because Q2_0 g64 is the only format here that runs GPU-accelerated on a phone
+    through apps that already exist."""
     w = TIER_EMISSION_WEIGHT
-    assert w["binary"] > w["ternary"] > w["sub2"] > w["sub4"], w
+    assert w["sub2"] == max(w.values()), f"the phone tier must lead: {w}"
+    assert w["sub4"] == min(w.values()), f"the commodity tier must trail: {w}"
+    assert w["ternary"] > w["binary"], "ternary is closer to shipping than binary"
     assert abs(sum(w.values()) - 1.0) < 1e-9, sum(w.values())
     assert set(w) == {t.name for t in TIERS}, "the weight table and the tier table disagree"
+
+
+def test_the_phone_tier_can_accept_the_phone_format():
+    """sub2's cap is 2.3 SO THAT Q2_0 FITS. At 2.0 the one phone-native format on the board could
+    enter no tier but sub4, where models carrying twice the bits would beat it — a tier built for
+    a format that could not enter it."""
+    from eval.bitrate import BitReport, bit_tier_gate
+    from eval.gguf import GGML_TYPES, code_bits, type_bits
+    by_name = {t.name: t for t in TIERS}
+    q2 = next(tid for tid, v in GGML_TYPES.items() if v[0] == "Q2_0")
+    rep = BitReport(params=8_190_000_000, code_bits=code_bits("Q2_0"), container_bits=type_bits(q2))
+    ok, why = bit_tier_gate(rep, by_name["sub2"])
+    assert ok, f"Q2_0 cannot enter the tier built for it: {why}"
+    assert abs(type_bits(q2) - 2.25) < 1e-9, type_bits(q2)     # 18 bytes / 64 elems
+    # and PrismML's Q1_0 lands in binary, at its published 1.125 bpw
+    q1 = next(tid for tid, v in GGML_TYPES.items() if v[0] == "Q1_0")
+    assert abs(type_bits(q1) - 1.125) < 1e-9, type_bits(q1)
+    assert bit_tier_gate(BitReport(params=8_190_000_000, code_bits=code_bits("Q1_0"),
+                                   container_bits=type_bits(q1)), by_name["binary"])[0]
 
 
 def test_unknown_tiers_fall_back_to_an_equal_split():
@@ -65,32 +90,42 @@ def test_unknown_tiers_fall_back_to_an_equal_split():
 
 # --- the subsidy ---------------------------------------------------------------------------------
 
-def test_an_empty_tier_does_not_pay_the_occupied_ones():
-    """THE BUG, stated as the case that produced it: binary and sub2 empty, ternary and sub4 held.
+def test_nothing_is_ever_burned():
+    """NO BURN, DELIBERATELY. A subnet writing part of its weight vector to a burn uid reads in
+    this ecosystem as taxing its own miners. Whatever the field looks like, the payout is whole."""
+    for live in (["ternary", "sub4"], ["sub2"], NAMES, ["binary", "sub4"]):
+        t = _tournament({n: f"m-{n}" for n in live})
+        assert abs(sum(t.weights().values()) - 1.0) < 1e-9, (live, t.weights())
 
-    Under the old rule the two kings split 1.0 between them and sub4 took half of all emission for
-    being the easiest tier on the board."""
+
+def test_moving_up_a_tier_still_roughly_doubles_income():
+    """What the unequal weights buy. Under an equal split the same field paid sub4 50% for one
+    `llama-quantize` invocation; the fix is the WEIGHTS being unequal, not withholding emission."""
+    today = _tournament({"ternary": "alice", "sub4": "bob"}).weights()
+    assert abs(today["alice"] - 0.625) < 1e-9, today      # ternary
+    assert abs(today["bob"] - 0.375) < 1e-9, today        # sub4, down from 50% under equal weights
+    moved = _tournament({"ternary": "alice", "sub2": "bob", "sub4": "carol"}).weights()
+    assert moved["bob"] > today["bob"], "taking the phone tier must pay more than holding sub4"
+    assert abs(moved["bob"] - 0.5) < 1e-9, moved
+
+
+def test_an_empty_tier_is_redistributed_not_withheld():
+    """An unclaimed share goes to the occupied tiers, and `unclaimed()` REPORTS how much did.
+
+    It is reporting only — the point is that a record can say "this round paid a four-tier schedule
+    to two tiers" rather than leaving a concentrated payout looking accidental."""
     t = _tournament({"ternary": "alice", "sub4": "bob"})
-    w = t.weights()
-    assert abs(w["bob"] - TIER_EMISSION_WEIGHT["sub4"]) < 1e-9, w
-    assert abs(w["alice"] - TIER_EMISSION_WEIGHT["ternary"]) < 1e-9, w
-    assert sum(w.values()) < 1.0, "an unclaimed tier's share was redistributed"
+    assert abs(sum(t.weights().values()) - 1.0) < 1e-9
     assert abs(t.unclaimed() - (TIER_EMISSION_WEIGHT["binary"]
                                 + TIER_EMISSION_WEIGHT["sub2"])) < 1e-9
+    assert _tournament({n: f"m-{n}" for n in NAMES}).unclaimed() == 0.0
 
 
-def test_entering_an_empty_hard_tier_cannot_be_diluted_by_the_easy_ones():
-    """The incentive the whole change exists to create: taking the binary crown pays its full share
-    no matter how crowded sub4 is."""
-    alone = _tournament({"binary": "carol"})
-    crowded = _tournament({"binary": "carol", "ternary": "a", "sub2": "b", "sub4": "c"})
-    assert abs(alone.weights()["carol"] - crowded.weights()["carol"]) < 1e-9
-    assert abs(alone.weights()["carol"] - TIER_EMISSION_WEIGHT["binary"]) < 1e-9
-
-
-def test_all_tiers_claimed_pays_out_in_full():
+def test_all_tiers_claimed_pays_the_nominal_schedule():
     t = _tournament({n: f"m-{n}" for n in NAMES})
-    assert abs(sum(t.weights().values()) - 1.0) < 1e-9
+    w = t.weights()
+    for n in NAMES:
+        assert abs(w[f"m-{n}"] - TIER_EMISSION_WEIGHT[n]) < 1e-9, (n, w)
     assert t.unclaimed() == 0.0
 
 
@@ -102,8 +137,10 @@ def test_no_kings_pays_nobody():
 
 def test_one_miner_holding_several_tiers_accumulates():
     t = _tournament({"binary": "solo", "sub4": "solo"})
-    assert abs(t.weights()["solo"]
-               - (TIER_EMISSION_WEIGHT["binary"] + TIER_EMISSION_WEIGHT["sub4"])) < 1e-9
+    assert abs(t.weights()["solo"] - 1.0) < 1e-9, "sole holder of every live tier takes it all"
+    both = _tournament({"binary": "solo", "sub4": "solo", "sub2": "rival"}).weights()
+    assert abs(both["solo"] - (0.20 + 0.15) / 0.75) < 1e-9, both
+    assert abs(both["rival"] - 0.40 / 0.75) < 1e-9, both
 
 
 # --- what cannot be crowned ----------------------------------------------------------------------
