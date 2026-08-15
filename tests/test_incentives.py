@@ -50,17 +50,38 @@ def _tournament(kings: dict):
 
 # --- what a tier pays ----------------------------------------------------------------------------
 
-def test_the_phone_tier_pays_most_and_the_commodity_tier_least():
-    """WEIGHTED BY PRODUCT VALUE, NOT DIFFICULTY. Binary is the hardest problem on the board and
-    pays third, because a binary winner needs a private fork to run and therefore reaches nobody.
-    sub2 pays most because Q2_0 g64 is the only format here that runs GPU-accelerated on a phone
-    through apps that already exist."""
+def test_the_smallest_tier_pays_most():
+    """Three orderings coincide, so the ladder is steepest at the bottom: fewer bits is a smaller
+    file, a smaller file fits more phones and decodes faster, and fewer bits is the harder problem.
+
+    This was briefly weighted the other way, on the belief that only Q2_0 reached a phone and
+    sub-2-bit needed a private fork. Mainline llama.cpp carries Metal kernels for Q1_0, IQ1_S,
+    IQ1_M, IQ2_XXS and Q2_0, so there is no reason to pay less for the smaller artifact."""
     w = TIER_EMISSION_WEIGHT
-    assert w["sub2"] == max(w.values()), f"the phone tier must lead: {w}"
-    assert w["sub4"] == min(w.values()), f"the commodity tier must trail: {w}"
-    assert w["ternary"] > w["binary"], "ternary is closer to shipping than binary"
+    by_bits = [t.name for t in sorted(TIERS, key=lambda t: t.max_code_bits)]
+    pay = [w[n] for n in by_bits]
+    assert pay == sorted(pay, reverse=True), \
+        f"emission must fall as the bit budget rises: {list(zip(by_bits, pay))}"
     assert abs(sum(w.values()) - 1.0) < 1e-9, sum(w.values())
     assert set(w) == {t.name for t in TIERS}, "the weight table and the tier table disagree"
+
+
+def test_a_format_that_cannot_run_is_refused_by_every_tier():
+    """TQ1_0 fits the binary and ternary budgets at 1.6875 bpw and mainline llama.cpp ships no
+    Metal kernels for it — a crown in it would be a champion that crashes on every iPhone. Its
+    sibling TQ2_0 is fine, so this cannot be waved through as "the ternary formats are broken"."""
+    from eval.bitrate import BitReport, bit_tier_gate
+    from eval.gguf import GGML_TYPES, code_bits, type_bits
+
+    def gate_all(name):
+        tid = next(k for k, v in GGML_TYPES.items() if v[0] == name)
+        rep = BitReport(params=8_190_000_000, code_bits=code_bits(name),
+                        container_bits=type_bits(tid), formats={name: 8_190_000_000})
+        return [t.name for t in TIERS if bit_tier_gate(rep, t)[0]]
+
+    assert gate_all("TQ1_0") == [], "an unrunnable format was accepted into a tier"
+    for ok in ("TQ2_0", "Q2_0", "Q1_0", "IQ1_S", "IQ1_M"):
+        assert gate_all(ok), f"{ok} runs on Apple GPU and must not be refused"
 
 
 def test_the_phone_tier_can_accept_the_phone_format():
@@ -98,15 +119,30 @@ def test_nothing_is_ever_burned():
         assert abs(sum(t.weights().values()) - 1.0) < 1e-9, (live, t.weights())
 
 
-def test_moving_up_a_tier_still_roughly_doubles_income():
-    """What the unequal weights buy. Under an equal split the same field paid sub4 50% for one
-    `llama-quantize` invocation; the fix is the WEIGHTS being unequal, not withholding emission."""
+def test_moving_up_a_tier_pays_more_with_the_field_held_fixed():
+    """What the unequal weights buy: under an equal split the same field paid sub4 50% for one
+    `llama-quantize` invocation.
+
+    THE COMPARISON MUST HOLD THE LIVE TIERS FIXED. An earlier version of this test compared a
+    two-tier field against a three-tier one and read the extra dilution as a lost incentive — the
+    renormalisation changes every share when a tier is added, so a miner moving up looked worse
+    off. Swap which tier one miner holds and leave the field alone."""
+    W = TIER_EMISSION_WEIGHT
+    live = ["ternary", "sub2", "sub4"]
+    tot = sum(W[t] for t in live)
+    got = _tournament({t: f"k-{t}" for t in live}).weights()
+    for t in live:
+        assert abs(got[f"k-{t}"] - W[t] / tot) < 1e-9, (t, got)
+    # the same miner, same field, one rung up each time
+    assert got["k-sub2"] > got["k-sub4"], got
+    assert got["k-ternary"] > got["k-sub2"], got
+
+    # and the two-tier field we actually have today
     today = _tournament({"ternary": "alice", "sub4": "bob"}).weights()
-    assert abs(today["alice"] - 0.625) < 1e-9, today      # ternary
-    assert abs(today["bob"] - 0.375) < 1e-9, today        # sub4, down from 50% under equal weights
-    moved = _tournament({"ternary": "alice", "sub2": "bob", "sub4": "carol"}).weights()
-    assert moved["bob"] > today["bob"], "taking the phone tier must pay more than holding sub4"
-    assert abs(moved["bob"] - 0.5) < 1e-9, moved
+    two = W["ternary"] + W["sub4"]
+    assert abs(today["alice"] - W["ternary"] / two) < 1e-9, today
+    assert abs(today["bob"] - W["sub4"] / two) < 1e-9, today
+    assert today["bob"] < 0.5, "sub4 must no longer take half of everything"
 
 
 def test_an_empty_tier_is_redistributed_not_withheld():
@@ -138,9 +174,11 @@ def test_no_kings_pays_nobody():
 def test_one_miner_holding_several_tiers_accumulates():
     t = _tournament({"binary": "solo", "sub4": "solo"})
     assert abs(t.weights()["solo"] - 1.0) < 1e-9, "sole holder of every live tier takes it all"
+    W = TIER_EMISSION_WEIGHT
+    tot = W["binary"] + W["sub4"] + W["sub2"]
     both = _tournament({"binary": "solo", "sub4": "solo", "sub2": "rival"}).weights()
-    assert abs(both["solo"] - (0.20 + 0.15) / 0.75) < 1e-9, both
-    assert abs(both["rival"] - 0.40 / 0.75) < 1e-9, both
+    assert abs(both["solo"] - (W["binary"] + W["sub4"]) / tot) < 1e-9, both
+    assert abs(both["rival"] - W["sub2"] / tot) < 1e-9, both
 
 
 # --- what cannot be crowned ----------------------------------------------------------------------

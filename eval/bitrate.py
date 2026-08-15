@@ -52,6 +52,10 @@ class BitReport:
     codebook: int = 0               # distinct codes found (2 = binary, 3 = ternary)
     group_size: int = 128
     per_group_size: dict = field(default_factory=dict)   # tensor -> group size used/detected
+    # GGUF only: quantisation type name -> weights carried. Kept separate from `per_tensor`, which
+    # is keyed by TENSOR name on the safetensors path and by TYPE name on the GGUF one — a
+    # collision that would make a runnability check mean different things per format.
+    formats: dict = field(default_factory=dict)
     per_tensor: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
 
@@ -304,6 +308,7 @@ def measure_gguf_dir(paths, group_size: int = 128) -> BitReport:
         tot_n += info.params
         for tname, n in (info.weight_type_hist or {}).items():
             rep.per_tensor[tname] = rep.per_tensor.get(tname, 0) + n
+            rep.formats[tname] = rep.formats.get(tname, 0) + n
             widths.add(int(_gguf_code(tname)))
     if tot_n:
         rep.params = tot_n
@@ -349,20 +354,22 @@ TIERS = (
 # research problem; 4-bit is one `llama-quantize` invocation, and the sub4 crown came in at 4.61 GB
 # against a 5.0 GB cap — a stock Q4_K_M, of which thousands already exist.
 #
-# The numbers below are a judgement, not a measurement, and they are weighted by PRODUCT VALUE
-# rather than by difficulty. Binary is the hardest problem on the board and pays third, because a
-# binary winner today needs PrismML's private fork to run and therefore reaches nobody. sub2 pays
-# most because `Q2_0` group-64 is the only format on this table that runs GPU-accelerated on a
-# phone through apps that already exist — it is the tier that delivers the subnet's stated promise.
+# The numbers below are a judgement, not a measurement. THREE ORDERINGS COINCIDE HERE, which is why
+# the ladder is simply steepest at the bottom: fewer bits is a smaller file, a smaller file fits
+# more phones and decodes faster (decode is memory-bandwidth-bound, so halving the weights roughly
+# doubles tokens/sec), and fewer bits is also the harder research problem. Smallest = fastest =
+# hardest = best product, all at once.
 #
-# The gradient still holds: with today's field a sub4 king takes 37% and moves to 50% by taking
-# sub2. If the goal ever shifts from shipping to phones back to pushing the compression frontier,
-# invert this — pay binary and ternary most — and the rest of the machinery is unchanged.
+# THIS WAS BRIEFLY WEIGHTED THE OTHER WAY, on the belief that only `Q2_0` reached a phone and that
+# sub-2-bit formats needed PrismML's private fork. That was wrong: mainline llama.cpp carries Metal
+# kernels for `Q1_0` (their 1.125 bpw format, since upstreamed), `IQ1_S`, `IQ1_M`, `IQ2_XXS` and
+# `Q2_0`. Every tier here produces something a phone can run, so there is no reason left to pay
+# less for the smaller artifact. See UNRUNNABLE_FORMATS for the one genuine exception.
 TIER_EMISSION_WEIGHT = {
-    "sub2": 0.40,      # the phone tier: Q2_0 g64, mainline + Metal, ~2.35 GB. This is the promise.
-    "ternary": 0.25,   # frontier, ~1.8 GB — but no Metal path yet, so it wins a trophy not a phone
-    "binary": 0.20,    # research frontier; a winner today needs a private fork to run at all
-    "sub4": 0.15,      # the on-ramp and the calibration control. Commodity: Q4_K_M is everywhere
+    "binary": 0.40,    # ~1.2 GB. Smallest, fastest, hardest — and Bonsai proves it is achievable
+    "ternary": 0.25,   # ~1.8 GB
+    "sub2": 0.20,      # ~2.3 GB
+    "sub4": 0.15,      # ~4.6 GB. The on-ramp and the calibration control; Q4_K_M is a commodity
 }
 
 
@@ -372,11 +379,28 @@ def emission_weight(tier_name: str, n_tiers: int = 4) -> float:
     return TIER_EMISSION_WEIGHT.get(tier_name, 1.0 / max(1, n_tiers))
 
 
+# Quantisation formats that fit a tier's bit budget and then cannot be RUN on the device this
+# subnet promises. A crown must be downloadable and usable, not merely small.
+#
+# `TQ1_0` is the whole list, and it is a real trap rather than a hypothetical: at 1.6875 bpw it
+# passes the binary and ternary budgets comfortably, and mainline llama.cpp ships NO Metal kernels
+# for it — verified against ggml-metal.metal, which carries get_rows/dequantize for q1_0, q2_0,
+# tq2_0, iq1_s, iq1_m, iq2_xxs and q4_K, and nothing for tq1_0. A TQ1_0 crown would be a champion
+# that crashes on every iPhone. Its sibling TQ2_0 is fine.
+UNRUNNABLE_FORMATS = {
+    "TQ1_0": "mainline llama.cpp has no Metal kernels for TQ1_0 — it cannot run on Apple GPU. "
+             "Use TQ2_0, Q2_0, Q1_0, IQ1_S or IQ1_M.",
+}
+
+
 def bit_tier_gate(rep: BitReport, tier: BitTier) -> tuple[bool, list[str]]:
-    """Fail-closed. Both budgets bind: the achievement AND the artifact."""
+    """Fail-closed. THREE budgets bind: the achievement, the artifact, and whether it runs."""
     r: list[str] = []
     if rep.params <= 0:
         r.append("no weights measured")
+    for fmt, why in UNRUNNABLE_FORMATS.items():
+        if fmt in (rep.formats or {}):
+            r.append(f"unrunnable format {fmt}: {why}")
     if rep.code_bits > tier.max_code_bits + 1e-6:
         r.append(f"code bits {rep.code_bits} exceed {tier.name} budget {tier.max_code_bits}")
     if rep.container_bits > tier.max_container_bits + 1e-6:
