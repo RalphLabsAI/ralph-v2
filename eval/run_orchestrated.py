@@ -64,6 +64,11 @@ class Config:
     # Whether to write the weight vector on chain. Separate from `live` on purpose: a shakedown
     # wants a real anchored trail without moving anyone's emission.
     set_weights: bool = True
+    # Mirror each crowned artifact into one repo under our org, verified against the signed
+    # record. On by default: a crown nobody can find is not a product, and the miner repos it
+    # lives in are named after miners and can be overwritten at will.
+    publish_crowns: bool = True
+    crowns_repo: str = "RalphLabsAI/ralph-crowns"
     # (cloud/region) pairs whose IMAGE cannot run a round — e.g. no CUDA toolkit, so llama.cpp
     # falls back to the CPU wheel and every submission scores ~6x slower on a GPU we are paying for.
     exclude_regions: tuple = ()
@@ -97,6 +102,8 @@ class Config:
             tiers=tuple(x.strip() for x in e("RALPH_TIERS", "").split(",") if x.strip())
                   or cls.tiers,
             set_weights=e("RALPH_SET_WEIGHTS", "1") != "0",
+            publish_crowns=e("RALPH_PUBLISH_CROWNS", "1") != "0",
+            crowns_repo=e("RALPH_CROWNS_REPO", "") or cls.crowns_repo,
             exclude_regions=tuple(x.strip() for x in e("RALPH_GPU_EXCLUDE", "").split(",")
                                   if x.strip()),
             references=tuple(x.strip() for x in e("RALPH_REFERENCES", "").split(",") if x.strip()),
@@ -376,6 +383,26 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     else:
         ok = chain.set_weights(rec.weights)
         w(f"  weights   : {rec.weights} -> set={ok} (live={cfg.live})\n")
+
+    # MIRROR THE CROWNS, AFTER the round is anchored and paid. Two rules make this safe to run
+    # inside the round rather than as a chore somebody remembers:
+    #
+    #   * it is LAST. Everything above is the round; a crown that fails to mirror leaves a round
+    #     that is still scored, signed, published, anchored and paid.
+    #   * it cannot raise. `publish()` swallows and reports, because a mirroring bug must not
+    #     convert a successful round into a failed one at the final step.
+    #
+    # It is also idempotent — a tier whose king did not change is skipped after one small read,
+    # so an unchanged crown costs nothing rather than re-uploading gigabytes every round.
+    if cfg.publish_crowns:
+        from .publish_crowns import publish as _publish_crowns
+        w(f"  crowns    : mirroring to {cfg.crowns_repo}…\n")
+        rep_c = _publish_crowns(repo=cfg.crowns_repo, push=True, out=w)
+        if not rep_c["ok"]:
+            w("  crowns    : NOT MIRRORED — the round stands; re-run "
+              "`python -m eval.publish_crowns --push` once the cause is fixed\n")
+    else:
+        w("  crowns    : not mirrored (RALPH_PUBLISH_CROWNS=0)\n")
     w(f"  cost      : ~${res['cost']:.2f}\n")
     return 0
 

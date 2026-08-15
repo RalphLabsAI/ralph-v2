@@ -4862,9 +4862,84 @@ def test_a_validator_never_burns_to_its_own_hotkey():
     assert ro.set_burn_weights() is False
 
 
+def test_crown_mirroring_can_never_fail_a_round_that_succeeded():
+    """MIRRORING RUNS INSIDE THE ROUND, so it has to be incapable of breaking one.
+
+    By the time it runs the round is scored, signed, published, anchored and paid — all of that is
+    correct whatever happens next. A crown that fails to mirror is a follow-up chore, not a failed
+    round, and `publish()` must therefore swallow anything the publisher throws and report it."""
+    import eval.publish_crowns as pc
+
+    real = pc.main
+    try:
+        pc.main = lambda argv=None: (_ for _ in ()).throw(RuntimeError("HF is down"))
+        rep = pc.publish(repo="x/y", push=True)
+        assert rep["ok"] is False and rep["rc"] != 0, rep
+        assert "HF is down" in rep["log"], rep["log"]
+
+        pc.main = lambda argv=None: (_ for _ in ()).throw(SystemExit(2))
+        assert pc.publish(repo="x/y", push=True)["ok"] is False
+
+        pc.main = lambda argv=None: 0
+        assert pc.publish(repo="x/y", push=True)["ok"] is True
+    finally:
+        pc.main = real
+
+    # the round's own switch, and the repo it defaults to
+    from eval.run_orchestrated import Config
+    import os as _os
+    old = {k: _os.environ.get(k) for k in ("RALPH_PUBLISH_CROWNS", "RALPH_CROWNS_REPO")}
+    try:
+        for k in old:
+            _os.environ.pop(k, None)
+        c = Config.from_env()
+        assert c.publish_crowns is True and c.crowns_repo == "RalphLabsAI/ralph-crowns", c
+        _os.environ["RALPH_PUBLISH_CROWNS"] = "0"
+        assert Config.from_env().publish_crowns is False
+    finally:
+        for k, v in old.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
+def test_a_published_crown_merges_the_two_rows_a_held_throne_leaves():
+    """A HELD CROWN APPEARS TWICE and neither row is publishable alone.
+
+    The incumbent row carries the re-score the crown decision actually used; the challenger row
+    carries the bit measurement, because an incumbent is re-scored rather than re-ingested and its
+    code_bits/container_bits/params are all zero. Taking the incumbent wholesale renders a 4.61 GB
+    model as "0.0 bits, 0.00 GB", which is exactly how the first draft of the card described it."""
+    from eval.publish_crowns import current_kings
+
+    rec = {"events": [{"tier": "sub4", "action": "hold", "king": "M"}],
+           "submissions": [
+               {"model_id": "M", "role": "challenger", "tier": "sub4", "retention": 0.3030,
+                "code_bits": 4.0, "container_bits": 4.5, "params": 8_190_427_136,
+                "artifact_uri": "hf://miner/m@rev"},
+               {"model_id": "M", "role": "incumbent", "tier": "sub4", "retention": 0.2875,
+                "code_bits": 0.0, "container_bits": 0.0, "params": 0, "artifact_uri": ""},
+           ]}
+    k = current_kings(rec)["sub4"]
+    assert k["retention"] == 0.2875, "must use the re-score, not the luckier challenger number"
+    assert k["code_bits"] == 4.0 and k["container_bits"] == 4.5, k
+    assert k["params"] == 8_190_427_136, k
+    assert k["artifact_uri"] == "hf://miner/m@rev", "the locator must survive the merge"
+
+    # a freshly crowned model has only the one row, and must still publish
+    fresh = {"events": [{"tier": "ternary", "action": "crown", "king": "N"}],
+             "submissions": [{"model_id": "N", "role": "challenger", "tier": "ternary",
+                              "retention": 0.24, "code_bits": 1.714, "container_bits": 2.36,
+                              "params": 1, "artifact_uri": "hf://a/b@c"}]}
+    assert current_kings(fresh)["ternary"]["code_bits"] == 1.714
+
+
 def main() -> int:
     _isolate_env()
     tests = [test_a_validator_never_burns_to_its_own_hotkey,
+             test_crown_mirroring_can_never_fail_a_round_that_succeeded,
+             test_a_published_crown_merges_the_two_rows_a_held_throne_leaves,
              test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,

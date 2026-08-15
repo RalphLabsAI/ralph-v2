@@ -22,9 +22,9 @@ than publishing it. Without that step this script would launder whatever the min
 to hold today into a repo carrying our name — which is worse than not mirroring at all, because it
 would carry our name.
 
-    python -m eval.publish_champions                 # verify everything, publish nothing
-    python -m eval.publish_champions --push          # verify, then upload
-    env: HF_TOKEN (write scope), RALPH_CHAMPIONS_REPO
+    python -m eval.publish_crowns                 # verify everything, publish nothing
+    python -m eval.publish_crowns --push          # verify, then upload
+    env: HF_TOKEN (write scope), RALPH_CROWNS_REPO
 """
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ import sys
 import urllib.request
 
 TRAIL = "https://huggingface.co/datasets/RalphLabsAI/ralph-v2-shakedown/resolve/main"
-CHAMPIONS_REPO = os.environ.get("RALPH_CHAMPIONS_REPO", "RalphLabsAI/ralph-qwen3-8b")
-MANIFEST = "champions.json"
+CROWNS_REPO = os.environ.get("RALPH_CROWNS_REPO", "RalphLabsAI/ralph-crowns")
+MANIFEST = "crowns.json"
 
 
 def _get(url: str) -> dict:
@@ -81,12 +81,24 @@ def current_kings(record: dict) -> dict:
         if not rows:
             print(f"  !! {tier}: record names king {model_id[:12]}… but carries no submission for it")
             continue
-        # PREFER THE INCUMBENT ROW. A held crown appears TWICE — once as the challenger it was
-        # submitted as, once as the incumbent re-scored on this round's exam — and in round 2 the
-        # same bytes scored 0.3030 and 0.2875, a 0.0155 spread that is the measured run-to-run
-        # floor. The re-score is the number the crown decision actually used, so publishing the
-        # challenger row would put the luckier of two measurements on the card.
-        out[tier] = next((s for s in rows if s.get("role") == "incumbent"), rows[0])
+        # MERGED, because the two facts live in DIFFERENT ROWS. A held crown appears twice — once
+        # as the artifact its miner submitted, once as the incumbent re-scored on this round's
+        # exam — and neither row alone is publishable:
+        #
+        #   retention   comes from the INCUMBENT row. In round 2 the same bytes scored 0.3030 as a
+        #               challenger and 0.2875 re-scored, a 0.0155 spread that is exactly the
+        #               measured run-to-run floor. The re-score is what the crown decision used;
+        #               publishing the challenger's number puts the luckier measurement on the card.
+        #   code_bits   comes from the CHALLENGER row. The incumbent is re-scored, not re-ingested,
+        #   container   so it carries no bit measurement at all — 0.0/0.0/0 params. Taking those
+        #   params      renders the crown as "0.0 bits, 0.00 GB", which is how the first draft of
+        #               this card described a 4.61 GB model.
+        base = next((s for s in rows if s.get("role") == "incumbent"), rows[0])
+        measured = next((s for s in rows if (s.get("params") or 0) > 0), base)
+        out[tier] = {**base, **{k: measured.get(k) for k in
+                                ("code_bits", "container_bits", "params")},
+                     # the locator must come from the row that was actually ingested
+                     "artifact_uri": measured.get("artifact_uri") or base.get("artifact_uri", "")}
     return out
 
 
@@ -132,7 +144,7 @@ base_model: Qwen/Qwen3-8B
 tags: [gguf, quantized, compression, bittensor]
 ---
 
-# Ralph champions — Qwen3-8B
+# Ralph crowns — Qwen3-8B
 
 The **reigning crowned compressions** from [Bittensor netuid 40](https://github.com/RalphLabsAI/ralph-v2),
 one file per bit tier. Every round re-scores the incumbents against a fresh exam; when a crown
@@ -156,10 +168,10 @@ Round record, with the exam, every per-sample measurement and the crown decision
 
 Each file is byte-identical to the artifact the round actually scored: it is downloaded from the
 miner's own repo at the **pinned commit** named in the signed record, re-hashed, and published only
-if the hash matches the `model_id` in that record. `champions.json` carries the source repo and
+if the hash matches the `model_id` in that record. `crowns.json` carries the source repo and
 revision for every file, so you can fetch the original and check it yourself.
 
-Credit for the weights belongs to the miners named in `champions.json`. This repo is a verified
+Credit for the weights belongs to the miners named in `crowns.json`. This repo is a verified
 mirror with a stable name, not the origin.
 
 ## Running them
@@ -171,11 +183,41 @@ the smaller tiers are the ones that fit comfortably.
 """
 
 
+def publish(repo: str = "", push: bool = True, out=None) -> dict:
+    """Mirror the current crowns. Returns a report; NEVER raises.
+
+    CALLED AT THE END OF A ROUND, which is why it cannot raise. The round is already scored,
+    signed, published and anchored by the time this runs — that work is done and correct whatever
+    happens here. A mirroring failure must show up as a line in the log and a follow-up, not as a
+    round that reports failure after having succeeded.
+
+    Idempotent: a crown already published at the same `model_id` is skipped, so an unchanged tier
+    costs one small HTTP read rather than re-uploading gigabytes every round."""
+    import io as _io
+    buf = _io.StringIO()
+    real = sys.stdout
+    try:
+        sys.stdout = buf
+        rc = main(["--repo", repo or CROWNS_REPO] + (["--push"] if push else []))
+    except SystemExit as e:                       # argparse/`--push` without a token
+        rc = int(getattr(e, "code", 1) or 0)
+    except Exception as e:
+        rc = 1
+        buf.write(f"\ncrown publishing raised {type(e).__name__}: {e}\n")
+    finally:
+        sys.stdout = real
+    text = buf.getvalue()
+    if out is not None:
+        for line in text.splitlines():
+            out(f"    {line}\n")
+    return {"ok": rc == 0, "rc": rc, "log": text}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--push", action="store_true",
                     help="actually upload; without it everything is verified and nothing is written")
-    ap.add_argument("--repo", default=CHAMPIONS_REPO)
+    ap.add_argument("--repo", default=CROWNS_REPO)
     a = ap.parse_args(argv)
 
     record, record_url = latest_record()
@@ -193,13 +235,22 @@ def main(argv=None) -> int:
     except Exception:
         published = {}
 
-    manifest, staged = dict(published), []
+    manifest, staged, failed = dict(published), [], []
     for tier, sub in sorted(kings.items()):
         if (published.get(tier) or {}).get("model_id") == sub.get("model_id"):
             print(f"  {tier}: already published at this model_id — skipping")
             continue
-        path = fetch_and_verify(sub, tier)
+        # PER TIER, so one bad crown cannot take the others down with it. A miner deleting their
+        # repo, a revision going missing, a dependency absent on this box — each of those is a
+        # reason to skip ONE tier and say so, not a reason to leave the other crowns unmirrored.
+        try:
+            path = fetch_and_verify(sub, tier)
+        except Exception as e:
+            print(f"  {tier}: FAILED — {type(e).__name__}: {e}")
+            failed.append(tier)
+            continue
         if not path:
+            failed.append(tier)
             continue
         repo, rev = parse_artifact_uri(sub["artifact_uri"])
         manifest[tier] = {
@@ -212,6 +263,11 @@ def main(argv=None) -> int:
         staged.append((tier, path, f"ralph-qwen3-8b-{tier}.gguf"))
 
     if not staged:
+        # A NON-ZERO EXIT WHEN SOMETHING FAILED, even though nothing was staged — otherwise a round
+        # whose only crown could not be fetched reports "nothing new to publish" and looks healthy.
+        if failed:
+            print(f"\nnothing published; {len(failed)} tier(s) failed: {', '.join(failed)}")
+            return 1
         print("\nnothing new to publish")
         return 0
 
@@ -241,11 +297,14 @@ def main(argv=None) -> int:
                         commit_message=f"{tier} champion, round {record.get('round')}")
     api.upload_file(path_or_fileobj=json.dumps(manifest, indent=1, sort_keys=True).encode(),
                     path_in_repo=MANIFEST, repo_id=a.repo, repo_type="model",
-                    commit_message=f"champions as of round {record.get('round')}")
+                    commit_message=f"crowns as of round {record.get('round')}")
     api.upload_file(path_or_fileobj=card.encode(), path_in_repo="README.md",
                     repo_id=a.repo, repo_type="model",
-                    commit_message=f"champions as of round {record.get('round')}")
+                    commit_message=f"crowns as of round {record.get('round')}")
     print(f"\npublished -> https://huggingface.co/{a.repo}")
+    if failed:
+        print(f"  !! {len(failed)} tier(s) did NOT mirror: {', '.join(failed)}")
+        return 1
     return 0
 
 
