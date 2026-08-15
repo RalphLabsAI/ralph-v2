@@ -7,22 +7,15 @@ pynacl                 # ed25519 signing of round records (eval/signing.py)
 # `--follow` spins forever printing the same ImportError.
 huggingface_hub        # fetch the published trail (eval/publish.py)
 
-# ...and to VOTE (--set-weights) an auditor additionally needs a Bittensor wallet:
-#   bittensor>=10.5,<11
+# EVERYTHING ELSE IS IN A SEPARATE FILE, and is a real `pip install -r`, not a comment. The chain
+# SDK used to be documented here as a version range and never pinned anywhere installable, so the
+# only working copy on the dev box belonged to ANOTHER PROJECT and whatever happened to be there
+# was what ran:
 #
-# THE UPPER BOUND IS LOAD-BEARING. eval/chain_bittensor.py is written against the 10.x SDK:
-# `bt.Subtensor` (the lowercase `bt.subtensor` alias is gone), `Subtensor.metagraph(netuid)`,
-# `get_commitment(netuid, uid)`, `set_commitment(wallet, netuid, data)`. Bittensor 11.x is a
-# ground-up rewrite with none of those — its Metagraph is a dataclass carrying `commitments` and
-# the Subtensor exposes namespaces instead of methods. That needs a new adapter, not a bump.
-
-# Real model runs (the validator, and auditors at L2/L3, GPU) additionally need:
-#   torch
-#   transformers
-#   safetensors
-#   llama-cpp-python    # GGUF students. NOT optional: integer safetensors measure at their full
-#                       # container width (int8 -> 8.0 bpw) so no safetensors artifact can clear
-#                       # sub4's 4.0/5.0, and a 4-bit-packed one fails the pinned-parent element
-#                       # count. GGUF is the only format that can pass the tiers at all.
-#   datasets            # only for the live trajectory pool (eval/pool.py, eval/corpus_hf.py)
-# and, for the code-axis grader sandbox in production, the system package `bubblewrap` (bwrap).
+#   pip install -r requirements-chain.txt    # reading commitments, setting weights, anchoring
+#   pip install -r requirements-gpu.txt      # scoring real models (the rented box, L2/L3 audits)
+#
+# The split is deliberate: `python -m tests.test_crown_path` must stay installable on a box with no
+# wallet, no GPU and no network, and folding either of those in would make it a torch-sized install.
+#
+# Production also needs the system package `bubblewrap` (bwrap) for the code-axis grader sandbox.

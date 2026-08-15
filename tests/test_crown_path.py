@@ -2115,34 +2115,47 @@ def test_miner_submit_and_chain_adapter():
         # the validator adapter parses the miner's envelope, and refuses anything else. The
         # subtensor and metagraph are injected rather than wrapped: since v1 was retired this talks
         # to bittensor directly, so the seam that has to stay testable is the SDK boundary.
-        class _MG:
-            hotkeys = ["hkA", "hkB", "hkC"]
-            coldkeys = ["ckA", "ckB", "ckC"]
+        # STUBBED AT THE bittensor 11.x SURFACE, which is where the real seam is: typed storage
+        # items through `query_map(item, params)`, `block` as a property, `block_info(n).hash`.
+        # 10.x's `get_commitment` / `metagraph()` / `.substrate` are gone from the SDK, so a stub
+        # offering them would be testing an adapter nobody runs.
+        # `_item` is patched to a plain string so this suite needs no `bittensor` on the box —
+        # see chain_bittensor._item for why that indirection exists.
+        import eval.chain_bittensor as _cb
+        _real_item = _cb._item
+        _cb._item = lambda container, name: f"{container}.{name}"
+
+        def _wrap(raw, blk):
+            return {"block": blk, "info": {"fields": [{"Raw64": "0x" + raw.encode().hex()}]}}
+
+        _COMMITS = {"hkA": _wrap(st["envelope"], 100),
+                    "hkB": _wrap("legacy-v1-handshake", 100),
+                    "hkC": _wrap('{"v":9,"tier":"x"}', 100)}
+        _KEYS = {0: "hkA", 1: "hkB", 2: "hkC"}
+        _OWNER = {"hkA": "ckA", "hkB": "ckB", "hkC": "ckC"}
+
+        class _Blk:
+            def __init__(self, n): self.number, self.hash = n, f"0x{n}"
 
         class _Sub:
-            def get_commitment(self, netuid, uid):
-                return {0: st["envelope"], 1: "legacy-v1-handshake",
-                        2: '{"v":9,"tier":"x"}'}[uid]
+            block = 1234
 
-            # commitments_map is preferred; give it the write heights so the ordering check runs
-            class _Substrate:
-                def query_map(self, module, storage_function, params):
-                    def wrap(raw, blk):
-                        return {"block": blk, "info": {"fields": [
-                            {"Raw64": "0x" + raw.encode().hex()}]}}
-                    return [("hkA", wrap(st["envelope"], 100)),
-                            ("hkB", wrap("legacy-v1-handshake", 100)),
-                            ("hkC", wrap('{"v":9,"tier":"x"}', 100))]
-            substrate = _Substrate()
+            def block_info(self, n):
+                return _Blk(n)
 
-            def metagraph(self, netuid):
-                return _MG()
+            def query_map(self, item, params=None, *, block=None):
+                if item == "Commitments.CommitmentOf":
+                    return list(_COMMITS.items())
+                if item == "SubtensorModule.Keys":
+                    return list(_KEYS.items())
+                raise KeyError(item)
 
-            def get_current_block(self):
-                return 1234
-
-            def get_block_hash(self, b):
-                return f"0x{b}"
+            def query(self, item, params=None, *, block=None):
+                if item == "SubtensorModule.Owner":
+                    return _OWNER.get(params[0], "")
+                if item == "Commitments.CommitmentOf":
+                    return _COMMITS.get(params[1], {})
+                raise KeyError(item)
 
         io = BittensorChainIO(subtensor=_Sub(), netuid=40,
                               fetch_dir_for=lambda hk, uri: str(d) if hk == "hkA" else "",
@@ -2182,13 +2195,24 @@ def test_miner_submit_and_chain_adapter():
         assert len(root_live) == 64
 
         class _Empty(_Sub):
-            def get_commitment(self, netuid, uid):
-                return None
+            """A subnet where nobody has committed. It must override the SAME seam the adapter
+            reads — overriding 10.x's `get_commitment`/`.substrate` left it inheriting `_Sub`'s
+            `query_map`, so it silently became a subnet WITH submissions and the assertion below
+            compared a value against itself."""
 
-            class _NoSubstrate:
-                def query_map(self, module, storage_function, params):
+            def query_map(self, item, params=None, *, block=None):
+                if item == "Commitments.CommitmentOf":
                     return []
-            substrate = _NoSubstrate()
+                return super().query_map(item, params, block=block)
+
+            def query(self, item, params=None, *, block=None):
+                # BOTH PATHS, because an empty map makes `read_commitments` fall back to the
+                # per-uid read — that degradation is deliberate, and a stub that empties only the
+                # map keeps serving commitments through the fallback and silently stops being an
+                # empty subnet at all.
+                if item == "Commitments.CommitmentOf":
+                    return {}
+                return super().query(item, params, block=block)
 
         bare = BittensorChainIO(subtensor=_Empty(), netuid=40)
         assert bare.commit_root(1100, 1234) != root_live, \
@@ -3773,12 +3797,27 @@ def test_an_unrevealed_submission_is_refused_not_waved_through():
         env["ch"], env["salt"] = h, salt
         raw = _json.dumps(env, separators=(",", ":"), sort_keys=True)
 
-        class _MG:
-            hotkeys = ["hkA"]; coldkeys = ["ckA"]
+        import eval.chain_bittensor as _cb
+        _real_item2 = _cb._item
+        _cb._item = lambda container, name: f"{container}.{name}"
+
+        _WRAPPED = {"hkA": {"block": 10, "info": {
+            "fields": [{"Raw64": "0x" + raw.encode().hex()}]}}}
 
         class _Sub:
-            def metagraph(self, netuid): return _MG()
-            def get_commitment(self, netuid, uid): return raw
+            block = 100
+
+            def query_map(self, item, params=None, *, block=None):
+                if item == "Commitments.CommitmentOf":
+                    return list(_WRAPPED.items())
+                if item == "SubtensorModule.Keys":
+                    return [(0, "hkA")]
+                raise KeyError(item)
+
+            def query(self, item, params=None, *, block=None):
+                if item == "SubtensorModule.Owner":
+                    return "ckA"
+                return _WRAPPED.get(params[1], {})
 
         io = BittensorChainIO(subtensor=_Sub(), netuid=40,
                               fetch_dir_for=lambda hk, uri: str(d))
