@@ -99,6 +99,14 @@ class RoundRecord:
     # reconciling `weights` against the emission actually written needs to see where the remainder
     # went, and "the vector does not sum to 1" is otherwise indistinguishable from a bug.
     unclaimed: float = 0.0
+    # WHEN THE ROUND RAN. Epoch seconds, operator-asserted — nothing in a signed record can prove
+    # its own clock. Published so a reader can see the subnet's CADENCE: how often rounds happen,
+    # how long one takes, whether a gap was a pause or a failure. Rounds 1 and 2 predate these and
+    # carry 0; they are sparse for the same reason `rejected` is, so those two still digest to
+    # exactly what they signed. A timestamp nobody has to take on trust is in the trail repo's own
+    # commit history.
+    started_at: float = 0.0
+    published_at: float = 0.0
     # Tolerance is derived from the MEASURED floor, not assumed. The old 0.02 default was ~200x
     # looser than the measured forward-pass floor, i.e. it would certify a materially wrong
     # re-run. build_round_record() sets this from `noise` when one is supplied.
@@ -125,7 +133,7 @@ class RoundRecord:
     # that must vanish is 0.0 rather than an empty list. Rounds 1 and 2 are anchored and predate
     # it; both had every live tier claimed, so 0.0 is also the honest value for them, and omitting
     # it leaves their bytes exactly as signed.
-    _SPARSE = ("rejected", "unclaimed")
+    _SPARSE = ("rejected", "unclaimed", "started_at", "published_at")
 
     def canonical(self) -> str:
         d = {k: v for k, v in asdict(self).items()
@@ -175,7 +183,8 @@ def build_round_record(round_no: int, commit_root: str, round_nonce: str, teache
                        events: list, weights: dict, manifest: dict | None = None,
                        noise: dict | None = None, safety: float = 3.0,
                        prev_anchor: str = "", rejected: list | None = None,
-                       unclaimed: float = 0.0) -> RoundRecord:
+                       unclaimed: float = 0.0, started_at: float = 0.0,
+                       published_at: float = 0.0) -> RoundRecord:
     def _pt(p):
         if not isinstance(p, dict):
             return {"rollout_id": getattr(p, "rollout_idx", None), "k": getattr(p, "k", None),
@@ -215,7 +224,9 @@ def build_round_record(round_no: int, commit_root: str, round_nonce: str, teache
                       prev_anchor=prev_anchor,
                       # COPIED, for the same reason `events` is
                       rejected=[[str(hk), list(rs)] for hk, rs in (rejected or [])],
-                      unclaimed=round(float(unclaimed or 0.0), 6))
+                      unclaimed=round(float(unclaimed or 0.0), 6),
+                      started_at=float(started_at or 0.0),
+                      published_at=float(published_at or 0.0))
     if noise:
         # derive the acceptance band from the MEASURED floor instead of a fixed 0.02, which was
         # ~200x looser than measured and would certify a materially wrong re-run.

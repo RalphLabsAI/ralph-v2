@@ -4377,7 +4377,8 @@ def test_a_sparse_field_cannot_move_an_already_published_digest():
         "the canonical form drifted from what a record published before this field would digest to"
 
     # ...and a real value IS signed, for each of them
-    NONEMPTY = {"rejected": [["5XYZ", ["committed but not revealed"]]], "unclaimed": 0.6}
+    NONEMPTY = {"rejected": [["5XYZ", ["committed but not revealed"]]], "unclaimed": 0.6,
+                "started_at": 1_786_030_000.0, "published_at": 1_786_033_600.0}
     for f in RoundRecord._SPARSE:
         assert f in NONEMPTY, f"sparse field {f!r} has no non-empty case in this test"
         full = _rec(**{f: NONEMPTY[f]})
