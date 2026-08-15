@@ -4824,9 +4824,48 @@ def test_a_reference_spec_is_parsed_and_a_typo_never_stops_a_round():
     assert p.as_job()["references"] == refs
 
 
+def test_a_validator_never_burns_to_its_own_hotkey():
+    """ON NETUID 40 THE DEFAULT BURN UID IS US. Verified on chain: uid 0 is
+    5HijSRHd9wUmk51UE8Kia7vmx6kD2jwqJLn9bY1frQ4aiTUs, the validator's own hotkey. Bittensor has no
+    designated burn address — uid 0 is whoever registered first, and here that is us.
+
+    `set_burn_weights` is called by the AUDITOR, which third parties are meant to run. With the
+    shipped default an independent auditor would have written 100% of its weight to us and called
+    it a burn. That is a self-vote wearing the word "burn", and it would be found."""
+    import eval.chain_bittensor as _cb
+    _cb._item = lambda container, name: f"{container}.{name}"
+    from eval.chain_bittensor import BittensorChainIO
+
+    class _Sub:
+        block = 1
+
+        def query_map(self, item, params=None, *, block=None):
+            return [(0, "US"), (1, "SOMEONE_ELSE")]
+
+        def query(self, item, params=None, *, block=None):
+            return ""
+
+        def submit_call(self, call, wallet):
+            raise AssertionError("signed a self-burn instead of refusing it")
+
+    class _W:
+        class hotkey:
+            ss58_address = "US"
+
+    ours = BittensorChainIO(subtensor=_Sub(), wallet=_W(), netuid=40, read_only=False, burn_uid=0)
+    assert ours.set_burn_weights() is False
+    assert any("REFUSED" in str(e) for e in ours.log), ours.log
+    assert any("own hotkey" in str(e) for e in ours.log), ours.log
+
+    # read_only short-circuits before the guard, so nothing is even considered
+    ro = BittensorChainIO(subtensor=_Sub(), wallet=_W(), netuid=40, read_only=True, burn_uid=0)
+    assert ro.set_burn_weights() is False
+
+
 def main() -> int:
     _isolate_env()
-    tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
+    tests = [test_a_validator_never_burns_to_its_own_hotkey,
+             test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
              test_content_identity_and_commit_reveal, test_round_record_signature,

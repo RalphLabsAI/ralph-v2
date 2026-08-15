@@ -299,9 +299,23 @@ class BittensorChainIO:
     def set_burn_weights(self) -> bool:
         """Everything to the burn uid. What a validator writes when it has nothing it is willing to
         pay: a validator that sets NO weights contributes nothing to consensus and eventually
-        crosses `activity_cutoff` into inactive, which is a worse outcome than an honest burn."""
+        crosses `activity_cutoff` into inactive, which is a worse outcome than an honest burn.
+
+        REFUSES TO BURN TO A HOTKEY WE CONTROL, because on netuid 40 the default `burn_uid=0` IS
+        the validator's own hotkey — verified on chain: uid 0 is
+        5HijSRHd9wUmk51UE8Kia7vmx6kD2jwqJLn9bY1frQ4aiTUs. Bittensor has no designated burn address;
+        uid 0 is simply whoever registered first, and here that is us. This method is called by the
+        AUDITOR, which third parties are meant to run — so with the shipped default an independent
+        auditor would have written 100% of its weight to us and called it a burn. That is not a
+        burn, it is a self-vote wearing one's name, and it would be found."""
         if self.read_only:
             self.log.append(("set_burn_weights", self.burn_uid))
+            return False
+        target = self.mg().get(int(self.burn_uid))
+        if target and target == self.me:
+            self.log.append(("set_burn_weights", "REFUSED",
+                             f"uid {self.burn_uid} is this validator's own hotkey — set "
+                             f"RALPH_BURN_UID to a uid you do not control"))
             return False
         return self._submit(self._set_weights_call([int(self.burn_uid)], [1.0]),
                             "set_burn_weights")
