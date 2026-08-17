@@ -266,6 +266,24 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
     for s in challengers:
         by_tier[s.get("tier") or "?"] = by_tier.get(s.get("tier") or "?", 0) + 1
     rejected = rec.get("rejected") or []
+    kings = kings_from_events(rec.get("events") or [])
+
+    # THE ROWS, PROJECTED HARD. The record's submissions carry `steps`, `effects`, `slices` and
+    # `per_point` — megabytes of per-sample measurement that exist so an auditor can recompute the
+    # score, and that have no business in a status snapshot a browser polls. Ten fields answer what
+    # a miner comes here to ask: was I in this round, what did I score, did I win, and if I am not
+    # in the list, why not.
+    def _row(s):
+        crowned = bool(s.get("model_id")) and kings.get(s.get("tier")) == s.get("model_id")
+        return {"miner": s.get("miner", ""), "tier": s.get("tier", ""),
+                "role": s.get("role", "challenger"),
+                "retention": s.get("retention"), "retention_lb": s.get("retention_lb"),
+                "code_bits": s.get("code_bits"), "container_bits": s.get("container_bits"),
+                "artifact_uri": s.get("artifact_uri", ""),
+                "crowned": crowned,
+                # A submission that was scored but GATED is not the same as one that scored badly,
+                # and the reason is the only thing its miner can act on.
+                "gates_ok": bool(s.get("gates_ok", True)), "reasons": list(s.get("reasons") or [])}
     n = int(rec.get("round") or 0)
     started, published = float(rec.get("started_at") or 0), float(rec.get("published_at") or 0)
     return {
@@ -277,7 +295,11 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
         "rejected_detail": [{"hotkey": r[0], "reasons": r[1]} for r in rejected
                             if isinstance(r, (list, tuple)) and len(r) == 2],
         "by_tier": by_tier,
-        "crowns": kings_from_events(rec.get("events") or []),
+        # Every row, best first, incumbents included and labelled — the re-score is half of the
+        # paired dethrone test, so hiding it would leave the margin unexplainable.
+        "submissions": sorted((_row(s) for s in subs),
+                              key=lambda r: -(r["retention"] or 0)),
+        "crowns": kings,
         "events": [{"tier": e.get("tier"), "action": e.get("action")}
                    for e in (rec.get("events") or [])],
         "parent": rec.get("teacher") or "",

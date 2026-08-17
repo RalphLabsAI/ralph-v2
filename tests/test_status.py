@@ -441,8 +441,12 @@ def _tl_rec(n, subs=(), events=(), **kw):
     return d
 
 
-def _tl_sub(hk, tier="sub4", role="challenger", uri=""):
-    return {"miner": hk, "tier": tier, "role": role, "artifact_uri": uri or f"hf://{hk}/m@r1"}
+def _tl_sub(hk, tier="sub4", role="challenger", uri="", **kw):
+    d = {"miner": hk, "tier": tier, "role": role, "artifact_uri": uri or f"hf://{hk}/m@r1",
+         "retention": 0.0, "retention_lb": 0.0, "code_bits": 0.0, "container_bits": 0.0,
+         "gates_ok": True, "reasons": [], "model_id": hk}
+    d.update(kw)
+    return d
 
 
 def test_a_rescored_incumbent_is_not_counted_as_another_submission():
@@ -533,6 +537,51 @@ def test_the_timeline_is_capped_and_says_so():
     assert len(v["items"]) == ROUND_WINDOW
     assert v["total"] == len(recs) and v["window"] == ROUND_WINDOW
     assert [i["round"] for i in v["items"]][:2] == [len(recs), len(recs) - 1], "newest first"
+
+
+def test_a_round_carries_its_own_field_because_the_cohort_moves_on():
+    """WHY THE FIELD LIVES WITH THE ROUND. The Submissions panel shows the CURRENT cohort, and a
+    commitment slot holds only its latest value — so once a miner resubmits, nothing anywhere can
+    still say who was in round 1. The signed record is the only durable answer, so the field is
+    carried per round."""
+    from eval.status import _round_summary
+    r = _round_summary(_tl_rec(
+        2,
+        subs=[_tl_sub("alice", retention=0.30, code_bits=4.0, model_id="M"),
+              _tl_sub("alice", role="incumbent", retention=0.2875, code_bits=0.0, model_id="M"),
+              _tl_sub("bob", retention=0.21, code_bits=4.0, model_id="N")],
+        events=[{"tier": "sub4", "action": "hold", "king": "M"}]))
+    rows = r["submissions"]
+    assert [x["miner"] for x in rows] == ["alice", "alice", "bob"], "best retention first"
+    assert rows[0]["role"] == "challenger" and rows[1]["role"] == "incumbent"
+    assert rows[0]["crowned"] and rows[1]["crowned"] and not rows[2]["crowned"]
+    # the incumbent carries NO bit measurement — it is re-scored, not re-ingested
+    assert rows[1]["code_bits"] == 0.0 and rows[0]["code_bits"] == 4.0
+
+
+def test_the_field_never_carries_the_per_sample_measurement_blob():
+    """The record's submissions hold `steps`, `effects`, `slices` and `per_point` — megabytes that
+    exist so an auditor can recompute a score, and that have no business in a snapshot a browser
+    polls every few seconds."""
+    from eval.status import _round_summary
+    fat = _tl_sub("alice", retention=0.3)
+    fat.update(steps=["x" * 5000] * 72, effects=[[1, 2, 3, 4]] * 72,
+               slices={"a": [0.1] * 72}, per_point=[1] * 72)
+    row = _round_summary(_tl_rec(1, subs=[fat]))["submissions"][0]
+    for heavy in ("steps", "effects", "slices", "per_point"):
+        assert heavy not in row, f"{heavy} leaked into the status document"
+    assert len(json.dumps(row)) < 600, len(json.dumps(row))
+
+
+def test_a_gated_submission_shows_why_it_did_not_count():
+    """Scored-but-gated and simply-low-scoring look identical from a number alone, and only the
+    first has anything its miner can act on."""
+    from eval.status import _round_summary
+    bad = _tl_sub("carol", retention=0.19)
+    bad.update(gates_ok=False, reasons=["degenerate output: 82% subword salad"])
+    row = _round_summary(_tl_rec(3, subs=[bad]))["submissions"][0]
+    assert row["gates_ok"] is False
+    assert "salad" in " ".join(row["reasons"])
 
 
 # COLLECTED AFTER EVERY TEST IS DEFINED. This used to sit above the last few tests, which
