@@ -4935,9 +4935,31 @@ def test_a_published_crown_merges_the_two_rows_a_held_throne_leaves():
     assert current_kings(fresh)["ternary"]["code_bits"] == 1.714
 
 
+def test_preflight_actually_runs():
+    """IT DID NOT. `preflight` used GpuSpec while only `run()` imported it — a function-local
+    import does not reach another function's scope — so every call raised NameError, including the
+    one `run()` makes before renting. The live round died before spending a cent, which is the good
+    half; the bad half is that nothing here called preflight, so it sat broken from the commit that
+    added the supervisor-deadline check until the first round that tried to use it.
+
+    This test does not care WHICH problems come back. It cares that the function completes and
+    returns a list, because the failure it guards against is an exception, not a wrong verdict."""
+    import io as _io
+
+    from eval.run_orchestrated import Config, preflight
+
+    out = _io.StringIO()
+    bad = preflight(Config(), out=out)
+    assert isinstance(bad, list), bad
+    # every problem must be a sentence an operator can act on, not a bare code
+    for b in bad:
+        assert isinstance(b, str) and len(b) > 20, b
+
+
 def main() -> int:
     _isolate_env()
-    tests = [test_a_validator_never_burns_to_its_own_hotkey,
+    tests = [test_preflight_actually_runs,
+             test_a_validator_never_burns_to_its_own_hotkey,
              test_crown_mirroring_can_never_fail_a_round_that_succeeded,
              test_a_published_crown_merges_the_two_rows_a_held_throne_leaves,
              test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,

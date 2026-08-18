@@ -179,6 +179,12 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
     # `kill_at` was raised 4.5 h -> 8 h and the unit's `TimeoutStartSec` was left at 6 h, so a
     # healthy 6.5 h round would have been killed 30 minutes from the end. Nothing caught it because
     # the ladder test asserts the rings this code owns, and the outermost ring lives in a unit file.
+    # IMPORTED HERE, not borrowed from run(). `run()` imports GpuSpec inside its own body, which
+    # does not put it in this function's scope — so every call to preflight() raised NameError,
+    # including the one run() makes before renting. The live round died before it could spend a
+    # cent, which is the good half; the bad half is that nothing exercised preflight, so it sat
+    # broken from the commit that added this check until the first round that tried to use it.
+    from .orchestrator import GpuSpec
     bad.extend(_supervisor_deadline_problems(GpuSpec(
         gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,
         max_price_per_hour=cfg.max_price_per_hour)))
