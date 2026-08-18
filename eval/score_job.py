@@ -224,9 +224,11 @@ def _assert_student_gpu() -> None:
     rents an H100, runs every submission on CPU at roughly 6x the time, and says so in one log line
     nobody is watching. Observed on massedcompute/desmoines, 2026-08-07.
 
-    It is not a correctness failure — CPU llama.cpp is deterministic and the incumbent is re-scored
-    on the same box, so the paired comparison still holds. It is a MONEY failure, and the cheapest
-    place to catch it is before the first token."""
+    Within one round it is not a correctness failure — CPU llama.cpp is deterministic and the
+    incumbent is re-scored on the same box, so the paired comparison still holds. ACROSS rounds it
+    is: llama.cpp on CPU and on CUDA do not emit identical tokens, so a crown measured one way is
+    not comparable with one defended the other, which is the whole reason the GPU is pinned. And it
+    is always a MONEY failure. The cheapest place to catch all three is before the first token."""
     import os
 
     try:
@@ -237,20 +239,23 @@ def _assert_student_gpu() -> None:
     if not on_gpu or os.environ.get("RALPH_ALLOW_CPU_STUDENTS") == "1":
         return
 
+    from .gpu_check import probe
     from .progress import tick
-    from .runners import GGUFStudentRunner
 
-    backend = GGUFStudentRunner.backend()
-    if backend == "cuda":
+    ok, why = probe()
+    if ok:
         tick("student backend", "cuda", force=True)
         return
+    # WHY the reason is quoted rather than summarised: there are now two distinct causes and they
+    # need different fixes. A CPU-only wheel means the IMAGE is wrong (no `nvcc`, so the source
+    # build fell back). A CUDA build that will not start means the DRIVER is too old for the
+    # runtime it was compiled against — a wrong REGION, on an image that looks perfect.
     raise SystemExit(
-        f"refusing to score: this box has a GPU but llama.cpp reports backend {backend!r}, so "
-        f"every submission would run on CPU while the GPU bills. The usual cause is an image with "
-        f"no `nvcc`, which makes the source build fall back to the CPU-only wheel — and that wheel "
-        f"accepts `n_gpu_layers` and ignores it, so nothing else would have told you. Rent an "
-        f"image with the CUDA toolkit, or set RALPH_ALLOW_CPU_STUDENTS=1 to accept ~6x the time "
-        f"and cost deliberately.")
+        f"refusing to score: this box has a GPU but llama.cpp cannot use it — {why}. Every "
+        f"submission would run on CPU while the GPU bills, at roughly 6x the time, and "
+        f"`n_gpu_layers` would not tell you: the CPU path accepts it and ignores it. Rent an image "
+        f"with the CUDA toolkit AND a driver new enough for it, or set RALPH_ALLOW_CPU_STUDENTS=1 "
+        f"to accept the time and cost deliberately.")
 
 
 def _gpu_name() -> str:
