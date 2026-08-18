@@ -294,6 +294,13 @@ class BittensorChainIO:
         vals = [v / total for v in vals]
         ok = self._submit(self._set_weights_call(uids, vals), "set_weights")
         self.log.append(("set_weights", dict(zip(uids, vals)), ok))
+        if not ok:
+            # THE REASON, WHERE THE OPERATOR READS IT. `_submit` records the failure in `self.log`,
+            # which the round never prints — so a failed payout appeared as `set=False` with no
+            # cause, and diagnosing it meant re-running the extrinsic by hand afterwards.
+            why = next((str(e[1]) for e in reversed(self.log)
+                        if e[0] == "set_weights" and isinstance(e[1], str)), "no reason recorded")
+            self.skipped.append(("set_weights", why))
         return ok
 
     def set_burn_weights(self) -> bool:
@@ -409,7 +416,23 @@ class BittensorChainIO:
         Found by an idempotent anchor test before a round depended on it. Without that test this
         surfaces after a round has scored and a rental has been paid for, as a withheld round."""
         try:
-            res = self.st().submit_call(call, self.wal(), signer="hotkey")
+            # TWO SUBMISSION PATHS, AND THEY ARE NOT INTERCHANGEABLE. `bt.SetWeights` is an
+            # INTENT — policy-gated, submitted with `execute`. `bt.calls.*` are raw generated
+            # calls, submitted with `submit_call`, whose docstring calls itself an escape hatch
+            # "for any generated raw call". Routing an intent through submit_call raises
+            # "TypeError: cannot unpack non-iterable SetWeights object", which `_submit` caught and
+            # reported as a bare `set=False` — so round 1 anchored (a real raw call) and then
+            # silently did not pay (an intent down the wrong path).
+            st = self.st()
+            import bittensor as bt
+            if isinstance(call, bt.Intent):
+                # An intent DECLARES its own signer role (`SetWeights.signer == "hotkey"`), so
+                # `execute` resolves it and rejects an explicit `signer=` kwarg outright.
+                res = st.execute(call, self.wal())
+            else:
+                # A raw generated call declares NO role, and `resolve_signer` defaults to coldkey —
+                # which is deliberately not on this box. It has to be said here or nothing signs.
+                res = st.submit_call(call, self.wal(), signer="hotkey")
         except Exception as e:
             self.log.append((what, f"submit failed: {type(e).__name__}: {e}"))
             if raise_on_fail:
