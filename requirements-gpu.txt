@@ -1,0 +1,18 @@
+# Scoring real models: the validator's rented box, and auditors at L2/L3.
+torch
+transformers
+safetensors
+huggingface_hub
+accelerate
+jinja2                 # apply_chat_template; without it every model silently falls back to a
+                       # raw completion prompt, which measures the prompt rather than the model
+datasets               # the live trajectory pool (eval/pool.py, eval/corpus_hf.py)
+llama-cpp-python==0.3.34
+# GGUF students. NOT optional: integer safetensors measure at their full container width (int8 ->
+# 8.0 bpw) so no safetensors artifact clears sub4's 4.0/5.0, and a 4-bit-packed one fails the
+# pinned-parent element count. GGUF is the only format that can pass the tiers at all.
+#
+# PINNED. The chat-handler fix in bench/compare.py reaches into Jinja2ChatFormatter's constructor
+# and __call__, which are internal API.
+#
+# Also needs the system package `bubblewrap` (bwrap) for the code-axis grader sandbox.

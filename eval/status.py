@@ -240,9 +240,123 @@ def _section(as_of: float, max_age_s: float, now: float, **body) -> dict:
 
 # ---------------------------------------------------------------------------------------------
 
+# Rounds numbered below this are SHAKEDOWN: run to exercise the validator, paying nobody. The
+# boundary is declared rather than inferred, because nothing in a record can tell the two apart —
+# a shakedown round computes a weight vector exactly like a live one, it simply is not written.
+# Default is effectively "everything so far is shakedown", so the page cannot claim a round paid
+# anyone until an operator says a round did.
+FIRST_LIVE_ROUND = int(os.environ.get("RALPH_FIRST_LIVE_ROUND", "1000000"))
+
+# How many recent rounds the timeline carries. A bounded list that does not SAY it is bounded reads
+# as the whole history, so the count and the cap both travel with it.
+ROUND_WINDOW = 12
+
+
+def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
+    """One round, reduced to what a miner wants to know: did it run, who was in it, who won.
+
+    Counts CHALLENGERS separately from incumbents. A held crown appears twice in `submissions` —
+    once as the artifact its miner submitted, once as the incumbent re-scored on this round's exam
+    — so a naive `len(submissions)` reports 13 for a round that scored 11 miners, and a miner
+    checking whether their submission made it in gets a number that does not match anything."""
+    from .koth import kings_from_events
+    subs = rec.get("submissions") or []
+    challengers = [s for s in subs if s.get("role") != "incumbent"]
+    by_tier: dict = {}
+    for s in challengers:
+        by_tier[s.get("tier") or "?"] = by_tier.get(s.get("tier") or "?", 0) + 1
+    rejected = rec.get("rejected") or []
+    kings = kings_from_events(rec.get("events") or [])
+
+    # THE ROWS, PROJECTED HARD. The record's submissions carry `steps`, `effects`, `slices` and
+    # `per_point` — megabytes of per-sample measurement that exist so an auditor can recompute the
+    # score, and that have no business in a status snapshot a browser polls. Ten fields answer what
+    # a miner comes here to ask: was I in this round, what did I score, did I win, and if I am not
+    # in the list, why not.
+    def _row(s):
+        crowned = bool(s.get("model_id")) and kings.get(s.get("tier")) == s.get("model_id")
+        return {"miner": s.get("miner", ""), "tier": s.get("tier", ""),
+                "role": s.get("role", "challenger"),
+                "retention": s.get("retention"), "retention_lb": s.get("retention_lb"),
+                "code_bits": s.get("code_bits"), "container_bits": s.get("container_bits"),
+                "artifact_uri": s.get("artifact_uri", ""),
+                "crowned": crowned,
+                # A submission that was scored but GATED is not the same as one that scored badly,
+                # and the reason is the only thing its miner can act on.
+                "gates_ok": bool(s.get("gates_ok", True)), "reasons": list(s.get("reasons") or [])}
+    n = int(rec.get("round") or 0)
+    started, published = float(rec.get("started_at") or 0), float(rec.get("published_at") or 0)
+    return {
+        "round": n,
+        "phase": "live" if n >= first_live else "shakedown",
+        "scored": len(challengers),
+        "rescored_incumbents": len(subs) - len(challengers),
+        "rejected": len(rejected),
+        "rejected_detail": [{"hotkey": r[0], "reasons": r[1]} for r in rejected
+                            if isinstance(r, (list, tuple)) and len(r) == 2],
+        "by_tier": by_tier,
+        # Every row, best first, incumbents included and labelled — the re-score is half of the
+        # paired dethrone test, so hiding it would leave the margin unexplainable.
+        "submissions": sorted((_row(s) for s in subs),
+                              key=lambda r: -(r["retention"] or 0)),
+        "crowns": kings,
+        "events": [{"tier": e.get("tier"), "action": e.get("action")}
+                   for e in (rec.get("events") or [])],
+        "parent": rec.get("teacher") or "",
+        "observer": (rec.get("manifest") or {}).get("observer") or "",
+        "exam_items": len((rec.get("manifest") or {}).get("item_indices") or []),
+        "started_at": started or None,
+        "published_at": published or None,
+        # None, not 0: a round with no recorded clock has an UNKNOWN duration, and a zero renders
+        # as "instant" — see the whole reason this module reports absence instead of defaults.
+        "duration_s": round(published - started, 1) if (started and published) else None,
+        "weights": rec.get("weights") or {},
+        "unclaimed": float(rec.get("unclaimed") or 0.0),
+    }
+
+
+def _pending_from(commitments, latest_record: dict | None) -> dict:
+    """What has been committed that the newest published round did NOT score.
+
+    THE QUESTION THE DASHBOARD COULD NOT ANSWER. `cohort` counted current commitments and the trail
+    counted published rounds, and nothing joined them — so "has anyone submitted since the last
+    round?" required diffing two pages by hand. Both halves matter and they are different miners:
+
+      * a hotkey absent from the last record is a NEW entrant
+      * a hotkey present but pointing at a DIFFERENT artifact has resubmitted, which is the more
+        common case here — the field iterates on recipe rather than arriving fresh
+    """
+    subs = (latest_record or {}).get("submissions") or []
+    scored_uri = {str(s.get("miner")): str(s.get("artifact_uri") or "") for s in subs}
+    seen = set(scored_uri) | {str(r[0]) for r in ((latest_record or {}).get("rejected") or [])
+                              if isinstance(r, (list, tuple)) and r}
+    new_entrants, resubmitted, unchanged = [], [], []
+    for c in commitments or []:
+        hk, uri = str(c.get("hotkey", "")), str(c.get("artifact_uri") or "")
+        row = {"hotkey": hk, "tier": c.get("tier"), "artifact_uri": uri}
+        if hk not in seen:
+            new_entrants.append(row)
+        elif uri and scored_uri.get(hk) and uri != scored_uri[hk]:
+            resubmitted.append(row)
+        else:
+            unchanged.append(row)
+    by_tier: dict = {}
+    for r in new_entrants + resubmitted:
+        by_tier[r["tier"] or "?"] = by_tier.get(r["tier"] or "?", 0) + 1
+    return {
+        "since_round": (latest_record or {}).get("round"),
+        "new_entrants": new_entrants,
+        "resubmitted": resubmitted,
+        "unchanged": len(unchanged),
+        "awaiting_scoring": len(new_entrants) + len(resubmitted),
+        "by_tier": by_tier,
+    }
+
+
 def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, chain_err: str,
           trail_index: dict, live: bool, latest_record: dict | None = None,
-          trail_err: str = "") -> dict:
+          trail_err: str = "", records: list | None = None,
+          first_live_round: int = FIRST_LIVE_ROUND) -> dict:
     """Pure over frozen observations, exactly as `watchdog.classify` is, and for the same reason:
     a snapshot builder that reads the world as it goes cannot be tested against the states that
     matter (no round, dead chain, empty trail) without arranging the world first."""
@@ -426,7 +540,8 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
         by_tier: dict = {}
         for c in commitments:
             by_tier[c.get("tier")] = by_tier.get(c.get("tier"), 0) + 1
-        cohort = m({"commitments": len(commitments), "by_tier": by_tier})
+        cohort = m({"commitments": len(commitments), "by_tier": by_tier,
+                    "pending": _pending_from(commitments, latest_record)})
 
     chain_sec = _section(now, 600.0, now, miners=miners, cohort=cohort)
 
@@ -439,6 +554,17 @@ def build(now: float, unit, log, watchdog_state: dict, rentals, commitments, cha
         # ATTEMPTS ARE NOT ROUNDS and the two are never added together.
         note=("no round has completed yet; every scored quantity below is NOT_YET_MEASURED by "
               "fact, not by omission" if trail_ok and rounds_published == 0 else ""),
+        # THE TIMELINE. `rounds_published` is a count, and a count cannot answer "what happened in
+        # round 2", "how often do rounds run" or "which of these paid anyone". Newest first.
+        rounds=(m({"window": ROUND_WINDOW, "total": rounds_published,
+                   "first_live_round": first_live_round,
+                   "items": [_round_summary(r, first_live_round)
+                             for r in sorted(records or [],
+                                             key=lambda r: -int(r.get("round") or 0))
+                             [:ROUND_WINDOW]]})
+                if trail_ok and records is not None else
+                unmeasured(f"the round history could not be read ({trail_err or 'not fetched'})",
+                           state="UNKNOWN")),
         crowns=_crowns_from(latest_record, rounds_published, rec_round, rec_uri, trail_ok,
                             trail_err),
         weights=_weights_from(latest_record, rounds_published, rec_round, rec_uri, trail_ok,
@@ -527,15 +653,38 @@ def main(argv: list) -> int:
     # and the newest record itself, fetched through the verifier rather than trusted: the scores a
     # miner reads here must be the ones that were signed and anchored, not whatever bytes the repo
     # happens to serve.
+    # …and the last few rounds for the timeline. Fetched through the SAME verifier as the newest
+    # one: a history panel is exactly where an unverified read would go unnoticed, because nobody
+    # re-checks the row for a round they already read about.
+    #
+    # A round that fails to verify is DROPPED FROM THE LIST AND NAMED, never silently skipped —
+    # a gap in a timeline is indistinguishable from a round that never happened.
+    records: list | None = None
     if not trail_err and (trail_index.get("rounds") or []):
         try:
             from .show_round import load as _load_round
             _n, latest_record, _idx = _load_round(None, cfg.records_repo)
         except Exception as e:
             trail_err = f"record unreadable: {type(e).__name__}: {e}"
+        if not trail_err:
+            records, bad = [], []
+            wanted = sorted((r.get("round") for r in trail_index["rounds"] if r.get("round")),
+                            reverse=True)[:ROUND_WINDOW]
+            for rn in wanted:
+                if latest_record and rn == latest_record.get("round"):
+                    records.append(latest_record)
+                    continue
+                try:
+                    _n2, rec2, _i2 = _load_round(rn, cfg.records_repo)
+                    records.append(rec2)
+                except Exception as e:
+                    bad.append(f"round {rn} ({type(e).__name__})")
+            if bad:
+                sys.stdout.write(f"  !! rounds omitted from the timeline: {', '.join(bad)}\n")
 
     doc = build(now, unit, log, wstate, rentals, commitments, chain_err, trail_index,
-                _effective_live(unit), latest_record=latest_record, trail_err=trail_err)
+                _effective_live(unit), latest_record=latest_record, trail_err=trail_err,
+                records=records)
     blob = json.dumps(doc, indent=1, sort_keys=True, allow_nan=False)
 
     out_path = os.path.join(cfg.work_dir, "status.json")

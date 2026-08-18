@@ -238,8 +238,13 @@ def run(cfg: Config, round_no: int = 1) -> int:
     observers = {o: HFRunner(o) for o in cfg.observers}
     print(f"  observers: {list(observers)}")
 
+    from .bitrate import emission_weight
+
     budgets = build_budgets(cfg)
-    tiers = [Tier(n, max_params=budgets[n].max_params, weight=1.0 / len(cfg.tiers))
+    # Difficulty-weighted, not an equal split — see bitrate.TIER_EMISSION_WEIGHT for why an equal
+    # split predicts exactly the field the first two rounds drew.
+    tiers = [Tier(n, max_params=budgets[n].max_params,
+                  weight=emission_weight(n, len(cfg.tiers)))
              for n in cfg.tiers]
 
     fetch_log: list = []

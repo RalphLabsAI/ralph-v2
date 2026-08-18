@@ -64,6 +64,11 @@ class Config:
     # Whether to write the weight vector on chain. Separate from `live` on purpose: a shakedown
     # wants a real anchored trail without moving anyone's emission.
     set_weights: bool = True
+    # Mirror each crowned artifact into one repo under our org, verified against the signed
+    # record. On by default: a crown nobody can find is not a product, and the miner repos it
+    # lives in are named after miners and can be overwritten at will.
+    publish_crowns: bool = True
+    crowns_repo: str = "RalphLabsAI/ralph-crowns"
     # (cloud/region) pairs whose IMAGE cannot run a round — e.g. no CUDA toolkit, so llama.cpp
     # falls back to the CPU wheel and every submission scores ~6x slower on a GPU we are paying for.
     exclude_regions: tuple = ()
@@ -97,11 +102,41 @@ class Config:
             tiers=tuple(x.strip() for x in e("RALPH_TIERS", "").split(",") if x.strip())
                   or cls.tiers,
             set_weights=e("RALPH_SET_WEIGHTS", "1") != "0",
+            publish_crowns=e("RALPH_PUBLISH_CROWNS", "1") != "0",
+            crowns_repo=e("RALPH_CROWNS_REPO", "") or cls.crowns_repo,
             exclude_regions=tuple(x.strip() for x in e("RALPH_GPU_EXCLUDE", "").split(",")
                                   if x.strip()),
             references=tuple(x.strip() for x in e("RALPH_REFERENCES", "").split(",") if x.strip()),
             gpu_type=e("RALPH_GPU_TYPE", "H100"), require_gpu=e("RALPH_REQUIRE_GPU", ""),
             max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
+
+
+def _merge_dropped(rec, commits, skipped, w=lambda _s: None) -> list:
+    """Fold submissions dropped BEFORE scoring into the record's `rejected`, with their reason.
+
+    `rejected` covers what the SCORER refused. A submission dropped earlier — at the chain read, for
+    a missing reveal, a failed fetch, a commitment written at or after the nonce block — never
+    reaches the scorer, so its reason landed in `chain.skipped` on the orchestrator and nowhere a
+    miner could see. From their side they committed, and then vanished from a round they were in.
+
+    THIS IS THE SECOND TIME. `rejected` was added to the signed record after a shakedown round
+    dropped a miner who never revealed; that fix covered only the scorer's own refusals, so live
+    round 1 dropped `5DhpPeU1uamKP` by the identical path — no row, no reason, nothing to appeal.
+    The caller merges before signing, so a drop is exactly as tamper-evident as a score.
+
+    Only hotkeys that actually committed a v2 envelope, and only those with no submission row:
+    `skipped` also carries our own operational notes (`set_weights`, `metagraph`) and the ~109 slots
+    on this netuid that are not submissions at all. Returns what it added, for the caller to log."""
+    committed = {c.hotkey for c in commits}
+    seen = {r[0] for r in (rec.rejected or [])} | {s.miner for s in rec.submissions}
+    added = []
+    for hk, whynot in (skipped or []):
+        if hk in committed and hk not in seen:
+            rec.rejected.append([str(hk), [str(whynot)]])
+            seen.add(hk)
+            added.append(hk)
+            w(f"  dropped   : {str(hk)[:12]}… — {whynot}\n")
+    return added
 
 
 def _parse_references(specs, out=None) -> list:
@@ -172,6 +207,12 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
     # `kill_at` was raised 4.5 h -> 8 h and the unit's `TimeoutStartSec` was left at 6 h, so a
     # healthy 6.5 h round would have been killed 30 minutes from the end. Nothing caught it because
     # the ladder test asserts the rings this code owns, and the outermost ring lives in a unit file.
+    # IMPORTED HERE, not borrowed from run(). `run()` imports GpuSpec inside its own body, which
+    # does not put it in this function's scope — so every call to preflight() raised NameError,
+    # including the one run() makes before renting. The live round died before it could spend a
+    # cent, which is the good half; the bad half is that nothing exercised preflight, so it sat
+    # broken from the commit that added this check until the first round that tried to use it.
+    from .orchestrator import GpuSpec
     bad.extend(_supervisor_deadline_problems(GpuSpec(
         gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,
         max_price_per_hour=cfg.max_price_per_hour)))
@@ -347,6 +388,11 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     res = run_remote_round(plan, provider or ShadeformProvider(), spec,
                            os.path.join(cfg.work_dir, f"round-{idx_round}"), out=out)
     rec, summary = res["record"], res["summary"]
+
+    # a drop is a judgement about someone's work: it belongs in the signed
+    # record beside the scores, not in a log only we can read
+    _merge_dropped(rec, commits, getattr(chain, "skipped", []), w)
+
     if not cfg.require_gpu:
         w(f"\n  PIN THIS: RALPH_REQUIRE_GPU={summary.get('gpu')!r}\n"
           f"  every later round must match it, or crowns stop being comparable\n\n")
@@ -376,6 +422,26 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     else:
         ok = chain.set_weights(rec.weights)
         w(f"  weights   : {rec.weights} -> set={ok} (live={cfg.live})\n")
+
+    # MIRROR THE CROWNS, AFTER the round is anchored and paid. Two rules make this safe to run
+    # inside the round rather than as a chore somebody remembers:
+    #
+    #   * it is LAST. Everything above is the round; a crown that fails to mirror leaves a round
+    #     that is still scored, signed, published, anchored and paid.
+    #   * it cannot raise. `publish()` swallows and reports, because a mirroring bug must not
+    #     convert a successful round into a failed one at the final step.
+    #
+    # It is also idempotent — a tier whose king did not change is skipped after one small read,
+    # so an unchanged crown costs nothing rather than re-uploading gigabytes every round.
+    if cfg.publish_crowns:
+        from .publish_crowns import publish as _publish_crowns
+        w(f"  crowns    : mirroring to {cfg.crowns_repo}…\n")
+        rep_c = _publish_crowns(repo=cfg.crowns_repo, push=True, out=w)
+        if not rep_c["ok"]:
+            w("  crowns    : NOT MIRRORED — the round stands; re-run "
+              "`python -m eval.publish_crowns --push` once the cause is fixed\n")
+    else:
+        w("  crowns    : not mirrored (RALPH_PUBLISH_CROWNS=0)\n")
     w(f"  cost      : ~${res['cost']:.2f}\n")
     return 0
 

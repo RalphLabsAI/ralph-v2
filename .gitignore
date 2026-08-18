@@ -9,3 +9,6 @@ runs/
 # quietly publish them.
 SECURITY-REVIEW-*.md
 ref/
+
+# local dev venv
+.venv/

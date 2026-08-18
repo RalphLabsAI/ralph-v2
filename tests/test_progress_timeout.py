@@ -489,6 +489,42 @@ def test_a_rental_with_no_gpu_is_refused_before_the_install():
     assert "exclude=tuple(tried)" in src
 
 
+def test_a_stop_signal_never_rents_another_box():
+    """OBSERVED LIVE 2026-08-18. `systemctl stop` landed inside the rent-retry loop, which catches
+    Exception so a dud region is destroyed and another tried. The signal handler raised a plain
+    RemoteRoundError, so "stop" was indistinguishable from "this region is bad": it destroyed the
+    current rental and RENTED ANOTHER ONE, then carried on scoring while the operator believed the
+    service was shutting down.
+
+    The rental it holds must still be destroyed — that is the whole point of turning the signal
+    into an exception — but the loop must then re-raise rather than acquire more hardware."""
+    import inspect
+
+    from eval.orchestrator import RoundAborted, run_remote_round
+
+    # the loop is: rent -> wait_ready -> on Exception destroy and try the next region
+    src = inspect.getsource(run_remote_round)
+    body = src[src.index("never became usable"):]
+    assert "if aborted:" in body and "raise" in body, \
+        "the retry loop does not re-raise an abort — a stop signal will rent another box"
+    assert "isinstance(e, RoundAborted)" in src, \
+        "the retry loop cannot tell an abort from a bad region"
+    # and the destroy still happens BEFORE the re-raise, or stopping leaks the rental it holds
+    assert body.index("provider.destroy") < body.index("if aborted:"), \
+        "the rental is not destroyed before the abort propagates"
+    assert issubclass(RoundAborted, RuntimeError)
+
+
+def test_the_abort_type_is_distinguishable_from_a_bad_region():
+    """Both stay RemoteRoundError so every existing `except RemoteRoundError` still withholds the
+    round; only the retry decision changes."""
+    from eval.orchestrator import RemoteRoundError, RoundAborted
+
+    assert issubclass(RoundAborted, RemoteRoundError)
+    assert not isinstance(RemoteRoundError("a dud region"), RoundAborted)
+    assert isinstance(RoundAborted("signal 15"), RemoteRoundError)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

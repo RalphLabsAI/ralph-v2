@@ -1,0 +1,6 @@
+# Talking to Bittensor: reading commitments, setting weights, anchoring a round.
+#
+# Kept OUT of requirements.txt because the crown-path suite and the L0/L1 auditor do not need a
+# chain at all — `python -m tests.test_crown_path` must stay installable on a box with no wallet
+# and no network, and folding the SDK in would make that a torch-sized install.
+bittensor>=11.1,<12

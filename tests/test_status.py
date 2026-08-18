@@ -432,6 +432,158 @@ def test_an_unreadable_trail_is_never_a_confident_zero():
         assert doc['trail'][k]['state'] == 'UNKNOWN', doc['trail'][k]
 
 
+# --- the round timeline, and what arrived after it -----------------------------------------------
+
+def _tl_rec(n, subs=(), events=(), **kw):
+    d = dict(round=n, submissions=list(subs), events=list(events), teacher="Qwen/Qwen3-8B",
+             manifest={"observer": "obs", "item_indices": list(range(72))}, weights={})
+    d.update(kw)
+    return d
+
+
+def _tl_sub(hk, tier="sub4", role="challenger", uri="", **kw):
+    d = {"miner": hk, "tier": tier, "role": role, "artifact_uri": uri or f"hf://{hk}/m@r1",
+         "retention": 0.0, "retention_lb": 0.0, "code_bits": 0.0, "container_bits": 0.0,
+         "gates_ok": True, "reasons": [], "model_id": hk}
+    d.update(kw)
+    return d
+
+
+def test_a_rescored_incumbent_is_not_counted_as_another_submission():
+    """A HELD CROWN APPEARS TWICE in a record — once as the artifact its miner submitted, once as
+    the incumbent re-scored on this round's exam. `len(submissions)` therefore says 13 for a round
+    that scored 11 miners, and a miner checking whether they made it in gets a number matching
+    nothing they can see."""
+    from eval.status import _round_summary
+    r = _round_summary(_tl_rec(2, subs=[_tl_sub("a"), _tl_sub("b"), _tl_sub("b", role="incumbent")]))
+    assert r["scored"] == 2, r
+    assert r["rescored_incumbents"] == 1, r
+    assert r["by_tier"] == {"sub4": 2}, r["by_tier"]
+
+
+def test_a_round_with_no_recorded_clock_reports_unknown_not_zero():
+    """Rounds 1-2 ran before the record carried timestamps. A 0 renders as `instant`; None renders
+    as `not recorded`, which is the true statement."""
+    from eval.status import _round_summary
+    assert _round_summary(_tl_rec(1))["duration_s"] is None
+    assert _round_summary(_tl_rec(1))["published_at"] is None
+    timed = _round_summary(_tl_rec(3, started_at=1000.0, published_at=1600.0))
+    assert timed["duration_s"] == 600.0, timed
+
+
+def test_shakedown_and_live_are_declared_never_inferred():
+    """A shakedown round computes a weight vector exactly like a live one — it simply is not
+    written — so nothing IN a record can tell them apart. The boundary is an operator statement,
+    and the default must classify everything as shakedown rather than imply someone was paid."""
+    from eval.status import FIRST_LIVE_ROUND, _round_summary
+    assert FIRST_LIVE_ROUND > 1000, "the default must not silently mark rounds as live"
+    assert _round_summary(_tl_rec(4), first_live=7)["phase"] == "shakedown"
+    assert _round_summary(_tl_rec(7), first_live=7)["phase"] == "live"
+    assert _round_summary(_tl_rec(9), first_live=7)["phase"] == "live"
+
+
+def test_a_held_crown_still_shows_the_tier_as_occupied():
+    """`hold` is the action a round emits when the incumbent survives. A timeline that only counted
+    `crown` would show a tier going empty on every successful defence."""
+    from eval.status import _round_summary
+    r = _round_summary(_tl_rec(2, subs=[_tl_sub("a")],
+                            events=[{"tier": "ternary", "action": "hold", "king": "K"},
+                                    {"tier": "binary", "action": "none", "king": None}]))
+    assert r["crowns"] == {"ternary": "K"}, r["crowns"]
+
+
+def test_pending_separates_a_new_miner_from_one_who_resubmitted():
+    """Different miners, different meaning. This field iterates on recipe far more often than it
+    grows, so collapsing both into "pending" hides what is actually happening."""
+    from eval.status import _pending_from
+    last = _tl_rec(2, subs=[_tl_sub("alice", uri="hf://alice/m@v1"),
+                         _tl_sub("bob", uri="hf://bob/m@v1")])
+    p = _pending_from([{"hotkey": "alice", "tier": "sub4", "artifact_uri": "hf://alice/m@v1"},
+                       {"hotkey": "bob", "tier": "sub4", "artifact_uri": "hf://bob/m@V2"},
+                       {"hotkey": "carol", "tier": "binary", "artifact_uri": "hf://carol/m@v1"}],
+                      last)
+    assert [r["hotkey"] for r in p["new_entrants"]] == ["carol"], p["new_entrants"]
+    assert [r["hotkey"] for r in p["resubmitted"]] == ["bob"], p["resubmitted"]
+    assert p["unchanged"] == 1 and p["awaiting_scoring"] == 2, p
+    assert p["by_tier"] == {"binary": 1, "sub4": 1}, p["by_tier"]
+
+
+def test_a_miner_rejected_last_round_is_not_reported_as_a_new_entrant():
+    """They were seen, judged and told why. Calling them new would erase the rejection — the exact
+    thing `rejected` was added to the signed record to stop."""
+    from eval.status import _pending_from
+    last = _tl_rec(2, subs=[], rejected=[["dave", ["committed but never revealed"]]])
+    p = _pending_from([{"hotkey": "dave", "tier": "sub4", "artifact_uri": "hf://dave/m@v1"}], last)
+    assert p["new_entrants"] == [], p
+    assert p["awaiting_scoring"] == 0, p
+
+
+def test_an_unreadable_trail_yields_no_timeline_rather_than_an_empty_one():
+    """An empty list of rounds says "this subnet has never run one". That is a very different
+    claim from "the history could not be read", and it is the same failure that once printed a
+    MEASURED zero next to `rounds published` for an hour after round 1 anchored."""
+    doc = _build(trail_index={"rounds": [{"round": 1}]}, records=None, trail_err="HTTP 502")
+    assert doc["trail"]["rounds"]["state"] != "MEASURED"
+    assert doc["trail"]["rounds"]["state"] == "UNKNOWN"
+    assert "value" not in doc["trail"]["rounds"], "an unread history must carry no value at all"
+
+
+def test_the_timeline_is_capped_and_says_so():
+    """A bounded list that does not declare its bound reads as the whole history."""
+    from eval.status import ROUND_WINDOW
+    recs = [_tl_rec(n) for n in range(1, ROUND_WINDOW + 6)]
+    doc = _build(trail_index={"rounds": [{"round": r["round"]} for r in recs]}, records=recs)
+    v = doc["trail"]["rounds"]["value"]
+    assert len(v["items"]) == ROUND_WINDOW
+    assert v["total"] == len(recs) and v["window"] == ROUND_WINDOW
+    assert [i["round"] for i in v["items"]][:2] == [len(recs), len(recs) - 1], "newest first"
+
+
+def test_a_round_carries_its_own_field_because_the_cohort_moves_on():
+    """WHY THE FIELD LIVES WITH THE ROUND. The Submissions panel shows the CURRENT cohort, and a
+    commitment slot holds only its latest value — so once a miner resubmits, nothing anywhere can
+    still say who was in round 1. The signed record is the only durable answer, so the field is
+    carried per round."""
+    from eval.status import _round_summary
+    r = _round_summary(_tl_rec(
+        2,
+        subs=[_tl_sub("alice", retention=0.30, code_bits=4.0, model_id="M"),
+              _tl_sub("alice", role="incumbent", retention=0.2875, code_bits=0.0, model_id="M"),
+              _tl_sub("bob", retention=0.21, code_bits=4.0, model_id="N")],
+        events=[{"tier": "sub4", "action": "hold", "king": "M"}]))
+    rows = r["submissions"]
+    assert [x["miner"] for x in rows] == ["alice", "alice", "bob"], "best retention first"
+    assert rows[0]["role"] == "challenger" and rows[1]["role"] == "incumbent"
+    assert rows[0]["crowned"] and rows[1]["crowned"] and not rows[2]["crowned"]
+    # the incumbent carries NO bit measurement — it is re-scored, not re-ingested
+    assert rows[1]["code_bits"] == 0.0 and rows[0]["code_bits"] == 4.0
+
+
+def test_the_field_never_carries_the_per_sample_measurement_blob():
+    """The record's submissions hold `steps`, `effects`, `slices` and `per_point` — megabytes that
+    exist so an auditor can recompute a score, and that have no business in a snapshot a browser
+    polls every few seconds."""
+    from eval.status import _round_summary
+    fat = _tl_sub("alice", retention=0.3)
+    fat.update(steps=["x" * 5000] * 72, effects=[[1, 2, 3, 4]] * 72,
+               slices={"a": [0.1] * 72}, per_point=[1] * 72)
+    row = _round_summary(_tl_rec(1, subs=[fat]))["submissions"][0]
+    for heavy in ("steps", "effects", "slices", "per_point"):
+        assert heavy not in row, f"{heavy} leaked into the status document"
+    assert len(json.dumps(row)) < 600, len(json.dumps(row))
+
+
+def test_a_gated_submission_shows_why_it_did_not_count():
+    """Scored-but-gated and simply-low-scoring look identical from a number alone, and only the
+    first has anything its miner can act on."""
+    from eval.status import _round_summary
+    bad = _tl_sub("carol", retention=0.19)
+    bad.update(gates_ok=False, reasons=["degenerate output: 82% subword salad"])
+    row = _round_summary(_tl_rec(3, subs=[bad]))["submissions"][0]
+    assert row["gates_ok"] is False
+    assert "salad" in " ".join(row["reasons"])
+
+
 # COLLECTED AFTER EVERY TEST IS DEFINED. This used to sit above the last few tests, which
 # meant a test appended to the end of the file was silently never run — it does not fail,
 # it does not appear, and the count just does not go up. Keep this immediately above main().

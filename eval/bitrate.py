@@ -51,6 +51,11 @@ class BitReport:
     container_bits: float = 0.0     # bits per weight as stored/shipped (what you download)
     codebook: int = 0               # distinct codes found (2 = binary, 3 = ternary)
     group_size: int = 128
+    per_group_size: dict = field(default_factory=dict)   # tensor -> group size used/detected
+    # GGUF only: quantisation type name -> weights carried. Kept separate from `per_tensor`, which
+    # is keyed by TENSOR name on the safetensors path and by TYPE name on the GGUF one — a
+    # collision that would make a runnability check mean different things per format.
+    formats: dict = field(default_factory=dict)
     per_tensor: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
 
@@ -101,14 +106,44 @@ def tensor_code_bits(values, group_size: int = 128, scale_bits: int = 16,
     return tot_bits / tot_w, (tot_levels // max(1, n_groups))
 
 
-def measure_state_dict(tensors: dict, group_size: int = 128, scale_bits: int = 16,
+# Group sizes to try when the artifact does not say which it used. Every mainstream scheme sits in
+# here: Q4_K/Q6_K use 256, Q2_0 and the ternary formats use 64, most GPTQ/AWQ builds use 128.
+CANDIDATE_GROUPS = (32, 64, 128, 256)
+
+
+def detect_group_size(values, scale_bits: int = 16, candidates=CANDIDATE_GROUPS) -> int:
+    """The group size that best explains this tensor, by minimising measured bits per weight.
+
+    MEASURING AT THE WRONG GROUP SIZE INFLATES THE ANSWER, and it did. `measure_checkpoint` assumed
+    128 and nothing ever detected otherwise, so a genuinely ternary group-64 artifact — truly
+    log2(3) + 16/64 = 1.835 bpw — measured 2.447 and was thrown out of the ternary tier into sub4,
+    where it competes against models carrying twice the bits. We were silently punishing exactly the
+    artifacts the subnet exists to attract.
+
+    The mechanism: normalising a 128-wide window that actually contains two 64-wide groups with
+    different scales turns 3 levels into 5, and log2 does the rest.
+
+    Minimising is the right selector and is not a loophole. Scale overhead is `scale_bits /
+    group_size`, so a smaller group must shrink the codebook by MORE than the extra overhead costs
+    — at 32 it pays 0.5 bpw of scales against 0.125 at 128. The minimum is therefore the group
+    structure that genuinely explains the weights, and claiming a smaller one you did not use makes
+    your number worse, not better."""
+    best, best_bits = candidates[0], float("inf")
+    for g in candidates:
+        bits, _ = tensor_code_bits(values, g, scale_bits)
+        if bits < best_bits:
+            best, best_bits = g, bits
+    return best
+
+
+def measure_state_dict(tensors: dict, group_size: int | None = 128, scale_bits: int = 16,
                        container_bits_of=None) -> BitReport:
     """`tensors`: name -> (flat sequence of floats, container_bits_for_that_tensor).
 
     Weight-bearing tensors only — norms/biases/scales are the "negligible tail" every scheme
     keeps in higher precision; they are counted in the container total but never allowed to
     define the code width."""
-    rep = BitReport(group_size=group_size)
+    rep = BitReport(group_size=group_size or 0)
     total_code, total_container, total_n = 0.0, 0.0, 0
     all_codes = 0
     for name, item in sorted(tensors.items()):
@@ -116,7 +151,12 @@ def measure_state_dict(tensors: dict, group_size: int = 128, scale_bits: int = 1
         n = len(vals)
         if n == 0:
             continue
-        bits, k = tensor_code_bits(vals, group_size, scale_bits)
+        # group_size=None means "work it out from the weights" — see detect_group_size. Detected
+        # PER TENSOR, because a real checkpoint mixes schemes: the embedding and LM head are
+        # routinely quantised differently from the projections.
+        g = group_size or detect_group_size(vals, scale_bits)
+        rep.per_group_size[name] = g
+        bits, k = tensor_code_bits(vals, g, scale_bits)
         if not math.isfinite(bits) or bits > cbits:
             bits = float(cbits)                # not quantized (or worse than its container)
         rep.per_tensor[name] = {"n": n, "code_bits": round(bits, 4), "codebook": k,
@@ -268,6 +308,7 @@ def measure_gguf_dir(paths, group_size: int = 128) -> BitReport:
         tot_n += info.params
         for tname, n in (info.weight_type_hist or {}).items():
             rep.per_tensor[tname] = rep.per_tensor.get(tname, 0) + n
+            rep.formats[tname] = rep.formats.get(tname, 0) + n
             widths.add(int(_gguf_code(tname)))
     if tot_n:
         rep.params = tot_n
@@ -297,16 +338,69 @@ class BitTier:
 TIERS = (
     BitTier("binary", max_code_bits=1.15, max_container_bits=2.5),    # Bonsai 1-bit = 1.125
     BitTier("ternary", max_code_bits=1.75, max_container_bits=2.5),   # Bonsai ternary = 1.71
-    BitTier("sub2", max_code_bits=2.0, max_container_bits=3.0),
+    # 2.3, NOT 2.0. The format that actually runs GPU-accelerated on an iPhone is `Q2_0` group-64,
+    # merged into mainline llama.cpp with a Metal backend in July 2026, and it measures
+    # log2(4) + 16/64 = 2.25 bpw. At a 2.0 cap the one phone-native format on the board could not
+    # enter any tier but sub4, where it would be beaten by models carrying nearly twice the bits.
+    # This is the tier the subnet's on-device promise lives in: ~2.35 GB for an 8B, ~3.2 GB
+    # resident, comfortable on every iPhone including the 6 GB tier.
+    BitTier("sub2", max_code_bits=2.3, max_container_bits=3.0),
     BitTier("sub4", max_code_bits=4.0, max_container_bits=5.0),
 )
 
+# Share of emission per tier. NOT UNIFORM, because the tiers are not equally hard and miners price
+# effort correctly: the first two rounds drew 9 sub4 and 6 ternary submissions and nothing at all in
+# binary or sub2, which is exactly what an equal split should be expected to produce. Sub-2-bit is a
+# research problem; 4-bit is one `llama-quantize` invocation, and the sub4 crown came in at 4.61 GB
+# against a 5.0 GB cap — a stock Q4_K_M, of which thousands already exist.
+#
+# The numbers below are a judgement, not a measurement. THREE ORDERINGS COINCIDE HERE, which is why
+# the ladder is simply steepest at the bottom: fewer bits is a smaller file, a smaller file fits
+# more phones and decodes faster (decode is memory-bandwidth-bound, so halving the weights roughly
+# doubles tokens/sec), and fewer bits is also the harder research problem. Smallest = fastest =
+# hardest = best product, all at once.
+#
+# THIS WAS BRIEFLY WEIGHTED THE OTHER WAY, on the belief that only `Q2_0` reached a phone and that
+# sub-2-bit formats needed PrismML's private fork. That was wrong: mainline llama.cpp carries Metal
+# kernels for `Q1_0` (their 1.125 bpw format, since upstreamed), `IQ1_S`, `IQ1_M`, `IQ2_XXS` and
+# `Q2_0`. Every tier here produces something a phone can run, so there is no reason left to pay
+# less for the smaller artifact. See UNRUNNABLE_FORMATS for the one genuine exception.
+TIER_EMISSION_WEIGHT = {
+    "binary": 0.40,    # ~1.2 GB. Smallest, fastest, hardest — and Bonsai proves it is achievable
+    "ternary": 0.25,   # ~1.8 GB
+    "sub2": 0.20,      # ~2.3 GB
+    "sub4": 0.15,      # ~4.6 GB. The on-ramp and the calibration control; Q4_K_M is a commodity
+}
+
+
+def emission_weight(tier_name: str, n_tiers: int = 4) -> float:
+    """Emission share for a tier, falling back to an equal split for tiers not in the table
+    (`rehearsal`, `open`, and the simulation tiers, which run one tier at a time anyway)."""
+    return TIER_EMISSION_WEIGHT.get(tier_name, 1.0 / max(1, n_tiers))
+
+
+# Quantisation formats that fit a tier's bit budget and then cannot be RUN on the device this
+# subnet promises. A crown must be downloadable and usable, not merely small.
+#
+# `TQ1_0` is the whole list, and it is a real trap rather than a hypothetical: at 1.6875 bpw it
+# passes the binary and ternary budgets comfortably, and mainline llama.cpp ships NO Metal kernels
+# for it — verified against ggml-metal.metal, which carries get_rows/dequantize for q1_0, q2_0,
+# tq2_0, iq1_s, iq1_m, iq2_xxs and q4_K, and nothing for tq1_0. A TQ1_0 crown would be a champion
+# that crashes on every iPhone. Its sibling TQ2_0 is fine.
+UNRUNNABLE_FORMATS = {
+    "TQ1_0": "mainline llama.cpp has no Metal kernels for TQ1_0 — it cannot run on Apple GPU. "
+             "Use TQ2_0, Q2_0, Q1_0, IQ1_S or IQ1_M.",
+}
+
 
 def bit_tier_gate(rep: BitReport, tier: BitTier) -> tuple[bool, list[str]]:
-    """Fail-closed. Both budgets bind: the achievement AND the artifact."""
+    """Fail-closed. THREE budgets bind: the achievement, the artifact, and whether it runs."""
     r: list[str] = []
     if rep.params <= 0:
         r.append("no weights measured")
+    for fmt, why in UNRUNNABLE_FORMATS.items():
+        if fmt in (rep.formats or {}):
+            r.append(f"unrunnable format {fmt}: {why}")
     if rep.code_bits > tier.max_code_bits + 1e-6:
         r.append(f"code bits {rep.code_bits} exceed {tier.name} budget {tier.max_code_bits}")
     if rep.container_bits > tier.max_container_bits + 1e-6:

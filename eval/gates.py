@@ -23,6 +23,7 @@ tensor), which is bytes, not weights — cheap and load-free.
 from __future__ import annotations
 
 import json
+import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -194,10 +195,22 @@ def tier_gate(insp: Inspection, tier: TierBudget) -> tuple[bool, list[str]]:
 
 def degeneracy_flags(outputs: list[str], max_loop_ratio: float = 0.5,
                      max_len_chars: int = 8000) -> tuple[bool, list[str]]:
-    """A looping / runaway student is a DoS and is disqualified, not merely low-scored.
+    """A looping / runaway / incoherent student is disqualified, not merely low-scored.
 
-    Flags: high repeated-n-gram ratio, or a large fraction of responses hitting the
-    length ceiling on ordinary prompts.
+    Flags: high repeated-n-gram ratio, a large fraction of responses hitting the length
+    ceiling on ordinary prompts, or subword salad.
+
+    THE THIRD FLAG EXISTS BECAUSE THE FIRST TWO MISSED TWO REAL SUBMISSIONS. Round 2's ternary tier
+    had four entries and three were broken; this function caught one of them. The two it missed
+    emitted `ấnấn absolutelylys iterative研術棉.aspffffffffhack` — which defeats an n-gram check
+    completely, because the salad never repeats itself, and defeats a length check because the
+    responses are ordinary length. Those two scored 0.1230 and 0.1334 against a crown floor of 0.02,
+    so had the one working ternary submission not arrived, netuid 40 would have crowned a broken
+    quantiser and published it as the state of the compression art.
+
+    Script-mixing was the tempting signal and is the WRONG one: this corpus contains Hindi and
+    Chinese trajectories, and a genuine Chinese step switches script more often than the salad does.
+    What the salad cannot hide is runs of a repeated character.
     """
     if not outputs:
         return True, ["no outputs"]
@@ -216,4 +229,15 @@ def degeneracy_flags(outputs: list[str], max_loop_ratio: float = 0.5,
     loopy = sum(1 for o in outputs if loop_ratio(o) > max_loop_ratio) / len(outputs)
     if loopy > 0.3:
         reasons.append(f"{loopy:.0%} of responses are highly repetitive (looping)")
+
+    # ALPHANUMERIC runs only. `-----`, `=====` and `.....` are ordinary markdown rules, table
+    # borders and ellipses that appear in perfectly good steps; `ffffffff` and `aaaaaa` are not.
+    # Healthy steps sampled across this corpus — English, Hindi, Chinese, code and arithmetic —
+    # contain zero such runs; the broken submissions ran 10-15 per step, so the threshold sits in
+    # an empty gap rather than on a tuned edge.
+    runs = re.compile(r"([0-9A-Za-z])\1{5,}")
+    salad = sum(1 for o in outputs if len(runs.findall(o)) > 3) / len(outputs)
+    if salad > 0.25:
+        reasons.append(f"{salad:.0%} of responses are subword salad "
+                       f"(repeated-character runs, not language)")
     return (not reasons), reasons

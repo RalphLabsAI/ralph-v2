@@ -18,6 +18,24 @@ import random
 from dataclasses import dataclass, field
 
 
+def kings_from_events(events) -> dict:
+    """{tier: model_id} for every throne a round leaves occupied.
+
+    `hold` COUNTS. A round where the incumbent survives emits `hold`, not `crown` — the crown did
+    not change hands, so nothing is re-announced — and code that scans only for `crown`/`dethrone`
+    concludes the tier is empty. That reading has already broken the emission audit once and it is
+    the same mistake twice over, so the rule lives in one place: a tier has a king if the last event
+    that named one said `crown`, `dethrone` or `hold`."""
+    kings: dict = {}
+    for e in events or []:
+        tier, king = e.get("tier"), e.get("king")
+        if not tier:
+            continue
+        if e.get("action") in ("crown", "dethrone", "hold") and king:
+            kings[tier] = king
+    return kings
+
+
 @dataclass(frozen=True)
 class Tier:
     name: str
@@ -273,8 +291,22 @@ class Tournament:
         return event
 
     def weights(self) -> dict[str, float]:
-        """Emission per miner: each tier's weight goes to its king. Normalized to sum 1
-        over tiers that have a king."""
+        """Emission per miner: each tier's weight goes to its king.
+
+        SUMS TO 1 OVER THE OCCUPIED TIERS. Nothing is burned: a subnet that writes part of its
+        weight vector to a burn uid is read in this ecosystem as taxing its own miners, and it is
+        not worth the signal it buys.
+
+        What fixes the original problem is the WEIGHTS being unequal, not the normalisation. When
+        every tier paid the same, an empty binary tier and an empty sub2 tier handed their halves to
+        the two occupied ones and sub4 — enterable with one `llama-quantize` invocation — collected
+        half of all emission. Under `TIER_EMISSION_WEIGHT` the same field pays the sub4 king 37% and
+        the ternary king 62%, and taking sub2 moves a miner to 50%. Moving up a tier still roughly
+        doubles income, which is the whole property that was missing.
+
+        `unclaimed()` reports how much of the nominal schedule was redistributed this way. It is
+        recorded rather than acted on, so a reader can see that a two-tier round paid out a
+        four-tier schedule."""
         live = {t: k for t, k in self.kings.items() if t in self.tiers}
         total_w = sum(self.tiers[t].weight for t in live)
         if total_w <= 0:
@@ -283,3 +315,16 @@ class Tournament:
         for t, k in live.items():
             out[k.miner] = out.get(k.miner, 0.0) + self.tiers[t].weight / total_w
         return out
+
+    def unclaimed(self) -> float:
+        """Share of the NOMINAL schedule that belonged to tiers with no king.
+
+        Reporting only — `weights()` redistributes it across the occupied tiers, so this never
+        reduces what is paid out. It exists so the record can say "this round paid a four-tier
+        schedule to two tiers", which is the difference between a concentrated payout that was
+        designed and one that nobody noticed."""
+        total_w = sum(t.weight for t in self.tiers.values())
+        if total_w <= 0:
+            return 0.0
+        held = sum(self.tiers[t].weight for t in self.kings if t in self.tiers)
+        return max(0.0, (total_w - held) / total_w)

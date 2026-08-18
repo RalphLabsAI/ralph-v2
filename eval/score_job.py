@@ -25,7 +25,7 @@ from dataclasses import asdict
 
 def score(job: dict, out_dir: str) -> dict:
     """Run the round described by `job`. Returns a small summary; writes the artifacts."""
-    from .bitrate import TIERS
+    from .bitrate import TIERS, emission_weight
     from .economics import RegistrationLedger
     from .fetch import resolver
     from .gates import TierBudget
@@ -71,7 +71,10 @@ def score(job: dict, out_dir: str) -> dict:
                              max_effective_bits=by_name[n].max_container_bits,
                              bit_tier=by_name[n], parent=spec)
                for n in job["tiers"]}
-    tiers = [Tier(n, max_params=budgets[n].max_params, weight=1.0 / len(job["tiers"]))
+    # Difficulty-weighted, not an equal split — see bitrate.TIER_EMISSION_WEIGHT for why an equal
+    # split predicts exactly the field the first two rounds drew.
+    tiers = [Tier(n, max_params=budgets[n].max_params,
+                  weight=emission_weight(n, len(job["tiers"])))
              for n in job["tiers"]]
 
     # Artifacts land HERE, on the rented disk, not on the orchestrator: a miner controls the size

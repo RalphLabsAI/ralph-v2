@@ -38,11 +38,27 @@ TWO SAFETY PROPERTIES, deliberate:
   * FAIL-CLOSED READS. A commitment that is missing, unparseable, or not v2 is SKIPPED with a
     reason rather than guessed at. A malformed envelope must not become a submission.
 
-API NOTE. Written against `bittensor>=10.5,<11`: `bt.Subtensor` (capital S — the lowercase
-`bt.subtensor` alias is gone), `Subtensor.metagraph(netuid)`, `get_commitment(netuid, uid)`,
-`set_commitment(wallet, netuid, data)`. Bittensor 11.x is a ground-up rewrite — no
-`Subtensor.metagraph`, no `get_commitment`, a dataclass `Metagraph` carrying `commitments` — so it
-needs a new adapter rather than a version bump. requirements.txt pins accordingly.
+API NOTE. Written against `bittensor>=11.1,<12`, which is a ground-up rewrite of the 10.x SDK this
+file used to target. Nothing carried over: `Subtensor` has no `get_current_block`, no `metagraph`,
+no `get_commitment`, no `set_commitment`, no `set_weights` and no `.substrate`. What replaces them:
+
+    block           `st.block` (property)          was get_current_block()
+    block hash      `st.block_info(n).hash`        was get_block_hash(n)
+    storage read    `st.query_map(item, params)`   was st.substrate.query_map(module=, storage_function=)
+                    with `item` from `bt.storage.<Container>.<Item>`
+    uid <-> hotkey  storage `SubtensorModule.Keys` / `.Uids`   was metagraph.hotkeys
+    coldkey         storage `SubtensorModule.Owner(hotkey)`    was metagraph.coldkeys
+    extrinsics      build a call (`bt.SetWeights(...)`, `bt.calls.Commitments.set_commitment(...)`)
+                    then `st.submit_call(call, wallet)`
+
+`_decode_commitment` is unchanged and still correct: 11.x returns the same
+`{"info": {"fields": [{"RawN": "0x…"}]}}` shape, and it must keep WALKING that structure rather than
+indexing it — a payload longer than one Raw field is split across several, and a decoder that reads
+only the first one reported ZERO v2 commitments on a subnet that had sixteen.
+
+There is a real sync/async split in 11.x: `bt.Subtensor` is synchronous, but `bt.metagraph.fetch` is
+a coroutine. This file stays entirely on the synchronous storage reads rather than dragging an event
+loop into the validator, which is why `mg()` builds its own small view instead of calling `fetch`.
 """
 from __future__ import annotations
 
@@ -86,10 +102,21 @@ class BittensorChainIO:
         return self.wallet
 
     def mg(self, refresh: bool = False):
-        """Synced ONCE per round unless asked again. Every uid lookup used to trigger its own
-        sync, which on a full subnet is a lot of RPC for a mapping that does not move mid-round."""
+        """`{uid: hotkey}` for this subnet, read ONCE per round unless asked again.
+
+        Not `bt.metagraph.fetch` — that is a coroutine in 11.x, and the whole validator is
+        synchronous. It also returns far more than this needs (stake, emission, ranks, prices) for
+        a mapping that never moves mid-round. One storage read answers every uid lookup in a round.
+        """
         if self._mg is None or refresh:
-            self._mg = self.st().metagraph(netuid=self.netuid)
+            try:
+                self._mg = {int(uid): str(getattr(v, "value", v)) for uid, v in
+                            self.st().query_map(_item("SubtensorModule", "Keys"), [self.netuid])}
+            except Exception as e:
+                # `log`, not `skipped`: a failed metagraph read is our problem, not a miner's, and
+                # `skipped` is the column an operator reads to find out why a miner was not scored.
+                self.log.append(("metagraph", f"could not read Keys: {type(e).__name__}: {e}"))
+                self._mg = {}
         return self._mg
 
     @property
@@ -99,10 +126,10 @@ class BittensorChainIO:
     # ---- reads -------------------------------------------------------------------------
 
     def current_block(self) -> int:
-        return int(self.st().get_current_block())
+        return int(self.st().block)
 
     def block_hash(self, block: int) -> str:
-        return str(self.st().get_block_hash(block))
+        return str(self.st().block_info(int(block)).hash)
 
     def commitments_map(self) -> dict:
         """`{hotkey: raw commitment}` in ONE query instead of one per uid.
@@ -113,12 +140,13 @@ class BittensorChainIO:
         start. The storage map answers the same question in one call, and an empty slot is simply
         an absent key rather than an exception.
 
-        Falls back to the per-uid path when the map is unavailable, because a chain-layout change
-        must degrade to slow rather than to broken."""
+        In 11.x the map is reached as `st.query_map(bt.storage.Commitments.CommitmentOf, [netuid])`
+        — the typed storage item replaces the module/storage_function string pair, and there is no
+        `.substrate` attribute to reach through any more. The KEY is already the hotkey ss58, so no
+        uid round-trip is needed to attribute a commitment."""
         out: dict = {}
         try:
-            res = self.st().substrate.query_map(
-                module="Commitments", storage_function="CommitmentOf", params=[self.netuid])
+            res = self.st().query_map(_item("Commitments", "CommitmentOf"), [self.netuid])
         except Exception as e:
             # `log`, not `skipped`: skipped is the list of SUBMISSIONS we refused and it is read
             # by operators looking for why a miner was not scored. Our own RPC path degrading is
@@ -264,21 +292,40 @@ class BittensorChainIO:
             return False
         total = sum(vals)
         vals = [v / total for v in vals]
-        res = self.st().set_weights(wallet=self.wal(), netuid=self.netuid, uids=uids, weights=vals)
-        ok = bool(getattr(res, "success", res))
+        ok = self._submit(self._set_weights_call(uids, vals), "set_weights")
         self.log.append(("set_weights", dict(zip(uids, vals)), ok))
+        if not ok:
+            # THE REASON, WHERE THE OPERATOR READS IT. `_submit` records the failure in `self.log`,
+            # which the round never prints — so a failed payout appeared as `set=False` with no
+            # cause, and diagnosing it meant re-running the extrinsic by hand afterwards.
+            why = next((str(e[1]) for e in reversed(self.log)
+                        if e[0] == "set_weights" and isinstance(e[1], str)), "no reason recorded")
+            self.skipped.append(("set_weights", why))
         return ok
 
     def set_burn_weights(self) -> bool:
         """Everything to the burn uid. What a validator writes when it has nothing it is willing to
         pay: a validator that sets NO weights contributes nothing to consensus and eventually
-        crosses `activity_cutoff` into inactive, which is a worse outcome than an honest burn."""
+        crosses `activity_cutoff` into inactive, which is a worse outcome than an honest burn.
+
+        REFUSES TO BURN TO A HOTKEY WE CONTROL, because on netuid 40 the default `burn_uid=0` IS
+        the validator's own hotkey — verified on chain: uid 0 is
+        5HijSRHd9wUmk51UE8Kia7vmx6kD2jwqJLn9bY1frQ4aiTUs. Bittensor has no designated burn address;
+        uid 0 is simply whoever registered first, and here that is us. This method is called by the
+        AUDITOR, which third parties are meant to run — so with the shipped default an independent
+        auditor would have written 100% of its weight to us and called it a burn. That is not a
+        burn, it is a self-vote wearing one's name, and it would be found."""
         if self.read_only:
             self.log.append(("set_burn_weights", self.burn_uid))
             return False
-        res = self.st().set_weights(wallet=self.wal(), netuid=self.netuid,
-                                    uids=[int(self.burn_uid)], weights=[1.0])
-        return bool(getattr(res, "success", res))
+        target = self.mg().get(int(self.burn_uid))
+        if target and target == self.me:
+            self.log.append(("set_burn_weights", "REFUSED",
+                             f"uid {self.burn_uid} is this validator's own hotkey — set "
+                             f"RALPH_BURN_UID to a uid you do not control"))
+            return False
+        return self._submit(self._set_weights_call([int(self.burn_uid)], [1.0]),
+                            "set_burn_weights")
 
     def set_king(self, tier: str, hotkey: str, model_id: str) -> None:
         """Journalled, not written. See get_king: the crown lives in the signed record."""
@@ -312,9 +359,17 @@ class BittensorChainIO:
         if self.read_only:
             self.log.append(("commit_audit_root", value))
             return
-        res = self.st().set_commitment(wallet=self.wal(), netuid=self.netuid, data=str(value),
-                                       raise_error=True)
-        self.log.append(("commit_audit_root", value, bool(getattr(res, "success", res))))
+        import bittensor as bt
+        payload = str(value).encode()
+        # RawN variants are fixed-width, so a value that is not exactly a supported length has to be
+        # split or padded rather than silently truncated. The anchor is 64 hex chars, which is Raw64
+        # exactly; anything else is a programming error here and should say so.
+        if len(payload) != 64:
+            raise ValueError(f"anchor must be 64 bytes to fit one Raw64 field, got {len(payload)}")
+        call = bt.calls.Commitments.set_commitment(
+            self.netuid, {"fields": [{"Raw64": payload}]})
+        ok = self._submit(call, "commit_audit_root", raise_on_fail=True)
+        self.log.append(("commit_audit_root", value, ok))
 
     def head_anchor(self) -> str:
         """The anchor currently committed on chain, read FROM THE CHAIN.
@@ -326,11 +381,8 @@ class BittensorChainIO:
         return self.commitment_of_hotkey(self.me)
 
     def commitment_of_hotkey(self, hotkey: str) -> str:
-        uid = self.uid_of(hotkey)
-        if uid is None:
-            return ""
         try:
-            return str(self.st().get_commitment(netuid=self.netuid, uid=int(uid)) or "")
+            return str(self._commitment_of(0, hotkey) or "")
         except Exception:
             return ""
 
@@ -339,32 +391,99 @@ class BittensorChainIO:
         # extrinsic wired yet, so record the intent rather than pretend it settled.
         self.log.append(("settle_bonds", dict(refunds)))
 
+    # ---- writes: build a call, submit it with the wallet --------------------------------
+
+    def _set_weights_call(self, uids: list, vals: list):
+        """11.x has no `Subtensor.set_weights`. An extrinsic is a CALL OBJECT submitted with a
+        wallet, which is a better shape for us anyway: the call can be built and inspected without
+        a signer, so `read_only` can log exactly what would have gone on chain."""
+        import bittensor as bt
+        return bt.SetWeights(netuid=self.netuid, uids=[int(u) for u in uids],
+                             weights=[float(v) for v in vals])
+
+    def _submit(self, call, what: str, raise_on_fail: bool = False) -> bool:
+        """One place where anything is signed. Every mutating path goes through here so there is a
+        single line to audit for "what can this process write".
+
+        ALWAYS `signer="hotkey"`, AND THAT IS NOT A DETAIL. `resolve_signer` defaults to
+        role="coldkey", and a generated raw call carries no signer role of its own — so
+        `Commitments.set_commitment` submitted without this asks for a coldkey that is deliberately
+        NOT on the validator box, and dies with "could not unlock coldkey". The chain wants the
+        hotkey regardless: commitments are keyed BY hotkey (that is how `commitments_map` reads
+        them), and a validator's whole job is signing with the hotkey while the coldkey stays
+        somewhere else holding the funds.
+
+        Found by an idempotent anchor test before a round depended on it. Without that test this
+        surfaces after a round has scored and a rental has been paid for, as a withheld round."""
+        try:
+            # TWO SUBMISSION PATHS, AND THEY ARE NOT INTERCHANGEABLE. `bt.SetWeights` is an
+            # INTENT — policy-gated, submitted with `execute`. `bt.calls.*` are raw generated
+            # calls, submitted with `submit_call`, whose docstring calls itself an escape hatch
+            # "for any generated raw call". Routing an intent through submit_call raises
+            # "TypeError: cannot unpack non-iterable SetWeights object", which `_submit` caught and
+            # reported as a bare `set=False` — so round 1 anchored (a real raw call) and then
+            # silently did not pay (an intent down the wrong path).
+            st = self.st()
+            import bittensor as bt
+            if isinstance(call, bt.Intent):
+                # An intent DECLARES its own signer role (`SetWeights.signer == "hotkey"`), so
+                # `execute` resolves it and rejects an explicit `signer=` kwarg outright.
+                res = st.execute(call, self.wal())
+            else:
+                # A raw generated call declares NO role, and `resolve_signer` defaults to coldkey —
+                # which is deliberately not on this box. It has to be said here or nothing signs.
+                res = st.submit_call(call, self.wal(), signer="hotkey")
+        except Exception as e:
+            self.log.append((what, f"submit failed: {type(e).__name__}: {e}"))
+            if raise_on_fail:
+                # A SILENT ANCHOR FAILURE is how v1's on-chain root went 22 days stale while
+                # scoring carried on. The anchor is the one write that must never fail quietly.
+                raise
+            return False
+        ok = bool(getattr(res, "success", getattr(res, "is_success", res)))
+        if not ok and raise_on_fail:
+            raise RuntimeError(f"{what} was submitted but not accepted: {res!r}")
+        return ok
+
     # ---- helpers -----------------------------------------------------------------------
 
     def uid_of(self, hotkey: str):
-        try:
-            return list(self.mg().hotkeys).index(hotkey)
-        except Exception:
-            return None
+        """Reverse of the Keys map. Returns None for an unregistered hotkey, which every caller
+        treats as "not on this subnet" rather than as uid 0."""
+        for uid, hk in self.mg().items():
+            if hk == hotkey:
+                return uid
+        return None
 
     def _hotkeys(self) -> list:
-        try:
-            return list(self.mg().hotkeys)
-        except Exception as e:
-            self.skipped.append(("metagraph", f"could not sync: {type(e).__name__}: {e}"))
-            return []
+        m = self.mg()
+        if not m:
+            self.skipped.append(("metagraph", "could not read the uid -> hotkey map"))
+        return [m[u] for u in sorted(m)]
 
     def _coldkey_of(self, uid: int) -> str:
+        """The OPERATOR behind a hotkey — the identity anti-grind economics key on, and the one
+        worth deduplicating by, since hotkeys are cheap and a funded coldkey is not."""
+        hk = self.mg().get(int(uid))
+        if not hk:
+            return ""
         try:
-            return str(list(self.mg().coldkeys)[uid])
+            v = self.st().query(_item("SubtensorModule", "Owner"), [hk])
+            # `getattr(v, "value", "")` is WRONG here and returned empty for every hotkey: 11.x
+            # hands back a plain str for this item, and a str has no `.value`, so the default won.
+            # Fall back to the object ITSELF, never to a blank.
+            return str(getattr(v, "value", v) or "")
         except Exception:
             return ""
 
     def _commitment_of(self, uid: int, hotkey: str):
+        """Single-slot read, used only where the whole map would be wasteful. 11.x has no
+        `get_commitment`, so this is the same storage item the map walks, keyed by hotkey."""
         try:
-            return self.st().get_commitment(netuid=self.netuid, uid=int(uid))
+            val = self.st().query(_item("Commitments", "CommitmentOf"), [self.netuid, hotkey])
+            return _decode_commitment(getattr(val, "value", val) or {})
         except Exception as e:
-            self.skipped.append((hotkey, f"get_commitment failed: {type(e).__name__}"))
+            self.skipped.append((hotkey, f"commitment read failed: {type(e).__name__}"))
             return None
 
     def _parse(self, hotkey: str, raw) -> dict | None:
@@ -383,6 +502,18 @@ class BittensorChainIO:
             self.skipped.append((hotkey, "v2 commitment missing cv/tier"))
             return None
         return env
+
+
+def _item(container: str, name: str):
+    """Resolve a typed storage item, e.g. `_item("Commitments", "CommitmentOf")`.
+
+    ISOLATED SO THE CROWN-PATH SUITE STAYS INSTALLABLE WITHOUT THE SDK. 10.x addressed storage by
+    strings, so this module could be exercised with a stub and no `bittensor` on the box — a
+    property requirements.txt states out loud. 11.x addresses it by typed objects that only the
+    package can build, which would have made `import bittensor` a hard dependency of running the
+    tests. One indirection keeps the seam stubbable."""
+    import bittensor as bt
+    return getattr(getattr(bt.storage, container), name)
 
 
 def _decode_commitment(val) -> str:

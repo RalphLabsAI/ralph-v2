@@ -72,7 +72,7 @@ def damage(runner, sigma: float, seed: int = 0) -> int:
 def main() -> int:
     os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
     from .observer_round import build_shared, score_submission
-    from .runners import HFRunner
+    from .runners import HFRunner, continuation
     from .shakedown_round_noise import load_trajectories, _gpu, _sha
 
     rep = {"tag": TAG, "gpu": _gpu(), "parent": PARENT, "observer": OBSERVER, "sigmas": SIGMAS}
@@ -94,7 +94,9 @@ def main() -> int:
         # hash the generated steps too: it separates "the score moved because the model now says
         # something different" from "the score moved but the text did not", which are different
         # problems with different fixes
-        steps = runner.generate([s.prefix for s in shared if s.usable], 256)
+        # chat=False to match the scoring path. A probe that prompts differently from the round it
+        # is probing measures the probe.
+        steps = continuation(runner, [s.prefix for s in shared if s.usable], 256)
         step_sha[name] = _sha(steps)
         ms = score_submission(shared, runner, observer)
         curve[name] = round(ms.score, 6)

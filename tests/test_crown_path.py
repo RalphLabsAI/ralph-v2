@@ -2115,34 +2115,47 @@ def test_miner_submit_and_chain_adapter():
         # the validator adapter parses the miner's envelope, and refuses anything else. The
         # subtensor and metagraph are injected rather than wrapped: since v1 was retired this talks
         # to bittensor directly, so the seam that has to stay testable is the SDK boundary.
-        class _MG:
-            hotkeys = ["hkA", "hkB", "hkC"]
-            coldkeys = ["ckA", "ckB", "ckC"]
+        # STUBBED AT THE bittensor 11.x SURFACE, which is where the real seam is: typed storage
+        # items through `query_map(item, params)`, `block` as a property, `block_info(n).hash`.
+        # 10.x's `get_commitment` / `metagraph()` / `.substrate` are gone from the SDK, so a stub
+        # offering them would be testing an adapter nobody runs.
+        # `_item` is patched to a plain string so this suite needs no `bittensor` on the box —
+        # see chain_bittensor._item for why that indirection exists.
+        import eval.chain_bittensor as _cb
+        _real_item = _cb._item
+        _cb._item = lambda container, name: f"{container}.{name}"
+
+        def _wrap(raw, blk):
+            return {"block": blk, "info": {"fields": [{"Raw64": "0x" + raw.encode().hex()}]}}
+
+        _COMMITS = {"hkA": _wrap(st["envelope"], 100),
+                    "hkB": _wrap("legacy-v1-handshake", 100),
+                    "hkC": _wrap('{"v":9,"tier":"x"}', 100)}
+        _KEYS = {0: "hkA", 1: "hkB", 2: "hkC"}
+        _OWNER = {"hkA": "ckA", "hkB": "ckB", "hkC": "ckC"}
+
+        class _Blk:
+            def __init__(self, n): self.number, self.hash = n, f"0x{n}"
 
         class _Sub:
-            def get_commitment(self, netuid, uid):
-                return {0: st["envelope"], 1: "legacy-v1-handshake",
-                        2: '{"v":9,"tier":"x"}'}[uid]
+            block = 1234
 
-            # commitments_map is preferred; give it the write heights so the ordering check runs
-            class _Substrate:
-                def query_map(self, module, storage_function, params):
-                    def wrap(raw, blk):
-                        return {"block": blk, "info": {"fields": [
-                            {"Raw64": "0x" + raw.encode().hex()}]}}
-                    return [("hkA", wrap(st["envelope"], 100)),
-                            ("hkB", wrap("legacy-v1-handshake", 100)),
-                            ("hkC", wrap('{"v":9,"tier":"x"}', 100))]
-            substrate = _Substrate()
+            def block_info(self, n):
+                return _Blk(n)
 
-            def metagraph(self, netuid):
-                return _MG()
+            def query_map(self, item, params=None, *, block=None):
+                if item == "Commitments.CommitmentOf":
+                    return list(_COMMITS.items())
+                if item == "SubtensorModule.Keys":
+                    return list(_KEYS.items())
+                raise KeyError(item)
 
-            def get_current_block(self):
-                return 1234
-
-            def get_block_hash(self, b):
-                return f"0x{b}"
+            def query(self, item, params=None, *, block=None):
+                if item == "SubtensorModule.Owner":
+                    return _OWNER.get(params[0], "")
+                if item == "Commitments.CommitmentOf":
+                    return _COMMITS.get(params[1], {})
+                raise KeyError(item)
 
         io = BittensorChainIO(subtensor=_Sub(), netuid=40,
                               fetch_dir_for=lambda hk, uri: str(d) if hk == "hkA" else "",
@@ -2182,13 +2195,24 @@ def test_miner_submit_and_chain_adapter():
         assert len(root_live) == 64
 
         class _Empty(_Sub):
-            def get_commitment(self, netuid, uid):
-                return None
+            """A subnet where nobody has committed. It must override the SAME seam the adapter
+            reads — overriding 10.x's `get_commitment`/`.substrate` left it inheriting `_Sub`'s
+            `query_map`, so it silently became a subnet WITH submissions and the assertion below
+            compared a value against itself."""
 
-            class _NoSubstrate:
-                def query_map(self, module, storage_function, params):
+            def query_map(self, item, params=None, *, block=None):
+                if item == "Commitments.CommitmentOf":
                     return []
-            substrate = _NoSubstrate()
+                return super().query_map(item, params, block=block)
+
+            def query(self, item, params=None, *, block=None):
+                # BOTH PATHS, because an empty map makes `read_commitments` fall back to the
+                # per-uid read — that degradation is deliberate, and a stub that empties only the
+                # map keeps serving commitments through the fallback and silently stops being an
+                # empty subnet at all.
+                if item == "Commitments.CommitmentOf":
+                    return {}
+                return super().query(item, params, block=block)
 
         bare = BittensorChainIO(subtensor=_Empty(), netuid=40)
         assert bare.commit_root(1100, 1234) != root_live, \
@@ -3773,12 +3797,27 @@ def test_an_unrevealed_submission_is_refused_not_waved_through():
         env["ch"], env["salt"] = h, salt
         raw = _json.dumps(env, separators=(",", ":"), sort_keys=True)
 
-        class _MG:
-            hotkeys = ["hkA"]; coldkeys = ["ckA"]
+        import eval.chain_bittensor as _cb
+        _real_item2 = _cb._item
+        _cb._item = lambda container, name: f"{container}.{name}"
+
+        _WRAPPED = {"hkA": {"block": 10, "info": {
+            "fields": [{"Raw64": "0x" + raw.encode().hex()}]}}}
 
         class _Sub:
-            def metagraph(self, netuid): return _MG()
-            def get_commitment(self, netuid, uid): return raw
+            block = 100
+
+            def query_map(self, item, params=None, *, block=None):
+                if item == "Commitments.CommitmentOf":
+                    return list(_WRAPPED.items())
+                if item == "SubtensorModule.Keys":
+                    return [(0, "hkA")]
+                raise KeyError(item)
+
+            def query(self, item, params=None, *, block=None):
+                if item == "SubtensorModule.Owner":
+                    return "ckA"
+                return _WRAPPED.get(params[1], {})
 
         io = BittensorChainIO(subtensor=_Sub(), netuid=40,
                               fetch_dir_for=lambda hk, uri: str(d))
@@ -4358,28 +4397,43 @@ def test_a_sparse_field_cannot_move_an_already_published_digest():
         d.update(kw)
         return RoundRecord(**d)
 
+    # GENERIC OVER `_SPARSE`, not hard-coded to `rejected`. The second sparse field (`unclaimed`,
+    # a float whose empty value is 0.0 rather than []) broke this test while the property itself
+    # still held, because the legacy payload was reconstructed by deleting one known key. Every
+    # future sparse field is now covered the day it is added.
     empty = _rec()
-    assert '"rejected"' not in empty.canonical(), \
-        "an empty sparse field entered the signed payload — every published record just moved"
+    assert RoundRecord._SPARSE, "the sparse mechanism was removed; published digests are unprotected"
+    for f in RoundRecord._SPARSE:
+        assert f'"{f}"' not in empty.canonical(), \
+            f"empty sparse field {f!r} entered the signed payload — every published record moved"
 
-    # the digest a pre-`rejected` record would have had: canonical() minus the sparse key
+    # the digest a record published before ANY of these fields existed would have had
     import json as _j
     from dataclasses import asdict
     legacy = {k: v for k, v in asdict(empty).items()
-              if k not in RoundRecord._SIG_FIELDS and k != "rejected"}
+              if k not in RoundRecord._SIG_FIELDS and k not in RoundRecord._SPARSE}
     assert empty.canonical() == _j.dumps(legacy, sort_keys=True, separators=(",", ":")), \
         "the canonical form drifted from what a record published before this field would digest to"
 
-    # ...and a real rejection IS signed
-    full = _rec(rejected=[["5XYZ", ["committed but not revealed"]]])
-    assert '"rejected"' in full.canonical()
-    assert full.sha256() != empty.sha256(), "a rejection that does not change the digest is unsigned"
+    # ...and a real value IS signed, for each of them
+    NONEMPTY = {"rejected": [["5XYZ", ["committed but not revealed"]]], "unclaimed": 0.6,
+                "started_at": 1_786_030_000.0, "published_at": 1_786_033_600.0}
+    for f in RoundRecord._SPARSE:
+        assert f in NONEMPTY, f"sparse field {f!r} has no non-empty case in this test"
+        full = _rec(**{f: NONEMPTY[f]})
+        assert f'"{f}"' in full.canonical(), f"{f!r} vanished even when set"
+        assert full.sha256() != empty.sha256(), \
+            f"a {f!r} value that does not change the digest is unsigned"
 
-    # a record round-trips through the reader with the field intact
+    # a record round-trips through the reader with EVERY sparse field intact, set together — the
+    # loop above leaves `full` holding only the last one, and a per-field round-trip would not
+    # catch a reader that drops one of them when several are present
     from eval.rerun import record_from_blob
-    back = record_from_blob(_j.dumps({**asdict(full)}).encode())
-    assert back.rejected == [["5XYZ", ["committed but not revealed"]]], back.rejected
-    assert back.sha256() == full.sha256()
+    loaded = _rec(**NONEMPTY)
+    back = record_from_blob(_j.dumps(asdict(loaded)).encode())
+    for f, v in NONEMPTY.items():
+        assert getattr(back, f) == v, (f, getattr(back, f))
+    assert back.sha256() == loaded.sha256()
 
 
 def test_every_configured_tier_is_a_tier_that_can_actually_be_scored():
@@ -4770,9 +4824,145 @@ def test_a_reference_spec_is_parsed_and_a_typo_never_stops_a_round():
     assert p.as_job()["references"] == refs
 
 
+def test_a_validator_never_burns_to_its_own_hotkey():
+    """ON NETUID 40 THE DEFAULT BURN UID IS US. Verified on chain: uid 0 is
+    5HijSRHd9wUmk51UE8Kia7vmx6kD2jwqJLn9bY1frQ4aiTUs, the validator's own hotkey. Bittensor has no
+    designated burn address — uid 0 is whoever registered first, and here that is us.
+
+    `set_burn_weights` is called by the AUDITOR, which third parties are meant to run. With the
+    shipped default an independent auditor would have written 100% of its weight to us and called
+    it a burn. That is a self-vote wearing the word "burn", and it would be found."""
+    import eval.chain_bittensor as _cb
+    _cb._item = lambda container, name: f"{container}.{name}"
+    from eval.chain_bittensor import BittensorChainIO
+
+    class _Sub:
+        block = 1
+
+        def query_map(self, item, params=None, *, block=None):
+            return [(0, "US"), (1, "SOMEONE_ELSE")]
+
+        def query(self, item, params=None, *, block=None):
+            return ""
+
+        def submit_call(self, call, wallet):
+            raise AssertionError("signed a self-burn instead of refusing it")
+
+    class _W:
+        class hotkey:
+            ss58_address = "US"
+
+    ours = BittensorChainIO(subtensor=_Sub(), wallet=_W(), netuid=40, read_only=False, burn_uid=0)
+    assert ours.set_burn_weights() is False
+    assert any("REFUSED" in str(e) for e in ours.log), ours.log
+    assert any("own hotkey" in str(e) for e in ours.log), ours.log
+
+    # read_only short-circuits before the guard, so nothing is even considered
+    ro = BittensorChainIO(subtensor=_Sub(), wallet=_W(), netuid=40, read_only=True, burn_uid=0)
+    assert ro.set_burn_weights() is False
+
+
+def test_crown_mirroring_can_never_fail_a_round_that_succeeded():
+    """MIRRORING RUNS INSIDE THE ROUND, so it has to be incapable of breaking one.
+
+    By the time it runs the round is scored, signed, published, anchored and paid — all of that is
+    correct whatever happens next. A crown that fails to mirror is a follow-up chore, not a failed
+    round, and `publish()` must therefore swallow anything the publisher throws and report it."""
+    import eval.publish_crowns as pc
+
+    real = pc.main
+    try:
+        pc.main = lambda argv=None: (_ for _ in ()).throw(RuntimeError("HF is down"))
+        rep = pc.publish(repo="x/y", push=True)
+        assert rep["ok"] is False and rep["rc"] != 0, rep
+        assert "HF is down" in rep["log"], rep["log"]
+
+        pc.main = lambda argv=None: (_ for _ in ()).throw(SystemExit(2))
+        assert pc.publish(repo="x/y", push=True)["ok"] is False
+
+        pc.main = lambda argv=None: 0
+        assert pc.publish(repo="x/y", push=True)["ok"] is True
+    finally:
+        pc.main = real
+
+    # the round's own switch, and the repo it defaults to
+    from eval.run_orchestrated import Config
+    import os as _os
+    old = {k: _os.environ.get(k) for k in ("RALPH_PUBLISH_CROWNS", "RALPH_CROWNS_REPO")}
+    try:
+        for k in old:
+            _os.environ.pop(k, None)
+        c = Config.from_env()
+        assert c.publish_crowns is True and c.crowns_repo == "RalphLabsAI/ralph-crowns", c
+        _os.environ["RALPH_PUBLISH_CROWNS"] = "0"
+        assert Config.from_env().publish_crowns is False
+    finally:
+        for k, v in old.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
+def test_a_published_crown_merges_the_two_rows_a_held_throne_leaves():
+    """A HELD CROWN APPEARS TWICE and neither row is publishable alone.
+
+    The incumbent row carries the re-score the crown decision actually used; the challenger row
+    carries the bit measurement, because an incumbent is re-scored rather than re-ingested and its
+    code_bits/container_bits/params are all zero. Taking the incumbent wholesale renders a 4.61 GB
+    model as "0.0 bits, 0.00 GB", which is exactly how the first draft of the card described it."""
+    from eval.publish_crowns import current_kings
+
+    rec = {"events": [{"tier": "sub4", "action": "hold", "king": "M"}],
+           "submissions": [
+               {"model_id": "M", "role": "challenger", "tier": "sub4", "retention": 0.3030,
+                "code_bits": 4.0, "container_bits": 4.5, "params": 8_190_427_136,
+                "artifact_uri": "hf://miner/m@rev"},
+               {"model_id": "M", "role": "incumbent", "tier": "sub4", "retention": 0.2875,
+                "code_bits": 0.0, "container_bits": 0.0, "params": 0, "artifact_uri": ""},
+           ]}
+    k = current_kings(rec)["sub4"]
+    assert k["retention"] == 0.2875, "must use the re-score, not the luckier challenger number"
+    assert k["code_bits"] == 4.0 and k["container_bits"] == 4.5, k
+    assert k["params"] == 8_190_427_136, k
+    assert k["artifact_uri"] == "hf://miner/m@rev", "the locator must survive the merge"
+
+    # a freshly crowned model has only the one row, and must still publish
+    fresh = {"events": [{"tier": "ternary", "action": "crown", "king": "N"}],
+             "submissions": [{"model_id": "N", "role": "challenger", "tier": "ternary",
+                              "retention": 0.24, "code_bits": 1.714, "container_bits": 2.36,
+                              "params": 1, "artifact_uri": "hf://a/b@c"}]}
+    assert current_kings(fresh)["ternary"]["code_bits"] == 1.714
+
+
+def test_preflight_actually_runs():
+    """IT DID NOT. `preflight` used GpuSpec while only `run()` imported it — a function-local
+    import does not reach another function's scope — so every call raised NameError, including the
+    one `run()` makes before renting. The live round died before spending a cent, which is the good
+    half; the bad half is that nothing here called preflight, so it sat broken from the commit that
+    added the supervisor-deadline check until the first round that tried to use it.
+
+    This test does not care WHICH problems come back. It cares that the function completes and
+    returns a list, because the failure it guards against is an exception, not a wrong verdict."""
+    import io as _io
+
+    from eval.run_orchestrated import Config, preflight
+
+    out = _io.StringIO()
+    bad = preflight(Config(), out=out)
+    assert isinstance(bad, list), bad
+    # every problem must be a sentence an operator can act on, not a bare code
+    for b in bad:
+        assert isinstance(b, str) and len(b) > 20, b
+
+
 def main() -> int:
     _isolate_env()
-    tests = [test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
+    tests = [test_preflight_actually_runs,
+             test_a_validator_never_burns_to_its_own_hotkey,
+             test_crown_mirroring_can_never_fail_a_round_that_succeeded,
+             test_a_published_crown_merges_the_two_rows_a_held_throne_leaves,
+             test_worst_axis_blocks_drifter, test_axis_round_gates, test_long_context_checker,
              test_code_extractor_robust, test_numeric_first_marker, test_diff_in_diff_gate,
              test_diff_in_diff_over_corpus, test_axis_round_overfit_precondition,
              test_content_identity_and_commit_reveal, test_round_record_signature,
