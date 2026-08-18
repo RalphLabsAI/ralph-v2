@@ -396,9 +396,20 @@ class BittensorChainIO:
 
     def _submit(self, call, what: str, raise_on_fail: bool = False) -> bool:
         """One place where anything is signed. Every mutating path goes through here so there is a
-        single line to audit for "what can this process write"."""
+        single line to audit for "what can this process write".
+
+        ALWAYS `signer="hotkey"`, AND THAT IS NOT A DETAIL. `resolve_signer` defaults to
+        role="coldkey", and a generated raw call carries no signer role of its own — so
+        `Commitments.set_commitment` submitted without this asks for a coldkey that is deliberately
+        NOT on the validator box, and dies with "could not unlock coldkey". The chain wants the
+        hotkey regardless: commitments are keyed BY hotkey (that is how `commitments_map` reads
+        them), and a validator's whole job is signing with the hotkey while the coldkey stays
+        somewhere else holding the funds.
+
+        Found by an idempotent anchor test before a round depended on it. Without that test this
+        surfaces after a round has scored and a rental has been paid for, as a withheld round."""
         try:
-            res = self.st().submit_call(call, self.wal())
+            res = self.st().submit_call(call, self.wal(), signer="hotkey")
         except Exception as e:
             self.log.append((what, f"submit failed: {type(e).__name__}: {e}"))
             if raise_on_fail:
