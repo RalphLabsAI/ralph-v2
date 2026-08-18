@@ -123,6 +123,14 @@ def score(job: dict, out_dir: str) -> dict:
     # incumbent is RE-SCORED on this round's items rather than defended on last round's number.
     from .lineage import Reign
     tournament = Tournament(tiers, margin=float(job.get("margin", 0.05)))
+    # STAMP THE ROUND, or every event this round emits says it happened in round 0. `Tournament`
+    # initialises `self.round = 0` and each event copies it, so the number is not decorative: it is
+    # what a `crown` event means by "since", and what an auditor reads to say when a tier changed
+    # hands. `round_engine`, `env_round` and `axis_round` all set it; THIS path — the split
+    # validator, the only one that publishes — did not, so rounds 1 and 2 both shipped events
+    # stamped round 0. Same shape as the scorer-parity bug: the money path missed what the older
+    # entrypoints did correctly.
+    tournament.round = int(job.get("round", 0) or 0)
     registry = {}
     for tier, k in (job.get("kings") or {}).items():
         r = Reign(**k)
