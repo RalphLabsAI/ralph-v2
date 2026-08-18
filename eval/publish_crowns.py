@@ -34,7 +34,12 @@ import os
 import sys
 import urllib.request
 
-TRAIL = "https://huggingface.co/datasets/RalphLabsAI/ralph-v2-shakedown/resolve/main"
+# FOLLOWS THE LIVE TRAIL, from the same env var the round publishes to. This was pinned to the
+# shakedown repo, which was correct while that was the only trail — and would have kept mirroring
+# crowns from an ARCHIVED chain forever once live rounds moved to their own history, quietly
+# publishing a champion no current round had crowned.
+TRAIL_REPO = os.environ.get("RALPH_HF_REPO", "RalphLabsAI/ralph-v2-rounds")
+TRAIL = f"https://huggingface.co/datasets/{TRAIL_REPO}/resolve/main"
 CROWNS_REPO = os.environ.get("RALPH_CROWNS_REPO", "RalphLabsAI/ralph-crowns")
 MANIFEST = "crowns.json"
 
