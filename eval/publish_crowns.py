@@ -111,10 +111,17 @@ def fetch_and_verify(sub: dict, tier: str) -> str | None:
     """Download the pinned revision and prove it is the scored artifact. Returns the .gguf path."""
     from huggingface_hub import snapshot_download
 
-    from .identity import content_hash
+    from .identity import HASHED_SUFFIXES, content_hash
     repo, rev = parse_artifact_uri(sub.get("artifact_uri", ""))
     print(f"  {tier}: fetching {repo}@{rev[:12]}…")
-    d = snapshot_download(repo_id=repo, revision=rev, allow_patterns=["*.gguf"])
+    # THE SAME FILE SET THE SCORER HASHED, derived from HASHED_SUFFIXES rather than guessed.
+    # `allow_patterns=["*.gguf"]` fetched only the weights, but `content_hash` covers .json, .txt,
+    # .model and more — so an artifact carrying a config.json hashed differently here than it did
+    # at intake, and the mirror REFUSED a perfectly good crown as if its bytes had changed. It
+    # looked exactly like a miner swapping the file underneath us. The sub4 crown matched only
+    # because its repo happens to contain nothing but the .gguf.
+    d = snapshot_download(repo_id=repo, revision=rev,
+                          allow_patterns=[f"*{ext}" for ext in sorted(HASHED_SUFFIXES)])
     got = content_hash(d)
     want = sub.get("model_id", "")
     if got != want:
