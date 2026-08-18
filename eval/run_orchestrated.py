@@ -111,6 +111,34 @@ class Config:
             max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
 
 
+def _merge_dropped(rec, commits, skipped, w=lambda _s: None) -> list:
+    """Fold submissions dropped BEFORE scoring into the record's `rejected`, with their reason.
+
+    `rejected` covers what the SCORER refused. A submission dropped earlier — at the chain read, for
+    a missing reveal, a failed fetch, a commitment written at or after the nonce block — never
+    reaches the scorer, so its reason landed in `chain.skipped` on the orchestrator and nowhere a
+    miner could see. From their side they committed, and then vanished from a round they were in.
+
+    THIS IS THE SECOND TIME. `rejected` was added to the signed record after a shakedown round
+    dropped a miner who never revealed; that fix covered only the scorer's own refusals, so live
+    round 1 dropped `5DhpPeU1uamKP` by the identical path — no row, no reason, nothing to appeal.
+    The caller merges before signing, so a drop is exactly as tamper-evident as a score.
+
+    Only hotkeys that actually committed a v2 envelope, and only those with no submission row:
+    `skipped` also carries our own operational notes (`set_weights`, `metagraph`) and the ~109 slots
+    on this netuid that are not submissions at all. Returns what it added, for the caller to log."""
+    committed = {c.hotkey for c in commits}
+    seen = {r[0] for r in (rec.rejected or [])} | {s.miner for s in rec.submissions}
+    added = []
+    for hk, whynot in (skipped or []):
+        if hk in committed and hk not in seen:
+            rec.rejected.append([str(hk), [str(whynot)]])
+            seen.add(hk)
+            added.append(hk)
+            w(f"  dropped   : {str(hk)[:12]}… — {whynot}\n")
+    return added
+
+
 def _parse_references(specs, out=None) -> list:
     """`name=tier=uri` -> `[{"name", "tier", "artifact_uri"}]`. A malformed entry is SKIPPED with a
     warning, never fatal: a reference is our own yardstick, and a typo in it must not stop eleven
@@ -360,6 +388,11 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     res = run_remote_round(plan, provider or ShadeformProvider(), spec,
                            os.path.join(cfg.work_dir, f"round-{idx_round}"), out=out)
     rec, summary = res["record"], res["summary"]
+
+    # a drop is a judgement about someone's work: it belongs in the signed
+    # record beside the scores, not in a log only we can read
+    _merge_dropped(rec, commits, getattr(chain, "skipped", []), w)
+
     if not cfg.require_gpu:
         w(f"\n  PIN THIS: RALPH_REQUIRE_GPU={summary.get('gpu')!r}\n"
           f"  every later round must match it, or crowns stop being comparable\n\n")
