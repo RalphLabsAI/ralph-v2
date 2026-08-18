@@ -496,6 +496,18 @@ class RemoteRoundError(RuntimeError):
     """Raised INSTEAD of signing. Nothing is published and no weights are set."""
 
 
+class RoundAborted(RemoteRoundError):
+    """We were told to stop — SIGTERM, SIGINT, an operator running `systemctl stop`.
+
+    A DISTINCT TYPE BECAUSE "STOP" AND "THIS REGION IS BAD" MUST NOT LOOK ALIKE. The rent-retry
+    loop catches Exception so a dud region is destroyed and another is tried; before this existed
+    the signal raised a plain RemoteRoundError, landed in that handler, and was read as a failed
+    region — so `systemctl stop` destroyed the current rental and RENTED ANOTHER ONE. Stopping the
+    service made it acquire more hardware, and the round carried on scoring while the operator
+    believed it was shutting down. Observed live 2026-08-18.
+
+    Anything catching this must destroy what it holds and then re-raise, never retry.""" 
+
 def gpu_devices(inst: Instance, spec: GpuSpec, timeout: int = 120) -> list:
     """What GPUs the box can actually see, from `nvidia-smi -L`. Empty means none.
 
@@ -733,7 +745,7 @@ def _teardown_on_signal():
     A best-effort install. Off the main thread `signal.signal` raises, and a runner under test has
     nothing to tear down anyway."""
     def _raise(signum, _frame):
-        raise RemoteRoundError(f"signal {signum} — ending the round so the rental can be destroyed")
+        raise RoundAborted(f"signal {signum} — ending the round so the rental can be destroyed")
 
     prev = {}
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -919,7 +931,12 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
             except Exception as e:
                 # DESTROY BEFORE RETRYING. A box stuck in `pending_provider` is still billing, and
                 # leaving one behind per attempt is how a retry loop becomes the expensive bug.
-                w(f"  never became usable ({e}) — trying another region\n")
+                #
+                # AN ABORT IS NOT A BAD REGION. Destroy what we hold, then re-raise — retrying here
+                # is how `systemctl stop` ended up renting a SECOND box and scoring on it.
+                aborted = isinstance(e, RoundAborted)
+                w(f"  never became usable ({e}) — "
+                  f"{'aborting' if aborted else 'trying another region'}\n")
                 tried.append((inst.cloud, inst.region))
                 try:
                     provider.destroy(inst)
@@ -928,6 +945,8 @@ def run_remote_round(plan: RoundPlan, provider: Provider, spec: GpuSpec, work_di
                     w(f"  WARNING could not destroy {inst.id}: {de} — CHECK THE CONSOLE\n")
                 _flush(w)
                 inst = None
+                if aborted:
+                    raise
         if inst is None:
             raise RemoteRoundError(
                 f"no {spec.gpu_type} became usable after {len(tried)} region(s): {tried}. "
