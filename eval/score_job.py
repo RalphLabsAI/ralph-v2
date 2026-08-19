@@ -103,7 +103,16 @@ def score(job: dict, out_dir: str) -> dict:
                       f"{c.get('artifact_uri', '')[:48]}", force=True)
         d = fetch_dir_for(c["hotkey"], c.get("artifact_uri", ""))
         if not d:
-            skipped.append((c["hotkey"], "artifact could not be fetched"))
+            # SAY WHAT ACTUALLY HAPPENED. "could not be fetched" reads as a network blip, and the
+            # resolver refuses for reasons that are nothing of the kind — the one that has actually
+            # fired is commit-reveal: `content hash … does not match the revealed … — the bytes are
+            # not what was committed`. That is a miner serving different bytes than they sealed,
+            # the most security-relevant call this system makes, and it was being filed under a
+            # transport error. The resolver already recorded the real reason in `fetch_log`; this
+            # just stops throwing it away.
+            why = next((str(e[-1]) for e in reversed(fetch_log)
+                        if e and str(e[0]) == c["hotkey"]), "")
+            skipped.append((c["hotkey"], why or "artifact could not be fetched"))
             continue
         committed.append(CommittedSubmission(
             hotkey=c["hotkey"], coldkey=c.get("coldkey", ""), tier=c["tier"], ckpt_dir=d,

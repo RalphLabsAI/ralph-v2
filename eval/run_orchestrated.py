@@ -444,7 +444,19 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
 
     # a drop is a judgement about someone's work: it belongs in the signed
     # record beside the scores, not in a log only we can read
-    _merge_dropped(rec, all_commits, list(getattr(chain, "skipped", [])) + skipped_rows, w)
+    # THE REMOTE'S SKIPS TOO, not just this box's. `score_job` drops a committed miner into its own
+    # `skipped` list — artifact unfetchable, or REFUSED because the served bytes do not hash to what
+    # was revealed — and that list travels home in the SUMMARY, which is not signed and not
+    # published. The record carried only `out.rejected`, so a miner caught in a bait-and-switch
+    # vanished from the round entirely while a miner who merely used a bad quant format got a
+    # permanent, signed row explaining why. Exactly backwards.
+    #
+    # `5DhpPeU1uamK` was dropped this way in BOTH live rounds: content hash 85fc805f… against a
+    # revealed cc0b64ec…. Nothing in the published record said so.
+    _merge_dropped(rec, all_commits,
+                   list(getattr(chain, "skipped", []))
+                   + skipped_rows
+                   + [(h, r) for h, r in (summary.get("skipped") or [])], w)
 
     if not cfg.require_gpu:
         w(f"\n  PIN THIS: RALPH_REQUIRE_GPU={summary.get('gpu')!r}\n"
