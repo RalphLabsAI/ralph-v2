@@ -135,3 +135,35 @@ def replay_from_trail(publisher, max_rounds: int = 0, out=None) -> dict:
         out.write(f"  lineage   : {len(recs)} round(s) replayed -> "
                   f"{ {t: (r.model_id[:10] + '…') for t, r in kings.items()} or 'no king yet'}\n")
     return kings
+
+
+def replay_with_history(publisher, max_rounds: int = 0, out=None) -> tuple:
+    """`(kings, already_scored)` — the thrones, and every artifact the trail has ALREADY measured.
+
+    Same verified walk as `replay_from_trail`, which fetched every record, replayed it and threw
+    the submissions away. The set it now keeps is what lets a round decline to re-measure bytes it
+    has already measured: in live round 2 all THIRTEEN challengers were byte-identical to round 1,
+    so the entire $4.99 / 69-minute round re-derived numbers it already had.
+
+    Keyed on `model_id`, the CONTENT hash — not the artifact URI, which a miner can repoint without
+    changing a weight, and not the hotkey, which says nothing about what it serves. That also makes
+    the set safe to compare against a commitment's `revealed_hash` BEFORE anything is fetched:
+    `verify_reveal` refuses to intake an artifact whose recomputed hash is not the revealed one, so
+    a miner who claims a fresh hash to dodge the skip is rejected for bait-and-switch instead."""
+    idx = publisher.load_index()
+    entries = sorted(idx.get("rounds", []), key=lambda r: int(r["round"]))
+    if max_rounds:
+        entries = entries[-max_rounds:]
+    kings = replay_from_trail(publisher, max_rounds=max_rounds, out=out)
+
+    from .rerun import record_from_blob
+    already: dict = {}
+    for e in entries:
+        blob = publisher.sink.get(e["name"])
+        if blob is None:          # replay_from_trail already aborts on this; belt and braces
+            continue
+        rec = record_from_blob(blob)
+        for sub in rec.submissions:
+            # FIRST round wins, so the message names when it was actually measured
+            already.setdefault(sub.model_id, int(getattr(rec, "round", 0) or 0))
+    return kings, already

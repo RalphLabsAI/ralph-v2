@@ -365,8 +365,61 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     # records are signed, hash-chained and anchored, so the lineage is recoverable by anyone — and
     # a local kings.json would be a second source of truth the operator controls, which is exactly
     # what BittensorChainIO.get_king returns None to avoid.
-    from .lineage import replay_from_trail
-    kings = replay_from_trail(publisher, out=out)
+    from .lineage import replay_with_history
+    kings, already_scored = replay_with_history(publisher, out=out)
+
+    # DO NOT PAY TO MEASURE THE SAME BYTES TWICE. The exam is redrawn every round, so a score from
+    # round N is not comparable with one from round N+1 and cannot simply be carried forward — but
+    # that is an argument for not re-scoring unchanged artifacts, not for re-scoring them forever.
+    # In live round 2 ALL THIRTEEN challengers were byte-identical to round 1: the whole $4.99,
+    # 69-minute round re-derived numbers we already had, and produced no new information about any
+    # of them.
+    #
+    # THE REAL REASON IS NOT COST, IT IS THE FREE RE-ROLL. A challenger that sits still gets a
+    # fresh exam draw every round, forever, at our expense — so a weaker model only has to wait for
+    # a favourable draw. Round 2 showed the defence working (`5CXEMm6u6ono` scored raw-HIGHER than
+    # the sub4 king, 0.2784 vs 0.2671, and the paired bootstrap refused it at margin_lcb -0.0426),
+    # but unlimited free attempts against a fixed margin is the wrong shape. Dethroning should cost
+    # a better artifact, not patience.
+    #
+    # The KING is exempt, and is not listed as skipped: its commitment is byte-identical by
+    # definition, and it IS re-scored this round — through the incumbent path, on this round's
+    # exam, which is what makes the comparison fair. Skipping it here is what removes the duplicate
+    # row that made a 13-miner round publish 15 submissions.
+    crowned = {r.model_id for r in kings.values()}
+    repeats = [c for c in commits
+               if c.revealed_hash and c.revealed_hash in already_scored
+               and c.revealed_hash not in crowned]
+    fresh = [c for c in commits if c not in repeats]
+    # KEPT so the record can still account for them. Silence is exactly what `rejected` exists to
+    # prevent: a miner whose commitment is skipped must be able to read WHY, and "you were not in
+    # that round" is the one answer they cannot get from anywhere else.
+    all_commits = list(commits)
+    skipped_rows = [(c.hotkey,
+                     f"unchanged since round {already_scored[c.revealed_hash]} — the same bytes "
+                     f"were already scored there. Submit a changed artifact to be scored again.")
+                    for c in repeats]
+    for c in repeats:
+        w(f"  unchanged : {c.hotkey[:12]}… already scored in round "
+          f"{already_scored[c.revealed_hash]} — not re-scored\n")
+    if repeats:
+        w(f"  {len(repeats)} unchanged, {len(fresh)} to score\n")
+    commits = fresh
+
+    if not commits:
+        # Nothing NEW is not a failure either, and it is the common case once the field settles.
+        # Renting a GPU to re-measure a field that has not moved buys nothing: with no fresh
+        # challenger there is no one for a king to beat, so no crown can change hands.
+        #
+        # ⚠️ THIS PATH SETS NO WEIGHTS, because it publishes no round. On-chain weights persist
+        # until overwritten, so the standing kings keep earning — but if the field goes quiet for a
+        # long stretch, nothing here refreshes them. If that becomes a problem (validator weight
+        # staleness), the fix is to set weights from the REPLAYED lineage on this path rather than
+        # to start renting again: the thrones are already known, and re-scoring an unchanged field
+        # is exactly what this branch exists to avoid.
+        w("  nothing new since the last round — not renting. The thrones stand.\n")
+        w("  (no weights written on this path — the last vector stands)\n")
+        return 0
 
     idx_round = round_no if round_no is not None else len(publisher.load_index()["rounds"]) + 1
     plan = RoundPlan(
@@ -391,7 +444,19 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
 
     # a drop is a judgement about someone's work: it belongs in the signed
     # record beside the scores, not in a log only we can read
-    _merge_dropped(rec, commits, getattr(chain, "skipped", []), w)
+    # THE REMOTE'S SKIPS TOO, not just this box's. `score_job` drops a committed miner into its own
+    # `skipped` list — artifact unfetchable, or REFUSED because the served bytes do not hash to what
+    # was revealed — and that list travels home in the SUMMARY, which is not signed and not
+    # published. The record carried only `out.rejected`, so a miner caught in a bait-and-switch
+    # vanished from the round entirely while a miner who merely used a bad quant format got a
+    # permanent, signed row explaining why. Exactly backwards.
+    #
+    # `5DhpPeU1uamK` was dropped this way in BOTH live rounds: content hash 85fc805f… against a
+    # revealed cc0b64ec…. Nothing in the published record said so.
+    _merge_dropped(rec, all_commits,
+                   list(getattr(chain, "skipped", []))
+                   + skipped_rows
+                   + [(h, r) for h, r in (summary.get("skipped") or [])], w)
 
     if not cfg.require_gpu:
         w(f"\n  PIN THIS: RALPH_REQUIRE_GPU={summary.get('gpu')!r}\n"
