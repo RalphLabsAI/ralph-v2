@@ -4,11 +4,13 @@ The prior subnet's single most durable defense was economic, not heuristic: one 
 per registration. Detection-based Sybil/spam defenses were all evaded or weaponized.
 So the rules here are deliberately economic:
 
-  * ONE FREE EVAL per registration (hotkey). Extra submissions cost a bond.
   * PER-COLDKEY round cap — bounds how much of a round's eval budget one operator can
-    consume, without an identity-ban (bans hit legit multi-entry and were reverted).
-  * RESUBMISSION BOND, REFUNDED when the submission improves the miner's OWN best —
-    the fee taxes noise/best-of-N grinding, not honest iteration.
+    consume, without an identity-ban (bans hit legit multi-entry and were reverted). This is
+    the load-bearing control: the coldkey comes from chain and cannot be self-declared.
+  * RESUBMISSION BOND — implemented and REFUNDED on self-improvement, but DISABLED
+    (`base_bond = 0.0`) because it is not collectible: the amount is self-reported in the
+    miner's own commitment and no extrinsic moves stake. It rejected honest miners and stopped
+    nobody who read this file. Re-enable when the bond extrinsic below actually exists.
   * Compute is metered (declared, reconciled elsewhere) and only enters ranking as a
     tie-break in v0; capability-per-compute is the documented v1 ranking mode.
 
@@ -32,11 +34,23 @@ class RegistrationLedger:
     """Per-epoch submission accounting. Rebuildable from chain state (idempotent)."""
 
     per_coldkey_round_cap: int = 2
-    # bond for a 2nd+ submission by the same hotkey. NON-ZERO by default: at 0.0 the
-    # anti-grind defense is off and best-of-N crown farming within the per-coldkey cap is
-    # free (the failure that helped kill the prior team's subnet). A validator must
-    # consciously lower it, not silently inherit a disabled bond.
-    base_bond: float = 1.0
+    # OFF BY DEFAULT, CONSCIOUSLY — this used to be 1.0, with a comment insisting it stay
+    # non-zero. That reasoning assumed the bond was collectible. IT IS NOT: `bond_posted` is a
+    # number the miner writes into their own commitment envelope (`miner/submit.py --bond` ->
+    # `env["bond"]`), and no stake moves, nothing is escrowed, and the "bond extrinsic" this
+    # module's docstring refers to was never built. `bonds_held`/`settle()` account for it in a
+    # dict that is discarded when the round ends.
+    #
+    # So the gate blocked miners who trusted the error message and stopped nobody who read the
+    # source. It cost real submissions: algodhf had three artifacts refused for "requires bond
+    # 1.0" across live round 2, any of which would have passed by typing `--bond 1.0`.
+    #
+    # WHAT STILL DEFENDS THE ROUND, all of it actually enforceable:
+    #   * `per_coldkey_round_cap` — the coldkey comes from chain and cannot be self-declared
+    #   * skip-already-scored — re-entry costs NEW bytes, not patience (run_orchestrated)
+    #   * coldkey registration is real TAO, so extra identities are not free
+    # Set this above 0 the day a real bond extrinsic exists; the machinery below still works.
+    base_bond: float = 0.0
     # state
     hotkey_submissions: dict = field(default_factory=dict)      # hotkey -> count this epoch
     coldkey_submissions: dict = field(default_factory=dict)     # coldkey -> count this epoch
