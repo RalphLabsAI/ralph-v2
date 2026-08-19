@@ -67,9 +67,21 @@ def test_the_smallest_tier_pays_most():
 
 
 def test_a_format_that_cannot_run_is_refused_by_every_tier():
-    """TQ1_0 fits the binary and ternary budgets at 1.6875 bpw and mainline llama.cpp ships no
-    Metal kernels for it — a crown in it would be a champion that crashes on every iPhone. Its
-    sibling TQ2_0 is fine, so this cannot be waved through as "the ternary formats are broken"."""
+    """A format that fits the bit budget but cannot run on the target device is not a crown.
+
+    TQ1_0 fits binary and ternary at 1.6875 bpw and has no Metal kernel — a champion that crashes
+    on every iPhone.
+
+    THIS TEST USED TO ASSERT "its sibling TQ2_0 is fine". IT IS NOT. Checked against upstream
+    ggml-org/llama.cpp @ 1c3c967 (2026-08-04): `GGML_TYPE_TQ2_0` appears only in ggml-quants.c,
+    ggml.c and the two ggml-cpu files — zero occurrences under ggml-metal/ AND zero under
+    ggml-cuda/. TQ2_0 is CPU-only, so it would not even run GPU-accelerated on our own scorer; it
+    would silently fall back to CPU, which is the exact trap `eval/gpu_check` was hardened against.
+    Worse, the TQ1_0 refusal used to RECOMMEND TQ2_0, so a miner following our own instructions
+    would have cleared intake with an artifact that cannot ship.
+
+    Q2_0 is the control: same family, same ~2-bit neighbourhood, and it genuinely has Metal matmul
+    kernels — so this cannot be waved through as "the low-bit formats are all broken"."""
     from eval.bitrate import BitReport, bit_tier_gate
     from eval.gguf import GGML_TYPES, code_bits, type_bits
 
@@ -79,8 +91,9 @@ def test_a_format_that_cannot_run_is_refused_by_every_tier():
                         container_bits=type_bits(tid), formats={name: 8_190_000_000})
         return [t.name for t in TIERS if bit_tier_gate(rep, t)[0]]
 
-    assert gate_all("TQ1_0") == [], "an unrunnable format was accepted into a tier"
-    for ok in ("TQ2_0", "Q2_0", "Q1_0", "IQ1_S", "IQ1_M"):
+    for bad in ("TQ1_0", "TQ2_0"):
+        assert gate_all(bad) == [], f"{bad} has no Metal kernel and was accepted into a tier"
+    for ok in ("Q2_0", "Q1_0", "IQ1_S", "IQ1_M"):
         assert gate_all(ok), f"{ok} runs on Apple GPU and must not be refused"
 
 

@@ -197,6 +197,14 @@ class Provider:
     def list_all(self) -> list: ...
 
 
+def _is_out_of_stock(e: Exception) -> bool:
+    """Did the provider refuse this create for want of hardware, rather than because we asked
+    wrongly? Matched on the provider's own error code, with the HTTP status as a fallback for the
+    day they reword it."""
+    t = str(e)
+    return "OUT_OF_STOCK" in t.upper() or "-> 409:" in t
+
+
 class ShadeformProvider(Provider):
     """Shadeform's REST API. The key lives in a file, never in the repo or a job spec."""
 
@@ -282,34 +290,63 @@ class ShadeformProvider(Provider):
                 f"every available {spec.gpu_type} (cloud, region) is excluded: failed this "
                 f"round {sorted(exclude)}, permanently excluded {sorted(spec.exclude_regions)}. "
                 f"Still not substituting a different GPU model.")
-        best, region = cands[0]
-        rate = best.get("hourly_price", 0) / 100.0
-        body = {"cloud": best["cloud"], "region": region,
-                "shade_instance_type": best["shade_instance_type"], "shade_cloud": True,
-                "name": name}
-        if self.ssh_key_id:
-            body["ssh_key_id"] = self.ssh_key_id
-        # THE ONE BOUND THAT SURVIVES THIS BOX DYING. Shadeform enforces both thresholds itself, so
-        # unlike `kill_at`, the `finally`, and the watchdog — all of which need something here to be
-        # alive — this one holds through a SIGKILL, an OOM, a panic, a reboot, or the orchestrator
-        # being reclaimed entirely. That was the largest uncovered risk in the design: with nothing
-        # off-box watching, a leak is bounded only by a human noticing, which last time took 226
-        # minutes. Set LOOSER than every local deadline so it never pre-empts a legitimate round,
-        # and paired with a spend cap because a date is the wrong unit for the thing being risked.
-        hours = spec.max_hours + spec.provider_deadline_slack_h
-        body["auto_delete"] = {
-            "date_threshold": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                            time.gmtime(time.time() + hours * 3600.0)),
-            "spend_threshold": f"{max(1.0, rate * hours):.2f}",
-        }
-        # Self-describing ownership: the account is shared with a live miner box and other
-        # projects, and an instance that cannot say whose it is has to be reasoned about by name.
-        body["tags"] = ["ralph-v2", f"round-{name.split('-')[2] if name.count('-') >= 2 else '?'}",
-                        f"host-{os.uname().nodename[:16]}"]
-        got = self._api("POST", "/instances/create", body)
-        inst = Instance(id=str(got.get("id", "")), cloud=best["cloud"], region=region,
-                        instance_type=best["shade_instance_type"],
-                        price_per_hour=rate, status="pending")
+        # WALK THE CANDIDATES — `available=true` IS A CATALOGUE, NOT A RESERVATION.
+        # hyperstack/montreal-canada-2 advertised stock and answered the create with
+        # `409 OUT_OF_STOCK`. That raised out of `rent`, and the caller's retry loop does not cover
+        # it: that loop wraps `wait_ready`, so it retries a box that fails to BOOT and not one that
+        # fails to be CREATED — the commoner failure by far. Live round 2 died on it outright.
+        #
+        # ONLY STOCK FAILURES MOVE ON. A 401, a malformed body or a bad ssh key would fail
+        # identically in every region, and walking five of them with a broken request turns one
+        # bug into five charges.
+        refused: list = []
+        inst = None
+        for best, region in cands[:5]:
+            rate = best.get("hourly_price", 0) / 100.0
+            body = {"cloud": best["cloud"], "region": region,
+                    "shade_instance_type": best["shade_instance_type"], "shade_cloud": True,
+                    "name": name}
+            if self.ssh_key_id:
+                body["ssh_key_id"] = self.ssh_key_id
+            # THE ONE BOUND THAT SURVIVES THIS BOX DYING. Shadeform enforces both thresholds
+            # itself, so unlike `kill_at`, the `finally`, and the watchdog — all of which need
+            # something here to be alive — this one holds through a SIGKILL, an OOM, a panic, a
+            # reboot, or the orchestrator being reclaimed entirely. That was the largest uncovered
+            # risk in the design: with nothing off-box watching, a leak is bounded only by a human
+            # noticing, which last time took 226 minutes. Set LOOSER than every local deadline so
+            # it never pre-empts a legitimate round, and paired with a spend cap because a date is
+            # the wrong unit for the thing being risked.
+            hours = spec.max_hours + spec.provider_deadline_slack_h
+            body["auto_delete"] = {
+                "date_threshold": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + hours * 3600.0)),
+                "spend_threshold": f"{max(1.0, rate * hours):.2f}",
+            }
+            # Self-describing ownership: the account is shared with a live miner box and other
+            # projects, and an instance that cannot say whose it is has to be reasoned about by
+            # name.
+            body["tags"] = ["ralph-v2",
+                            f"round-{name.split('-')[2] if name.count('-') >= 2 else '?'}",
+                            f"host-{os.uname().nodename[:16]}"]
+            try:
+                got = self._api("POST", "/instances/create", body)
+            except Exception as e:
+                if not _is_out_of_stock(e):
+                    raise
+                refused.append(f"{best['cloud']}/{region}")
+                sys.stdout.write(
+                    f"  {best['cloud']}/{region} advertised stock then refused the create "
+                    f"(out of stock) — trying the next candidate\n")
+                continue
+            inst = Instance(id=str(got.get("id", "")), cloud=best["cloud"], region=region,
+                            instance_type=best["shade_instance_type"],
+                            price_per_hour=rate, status="pending")
+            break
+        if inst is None:
+            raise RuntimeError(
+                f"every available {spec.gpu_type} refused to create for want of stock: "
+                f"{refused}. Nothing was rented, and a different GPU model is still not a "
+                f"substitute.")
         # VERIFIED, NOT ASSUMED — this module's own lesson, learned when destroy() used the wrong
         # HTTP verb and reported success. A silently-ignored auto_delete is worse than none,
         # because the whole point is that it is the guarantee nobody is around to check.
