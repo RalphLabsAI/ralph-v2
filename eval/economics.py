@@ -33,6 +33,14 @@ class SubmitDecision:
 class RegistrationLedger:
     """Per-epoch submission accounting. Rebuildable from chain state (idempotent)."""
 
+    # PER (COLDKEY, TIER), NOT PER COLDKEY. It was per coldkey, and that punished exactly the
+    # behaviour the subnet wants: there are four tiers, a commitment declares ONE, so an operator
+    # competing in all four needs four hotkeys under their coldkey — and the cap scored two of them
+    # and refused the rest, by iteration order. algodhf hit this in live round 2 with one artifact
+    # per tier. Entering more tiers is breadth, not grinding.
+    #
+    # What the cap is actually for is best-of-N INSIDE one tier: two artifacts in `binary`, keep
+    # whichever scores better. Scoping it to the tier stops that and leaves breadth alone.
     per_coldkey_round_cap: int = 2
     # OFF BY DEFAULT, CONSCIOUSLY — this used to be 1.0, with a comment insisting it stay
     # non-zero. That reasoning assumed the bond was collectible. IT IS NOT: `bond_posted` is a
@@ -57,10 +65,14 @@ class RegistrationLedger:
     best_score: dict = field(default_factory=dict)             # COLDKEY -> best retention so far
     bonds_held: dict = field(default_factory=dict)             # hotkey -> bond posted, pending refund
 
-    def can_submit(self, hotkey: str, coldkey: str, bond_posted: float = 0.0) -> SubmitDecision:
-        n_cold = self.coldkey_submissions.get(coldkey, 0)
+    def can_submit(self, hotkey: str, coldkey: str, bond_posted: float = 0.0,
+                   tier: str = "") -> SubmitDecision:
+        n_cold = self.coldkey_submissions.get((coldkey, tier), 0)
         if n_cold >= self.per_coldkey_round_cap:
-            return SubmitDecision(False, reason=f"coldkey round cap {self.per_coldkey_round_cap} reached")
+            return SubmitDecision(False,
+                                  reason=f"coldkey round cap {self.per_coldkey_round_cap} reached "
+                                         f"for tier {tier!r} (the cap is per tier — other tiers "
+                                         f"are unaffected)")
         # The free eval is per COLDKEY, not per hotkey: an operator that registers two
         # hotkeys would otherwise get two FREE scored submissions and keep the better —
         # free best-of-N, the exact grind the bond exists to tax. The coldkey is the
@@ -74,9 +86,11 @@ class RegistrationLedger:
                                   reason=f"resubmission #{n_cold+1} (coldkey) requires bond {need}")
         return SubmitDecision(True, bond_required=need, reason="bonded resubmission")
 
-    def record(self, hotkey: str, coldkey: str, bond_posted: float = 0.0) -> None:
+    def record(self, hotkey: str, coldkey: str, bond_posted: float = 0.0,
+               tier: str = "") -> None:
         self.hotkey_submissions[hotkey] = self.hotkey_submissions.get(hotkey, 0) + 1
-        self.coldkey_submissions[coldkey] = self.coldkey_submissions.get(coldkey, 0) + 1
+        key = (coldkey, tier)
+        self.coldkey_submissions[key] = self.coldkey_submissions.get(key, 0) + 1
         if bond_posted > 0:
             self.bonds_held[hotkey] = self.bonds_held.get(hotkey, 0.0) + bond_posted
 

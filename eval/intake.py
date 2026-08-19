@@ -47,7 +47,7 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
 
     # 1. economics first — cheapest, and stops spam before any file work
     if ledger is not None:
-        d = ledger.can_submit(hotkey, coldkey, bond_posted)
+        d = ledger.can_submit(hotkey, coldkey, bond_posted, tier=getattr(tier, "name", ""))
         if not d.ok:
             return IntakeDecision(False, bond_required=d.bond_required, reasons=[d.reason])
 
@@ -132,6 +132,6 @@ def intake(ckpt_dir: str | Path, tier: TierBudget, ledger: RegistrationLedger | 
 
     # accepted — record the submission (degeneracy + pass@k gates run later, on outputs)
     if ledger is not None:
-        ledger.record(hotkey, coldkey, bond_posted)
+        ledger.record(hotkey, coldkey, bond_posted, tier=getattr(tier, "name", ""))
     return IntakeDecision(True, insp, reasons=[], content_hash=chash, bits=bits_report,
                           parent=parent_check)

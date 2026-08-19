@@ -48,3 +48,29 @@ def test_the_machinery_still_works_when_a_real_bond_exists():
     d = led.can_submit("hot2", "cold1")
     assert not d.ok and d.bond_required == 1.0
     assert led.can_submit("hot2", "cold1", bond_posted=1.0).ok
+
+
+def test_an_operator_can_enter_every_tier():
+    """THE ROUND-2 BUG. There are four tiers and a commitment declares ONE, so competing in all
+    four needs four hotkeys under one coldkey. The cap was per COLDKEY, so it scored two of them
+    and refused the rest by iteration order — punishing breadth, which is the behaviour the subnet
+    wants most. algodhf hit this with one artifact per tier."""
+    led = RegistrationLedger()
+    for hk, tier in (("hk_b", "binary"), ("hk_t", "ternary"),
+                     ("hk_2", "sub2"), ("hk_4", "sub4")):
+        d = led.can_submit(hk, "cold1", tier=tier)
+        assert d.ok, f"{tier} refused for an operator entering every tier: {d.reason}"
+        led.record(hk, "cold1", tier=tier)
+
+
+def test_best_of_n_inside_one_tier_is_still_bounded():
+    """What the cap is actually for: two artifacts in `binary`, keep whichever scores better."""
+    led = RegistrationLedger(per_coldkey_round_cap=2)
+    for n in range(2):
+        assert led.can_submit(f"hk{n}", "cold1", tier="binary").ok
+        led.record(f"hk{n}", "cold1", tier="binary")
+    d = led.can_submit("hk_extra", "cold1", tier="binary")
+    assert not d.ok, "unbounded best-of-N within a tier"
+    assert "binary" in d.reason, "the refusal must name the tier that is full"
+    # ...and a DIFFERENT tier is untouched by that
+    assert led.can_submit("hk_other", "cold1", tier="ternary").ok
