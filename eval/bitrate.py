@@ -36,6 +36,7 @@ Rules that follow, and that the tier gate enforces:
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
 
 # a code is "the same" if it matches to this tolerance after group normalization. Loose enough
@@ -387,9 +388,26 @@ def emission_weight(tier_name: str, n_tiers: int = 4) -> float:
 # for it — verified against ggml-metal.metal, which carries get_rows/dequantize for q1_0, q2_0,
 # tq2_0, iq1_s, iq1_m, iq2_xxs and q4_K, and nothing for tq1_0. A TQ1_0 crown would be a champion
 # that crashes on every iPhone. Its sibling TQ2_0 is fine.
+# VERIFIED AGAINST THE SOURCE, NOT REMEMBERED. Checked against a mainline llama.cpp checkout
+# (1c3c967, 2026-08-04): `ggml/src/ggml-metal/` contains ZERO occurrences of tq1_0 or tq2_0, while
+# q1_0, q2_0, iq1_s, iq1_m, iq2_xxs and the q*_K family all have `kernel_mul_mv_*` matmul kernels.
+# Both TQ types exist in the CPU and CUDA paths only — which is exactly why they are so easy to
+# ship by accident: they quantise, they load, and they run perfectly well on the box you built them
+# on.
+#
+# TQ2_0 WAS THE DANGEROUS ONE. It was missing from this dict, so it passed intake — and the TQ1_0
+# rejection message ACTIVELY RECOMMENDED IT. A miner who did exactly what we told them would have
+# swapped one unrunnable format for another, cleared the gate, and could have been crowned with an
+# artifact that cannot run on the device the crown exists to reach. The advice was worse than the
+# rule it explained.
+_NO_METAL = ("mainline llama.cpp has no Metal kernels for {fmt} — it cannot run on Apple GPU, "
+             "which is what the crown has to ship to. Use Q1_0, Q2_0, IQ1_S, IQ1_M or IQ2_XXS "
+             "(all of which have Metal matmul kernels). Check with "
+             "`python -m eval.bitrate <model.gguf>` before you commit.")
+
 UNRUNNABLE_FORMATS = {
-    "TQ1_0": "mainline llama.cpp has no Metal kernels for TQ1_0 — it cannot run on Apple GPU. "
-             "Use TQ2_0, Q2_0, Q1_0, IQ1_S or IQ1_M.",
+    "TQ1_0": _NO_METAL.format(fmt="TQ1_0"),
+    "TQ2_0": _NO_METAL.format(fmt="TQ2_0"),
 }
 
 
@@ -407,3 +425,65 @@ def bit_tier_gate(rep: BitReport, tier: BitTier) -> tuple[bool, list[str]]:
         r.append(f"container bits {rep.container_bits} exceed {tier.name} cap "
                  f"{tier.max_container_bits} (unshippable artifact)")
     return (not r), r
+
+
+def main(argv: list) -> int:
+    """`python -m eval.bitrate <model.gguf | checkpoint-dir>` — what intake will decide, before you
+    commit to it.
+
+    THIS EXISTS BECAUSE THE RULES WERE ONLY DISCOVERABLE BY LOSING. Two miners have been rejected
+    for `TQ1_0` — including the only `binary` submission this subnet has ever received — for a
+    constraint that lived in this file and appeared in no document a miner reads. A rule enforced
+    at intake and published nowhere is a trap, and the cheapest fix is to let them run the same
+    code the validator runs.
+
+    Deliberately calls `measure_checkpoint`/`measure_gguf_dir` rather than reimplementing the
+    walk: a checker that can disagree with intake is worse than no checker, because it is believed.
+    """
+    import os
+
+    if len(argv) < 2:
+        sys.stdout.write("usage: python -m eval.bitrate <model.gguf | checkpoint-dir>\n")
+        return 2
+    path = argv[1]
+    if not os.path.exists(path):
+        sys.stdout.write(f"no such path: {path}\n")
+        return 2
+
+    rep = (measure_gguf_dir([path]) if os.path.isfile(path) and path.lower().endswith(".gguf")
+           else measure_checkpoint(path))
+
+    sys.stdout.write(f"\n  {path}\n")
+    sys.stdout.write(f"  params          : {rep.params:,}\n")
+    sys.stdout.write(f"  code bits/weight: {rep.code_bits:.4f}   (the achievement)\n")
+    sys.stdout.write(f"  container bits  : {rep.container_bits:.4f}   (what you ship)\n")
+    if rep.formats:
+        sizes = ", ".join(f"{k} ({v:,} weights)" for k, v in sorted(rep.formats.items()))
+        sys.stdout.write(f"  quant formats   : {sizes}\n")
+    for note in (rep.notes or []):
+        sys.stdout.write(f"  note            : {note}\n")
+
+    sys.stdout.write("\n  tier fit:\n")
+    fits = []
+    for tier in TIERS:
+        ok, why = bit_tier_gate(rep, tier)
+        if ok:
+            fits.append(tier.name)
+            sys.stdout.write(f"    {tier.name:8s} PASS\n")
+        else:
+            sys.stdout.write(f"    {tier.name:8s} no — {why[0]}\n")
+
+    if not fits:
+        sys.stdout.write("\n  THIS WOULD BE REJECTED AT INTAKE in every tier. Fix the reason "
+                         "above and re-measure before you commit.\n\n")
+        return 9
+    # The tiers are ordered smallest-budget first, so the first fit is the hardest one it clears —
+    # and the hardest tier it clears is the one worth entering: emission is weighted toward the
+    # smaller artifact, and entering an easier tier only puts it against models carrying more bits.
+    sys.stdout.write(f"\n  fits: {', '.join(fits)} — enter `{fits[0]}`, the smallest that fits "
+                     f"(emission is weighted toward smaller artifacts).\n\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

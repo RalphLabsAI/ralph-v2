@@ -65,6 +65,29 @@ Six gates, in order. Nothing loads your weights until all six pass.
 A 4-bit model shipped inside a 16-bit container is credited for the compression it achieved and
 rejected as an unshippable artifact — both budgets bind.
 
+### Formats that can win
+
+**The crown has to run on a phone.** That is the product, so a format mainline `llama.cpp` cannot
+execute on Apple GPU is rejected at intake no matter how good its retention would have been — we
+score on an H100 where it might run perfectly well, and reject it anyway.
+
+| | |
+|---|---|
+| **use** | `Q1_0`, `Q2_0`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, and the `Q*_K` family |
+| **rejected** | **`TQ1_0`, `TQ2_0`** — mainline has no Metal kernel for either |
+
+**The `TQ*` types are the trap.** They are the obvious choice by name at ~1.1 and ~2.1 bits, they
+pack beautifully, and they run fine on the CUDA box you built them on — and they exist only in
+llama.cpp's CPU and CUDA paths. There is no Metal kernel for either, so they cannot run on a phone.
+`TQ1_0` has already cost two miners their entry, including the only `binary` submission this subnet
+has ever received. Use `Q1_0` or `IQ1_S` at the binary end, `Q2_0` or `IQ2_XXS` at the sub-2 end.
+
+Check before you commit — the same code the validator runs:
+
+```bash
+python -m eval.bitrate path/to/model.gguf
+```
+
 ### What wins
 
 Your model and the parent each continue the same reasoning trajectory. An independent observer
