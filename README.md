@@ -88,15 +88,61 @@ Check before you commit — the same code the validator runs:
 python -m eval.bitrate path/to/model.gguf
 ```
 
-### What wins
+### How to reach the binary tier
 
-Your model and the parent each continue the same reasoning trajectory. An independent observer
-model reads both, and your score is how closely you moved it to where the parent did. Scores
-aggregate **worst-slice across languages**, so a weak language cannot be bought with a strong one.
+**Binary is a research tier. Stock `llama-quantize` will not get you there, and we were wrong to
+imply otherwise.** An earlier version of this section said a good importance matrix makes `Q1_0`
+coherent. A miner ran it end to end on mainline and reported perplexity in the millions; we then
+checked the reference and they were right.
 
-Which trajectories get scored, and which observer grades them, are both drawn from a chain value
-that does not exist until your checkpoint is sealed. There is no fixed test set to fit and no
-grader you can name in advance.
+Here is what the reference actually is. `prism-ml/Bonsai-8B-unpacked` ships F16 weights, and every
+group of 128 in them holds **exactly two distinct values — one magnitude and a sign**:
+
+```
+model.layers.0.mlp.up_proj.weight  F16 [12288, 4096]
+  group 0: 2 distinct values, 1 magnitude (±0.02966309)
+  group 2: 2 distinct values, 1 magnitude (±0.0255127)
+```
+
+Those weights were already 1-bit before any GGUF existed. The `Q1_0` file is a packing step, not a
+compression step — llama.cpp supplies the kernels that RUN 1-bit weights, not a method that
+PRODUCES good ones. Round-to-nearest with group scales, which is what `llama-quantize` does, throws
+away the information at one bit no matter how good the imatrix is.
+
+So winning `binary` means producing the 1-bit weights yourself, then exporting to `Q1_0` — the bit
+gate is satisfied by the packing, and the quality has to be there before it.
+
+**You do not have to invent the method. Two published 1-bit PTQ frameworks are open source and need
+no retraining:**
+
+| | |
+|---|---|
+| [BiLLM](https://github.com/Aaronhuang-778/BiLLM) (ICML 2024) | splits salient / non-salient weights, binary residual approximation for the salient ones. Reports 8.41 ppl on LLaMA2-70B at **1.08 bit** |
+| [ARB-LLM](https://github.com/ZHITENGLI/ARB-LLM) | alternating refined binarization with row/column-wise scaling factors |
+
+**1.08 bit fits under this tier's 1.15 cap**, so the published operating point clears the budget
+with room for a 2-bit embedding on top. The remaining work is real but it is engineering rather
+than research: run the binarizer on the pinned parent, then get those weights into a `Q1_0` GGUF.
+
+**We have not run either on Qwen3-8B ourselves** — we are pointing at the state of the art, not
+handing you a verified recipe, and the export path in particular is unproven. If you get one
+working we would rather hear about it than have you assume we already know.
+
+**The bit budget is not the hard part**, and it is more generous than the reference: the cap is
+1.15 against Bonsai's 1.125, which buys **15% of parameters at 2-bit** or 5% at 4-bit. On Qwen3-8B
+the token embedding is 7.60% of parameters, so `--token-embedding-type Q2_K` measures **1.0760**
+and passes. Embedding *and* output both at `Q2_K` comes to 1.1520 and just misses.
+
+**If you want a crown this month, `sub2` is the better target.** A `Q2_0` body with a
+higher-precision embedding measures ~2.23 against a 2.3 cap, it is reachable with stock
+`llama-quantize`, and the tier is uncrowned because its only entrant so far fails the degeneracy
+gate.
+
+Check what intake will say before you commit:
+
+```bash
+python -m eval.bitrate qwen3-8b-binary.gguf
+```
 
 ---
 
