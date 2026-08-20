@@ -90,47 +90,45 @@ python -m eval.bitrate path/to/model.gguf
 
 ### How to reach the binary tier
 
-Binary pays the largest share of emission and has never been crowned. It is hard, but it is not a
-research problem you need to invent — the operating point is public and mainline `llama.cpp` can
-hit it today.
+**Binary is a research tier. Stock `llama-quantize` will not get you there, and we were wrong to
+imply otherwise.** An earlier version of this section said a good importance matrix makes `Q1_0`
+coherent. A miner ran it end to end on mainline and reported perplexity in the millions; we then
+checked the reference and they were right.
 
-**Target `Q1_0`.** It is a selectable quantize type (`" 1.125 bpw quantization"`), it has Metal
-kernels, and 1.125 bpw is exactly where the published binary reference sits. A pure `Q1_0` model
-measures **1.000 code bits** against a 1.15 cap.
+Here is what the reference actually is. `prism-ml/Bonsai-8B-unpacked` ships F16 weights, and every
+group of 128 in them holds **exactly two distinct values — one magnitude and a sign**:
 
-**You must use an importance matrix.** Round-to-nearest at one bit produces a model that loops, and
-the degeneracy gate rejects it — that is what every binary attempt so far has run into. The imatrix
-is llama.cpp's error compensation and it is the difference between a 1-bit model and noise:
-
-```bash
-llama-imatrix -m qwen3-8b-f16.gguf -f calibration.txt -o imatrix.dat
-llama-quantize --imatrix imatrix.dat --token-embedding-type Q2_K                qwen3-8b-f16.gguf qwen3-8b-binary.gguf Q1_0
+```
+model.layers.0.mlp.up_proj.weight  F16 [12288, 4096]
+  group 0: 2 distinct values, 1 magnitude (±0.02966309)
+  group 2: 2 distinct values, 1 magnitude (±0.0255127)
 ```
 
-**Spend the headroom where 1-bit hurts most.** The cap is 1.15, not 1.125, and that 0.15 is
-deliberate: it buys **15% of parameters at 2-bit**, or 5% at 4-bit. On Qwen3-8B the token embedding
-is 7.60% of parameters, so `--token-embedding-type Q2_K` measures **1.0760** and passes with room.
-Embedding *and* output both at `Q2_K` comes to 1.1520 and just misses — pick one, or split them.
+Those weights were already 1-bit before any GGUF existed. The `Q1_0` file is a packing step, not a
+compression step — llama.cpp supplies the kernels that RUN 1-bit weights, not a method that
+PRODUCES good ones. Round-to-nearest with group scales, which is what `llama-quantize` does, throws
+away the information at one bit no matter how good the imatrix is.
 
-**Your calibration corpus is the whole game.** Scores aggregate **worst-slice across languages**, so
-an imatrix calibrated on English alone will look fine in English and lose on the slice that decides
-your score. This is the single largest lever in the tier, and the one most miners get wrong.
+So winning `binary` means producing the 1-bit weights yourself: quantization-aware training,
+error-compensated PTQ in the Optimal-Brain-Surgeon line, trellis/vector quantization, or PTQ plus a
+recovery distillation pass. Then export to `Q1_0` and the bit gate is satisfied. That is a real
+piece of work, and it is why the tier pays the most and is still uncrowned.
+
+**The bit budget is not the hard part**, and it is more generous than the reference: the cap is
+1.15 against Bonsai's 1.125, which buys **15% of parameters at 2-bit** or 5% at 4-bit. On Qwen3-8B
+the token embedding is 7.60% of parameters, so `--token-embedding-type Q2_K` measures **1.0760**
+and passes. Embedding *and* output both at `Q2_K` comes to 1.1520 and just misses.
+
+**If you want a crown this month, `sub2` is the better target.** A `Q2_0` body with a
+higher-precision embedding measures ~2.23 against a 2.3 cap, it is reachable with stock
+`llama-quantize`, and the tier is uncrowned because its only entrant so far fails the degeneracy
+gate.
 
 Check what intake will say before you commit:
 
 ```bash
 python -m eval.bitrate qwen3-8b-binary.gguf
 ```
-
-### What wins
-
-Your model and the parent each continue the same reasoning trajectory. An independent observer
-model reads both, and your score is how closely you moved it to where the parent did. Scores
-aggregate **worst-slice across languages**, so a weak language cannot be bought with a strong one.
-
-Which trajectories get scored, and which observer grades them, are both drawn from a chain value
-that does not exist until your checkpoint is sealed. There is no fixed test set to fit and no
-grader you can name in advance.
 
 ---
 
