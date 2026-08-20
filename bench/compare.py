@@ -43,22 +43,33 @@ from bench.tasks import DATASET_IDS, TASKS, score, select_mgsm_langs
 #           not compression — which is the only thing this benchmark is trying to measure. It is
 #           disabled, explicitly and on the record, rather than silently.
 MODELS = {
-    "parent-qwen3-8b":  {"kind": "hf", "repo": "Qwen/Qwen3-8B", "rev": "main",
+    "parent-qwen3-8b":  {"kind": "hf", "repo": "Qwen/Qwen3-8B",
+                         "rev": "b968826d9c46dd6066d109eabc6255188de91218",
                          "dtype": "bfloat16"},
 
     # Ralph crowns — exactly the bytes that were scored and anchored
-    "ralph-ternary":    {"kind": "gguf", "repo": "tensor-tailor/ralph-qwen3-8b-ternary",
-                         "rev": "301e4db4e8889831856eabd58e0824034d4ed236"},
-    "ralph-sub4":       {"kind": "gguf", "repo": "tensor-tailor/ralph-qwen3-8b-sub4",
-                         "rev": "2a2e1bcf9fa9e53165c78be66c9be14d3f9cc1c7"},
+    # THE REIGNING CROWNS, as of round 2 — not whoever held them when this file was written.
+    # These were pinned to tensor-tailor, which in round 2 scored 0.2062 ternary and 0.1341 sub4:
+    # neither is a king. Benchmarking a model the subnet did not crown, and publishing it as "our
+    # crown", is the same class of error as the three confounds this harness was rebuilt to fix.
+    #
+    # Revisions are COMMIT SHAS, never `main`. The record pins ternary at `@main`, which is a
+    # moving reference — fine for a round that re-fetches and hash-verifies every time, useless for
+    # a benchmark whose whole value is that someone else can re-run it and get the same number.
+    "ralph-ternary":    {"kind": "gguf", "repo": "crazy-m1ner/ralph-qwen3-8b-ternary",
+                         "rev": "319aa2d43933931a2e9d831166e545eb187a248f"},
+    "ralph-sub4":       {"kind": "gguf", "repo": "andreas11112/qwen3-8b-sn40-sub4",
+                         "rev": "8c8cfa61be18005fb859fd58b5c8d943a26ac1dd"},
 
     # PrismML. Their COMPRESSED ggufs advertise file_type 141 / 41 — a custom fork's types that
     # stock llama.cpp cannot load — so the unpacked safetensors are the only artifact of theirs
     # runnable without adopting their toolchain. Verified genuinely ternary: exactly 3 distinct
     # values in every 128-weight window across three tensors.
-    "bonsai-ternary":   {"kind": "hf", "repo": "prism-ml/Ternary-Bonsai-8B-unpacked", "rev": "main",
+    "bonsai-ternary":   {"kind": "hf", "repo": "prism-ml/Ternary-Bonsai-8B-unpacked",
+                         "rev": "ac20f03fc62e872399218b659c8e949dfca05769",
                          "dtype": "float16", "config": {"rope_scaling": None}},
-    "bonsai-1bit":      {"kind": "hf", "repo": "prism-ml/Bonsai-8B-unpacked", "rev": "main",
+    "bonsai-1bit":      {"kind": "hf", "repo": "prism-ml/Bonsai-8B-unpacked",
+                         "rev": "376f381570d6115bc03f82adcfa4af0c7672ae54",
                          "dtype": "float16", "config": {"rope_scaling": None}},
 }
 
