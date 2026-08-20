@@ -403,6 +403,49 @@ def _save(path, payload):
     os.replace(tmp, path)
 
 
+def _assert_gpu() -> None:
+    """Refuse to benchmark on CPU. The round path has had this since the CPU-fallback hole; the
+    BENCHMARK path never did, and on 2026-08-18 it quietly spent 31 minutes and ~$3.60 running a
+    rented H100 SXM box at 1252% CPU and 0% GPU.
+
+    The cause was `CUDA error 802: system not yet initialized` — an H100 SXM board whose
+    `nvidia-fabricmanager` would not start, so the NVLink fabric was never brought up and
+    `cudaGetDeviceCount()` failed. torch was the correct `2.11.0+cu128` and the driver
+    (570.148.08) supported it; nothing about the install was wrong, and nothing said so.
+
+    It is not only a money failure. CPU and GPU do not produce identical logits, so a benchmark
+    that silently changes device is a fourth confound in a harness rebuilt specifically to remove
+    three of them — and it would have been the kind that favours nobody predictably, which is
+    worse than one that favours us.
+
+    `RALPH_ALLOW_CPU_BENCH=1` to accept it deliberately."""
+    import os
+
+    if os.environ.get("RALPH_ALLOW_CPU_BENCH") == "1":
+        return
+    try:
+        import torch
+    except Exception:
+        return                      # no torch at all: the GGUF-only path is llama.cpp's problem
+    if torch.cuda.is_available():
+        print(f"  gpu: {torch.cuda.get_device_name(0)}")
+        return
+    hint = ""
+    try:
+        import subprocess
+        smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30)
+        if smi.returncode == 0 and smi.stdout.strip():
+            hint = (f" `nvidia-smi` DOES see {smi.stdout.strip().splitlines()[0][:60]}, so the card "
+                    f"is attached and the CUDA runtime cannot reach it — on an SXM board that is "
+                    f"usually nvidia-fabricmanager failing to start.")
+    except Exception:
+        pass
+    raise SystemExit(
+        f"refusing to benchmark: torch reports no CUDA device, so every model would run on CPU."
+        f"{hint} The numbers would not be comparable with any GPU run and the box bills either "
+        f"way. Rent elsewhere, or set RALPH_ALLOW_CPU_BENCH=1 to accept it.")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tasks", default=",".join(TASKS))
@@ -419,6 +462,8 @@ def main(argv=None) -> int:
 
     if a.langs:
         print(f"  mgsm restricted to: {', '.join(select_mgsm_langs(a.langs))}")
+
+    _assert_gpu()
 
     for p in preflight():
         print(f"  PREFLIGHT: {p}")
