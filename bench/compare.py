@@ -43,22 +43,33 @@ from bench.tasks import DATASET_IDS, TASKS, score, select_mgsm_langs
 #           not compression — which is the only thing this benchmark is trying to measure. It is
 #           disabled, explicitly and on the record, rather than silently.
 MODELS = {
-    "parent-qwen3-8b":  {"kind": "hf", "repo": "Qwen/Qwen3-8B", "rev": "main",
+    "parent-qwen3-8b":  {"kind": "hf", "repo": "Qwen/Qwen3-8B",
+                         "rev": "b968826d9c46dd6066d109eabc6255188de91218",
                          "dtype": "bfloat16"},
 
     # Ralph crowns — exactly the bytes that were scored and anchored
-    "ralph-ternary":    {"kind": "gguf", "repo": "tensor-tailor/ralph-qwen3-8b-ternary",
-                         "rev": "301e4db4e8889831856eabd58e0824034d4ed236"},
-    "ralph-sub4":       {"kind": "gguf", "repo": "tensor-tailor/ralph-qwen3-8b-sub4",
-                         "rev": "2a2e1bcf9fa9e53165c78be66c9be14d3f9cc1c7"},
+    # THE REIGNING CROWNS, as of round 2 — not whoever held them when this file was written.
+    # These were pinned to tensor-tailor, which in round 2 scored 0.2062 ternary and 0.1341 sub4:
+    # neither is a king. Benchmarking a model the subnet did not crown, and publishing it as "our
+    # crown", is the same class of error as the three confounds this harness was rebuilt to fix.
+    #
+    # Revisions are COMMIT SHAS, never `main`. The record pins ternary at `@main`, which is a
+    # moving reference — fine for a round that re-fetches and hash-verifies every time, useless for
+    # a benchmark whose whole value is that someone else can re-run it and get the same number.
+    "ralph-ternary":    {"kind": "gguf", "repo": "crazy-m1ner/ralph-qwen3-8b-ternary",
+                         "rev": "319aa2d43933931a2e9d831166e545eb187a248f"},
+    "ralph-sub4":       {"kind": "gguf", "repo": "andreas11112/qwen3-8b-sn40-sub4",
+                         "rev": "8c8cfa61be18005fb859fd58b5c8d943a26ac1dd"},
 
     # PrismML. Their COMPRESSED ggufs advertise file_type 141 / 41 — a custom fork's types that
     # stock llama.cpp cannot load — so the unpacked safetensors are the only artifact of theirs
     # runnable without adopting their toolchain. Verified genuinely ternary: exactly 3 distinct
     # values in every 128-weight window across three tensors.
-    "bonsai-ternary":   {"kind": "hf", "repo": "prism-ml/Ternary-Bonsai-8B-unpacked", "rev": "main",
+    "bonsai-ternary":   {"kind": "hf", "repo": "prism-ml/Ternary-Bonsai-8B-unpacked",
+                         "rev": "ac20f03fc62e872399218b659c8e949dfca05769",
                          "dtype": "float16", "config": {"rope_scaling": None}},
-    "bonsai-1bit":      {"kind": "hf", "repo": "prism-ml/Bonsai-8B-unpacked", "rev": "main",
+    "bonsai-1bit":      {"kind": "hf", "repo": "prism-ml/Bonsai-8B-unpacked",
+                         "rev": "376f381570d6115bc03f82adcfa4af0c7672ae54",
                          "dtype": "float16", "config": {"rope_scaling": None}},
 }
 
@@ -392,6 +403,49 @@ def _save(path, payload):
     os.replace(tmp, path)
 
 
+def _assert_gpu() -> None:
+    """Refuse to benchmark on CPU. The round path has had this since the CPU-fallback hole; the
+    BENCHMARK path never did, and on 2026-08-18 it quietly spent 31 minutes and ~$3.60 running a
+    rented H100 SXM box at 1252% CPU and 0% GPU.
+
+    The cause was `CUDA error 802: system not yet initialized` — an H100 SXM board whose
+    `nvidia-fabricmanager` would not start, so the NVLink fabric was never brought up and
+    `cudaGetDeviceCount()` failed. torch was the correct `2.11.0+cu128` and the driver
+    (570.148.08) supported it; nothing about the install was wrong, and nothing said so.
+
+    It is not only a money failure. CPU and GPU do not produce identical logits, so a benchmark
+    that silently changes device is a fourth confound in a harness rebuilt specifically to remove
+    three of them — and it would have been the kind that favours nobody predictably, which is
+    worse than one that favours us.
+
+    `RALPH_ALLOW_CPU_BENCH=1` to accept it deliberately."""
+    import os
+
+    if os.environ.get("RALPH_ALLOW_CPU_BENCH") == "1":
+        return
+    try:
+        import torch
+    except Exception:
+        return                      # no torch at all: the GGUF-only path is llama.cpp's problem
+    if torch.cuda.is_available():
+        print(f"  gpu: {torch.cuda.get_device_name(0)}")
+        return
+    hint = ""
+    try:
+        import subprocess
+        smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30)
+        if smi.returncode == 0 and smi.stdout.strip():
+            hint = (f" `nvidia-smi` DOES see {smi.stdout.strip().splitlines()[0][:60]}, so the card "
+                    f"is attached and the CUDA runtime cannot reach it — on an SXM board that is "
+                    f"usually nvidia-fabricmanager failing to start.")
+    except Exception:
+        pass
+    raise SystemExit(
+        f"refusing to benchmark: torch reports no CUDA device, so every model would run on CPU."
+        f"{hint} The numbers would not be comparable with any GPU run and the box bills either "
+        f"way. Rent elsewhere, or set RALPH_ALLOW_CPU_BENCH=1 to accept it.")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tasks", default=",".join(TASKS))
@@ -408,6 +462,8 @@ def main(argv=None) -> int:
 
     if a.langs:
         print(f"  mgsm restricted to: {', '.join(select_mgsm_langs(a.langs))}")
+
+    _assert_gpu()
 
     for p in preflight():
         print(f"  PREFLIGHT: {p}")
