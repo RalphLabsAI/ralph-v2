@@ -41,7 +41,15 @@ class RegistrationLedger:
     #
     # What the cap is actually for is best-of-N INSIDE one tier: two artifacts in `binary`, keep
     # whichever scores better. Scoping it to the tier stops that and leaves breadth alone.
-    per_coldkey_round_cap: int = 2
+    # ONE PER (COLDKEY, TIER). At 2 this allowed best-of-2 inside a tier and, across four tiers,
+    # up to 8 accepted submissions from a single operator per round — ~15 minutes of rented GPU for
+    # one miner. At 1 an operator can enter every tier and grind none of them, which is exactly the
+    # shape we want: breadth free, best-of-N closed.
+    #
+    # Iterating is not blocked, it is just moved to where it belongs — the NEXT round, with
+    # different bytes. `run_orchestrated` already refuses to re-score an artifact the trail has
+    # measured, so re-entry costs a real quantize, not a resubmit.
+    per_coldkey_round_cap: int = 1
     # OFF BY DEFAULT, CONSCIOUSLY — this used to be 1.0, with a comment insisting it stay
     # non-zero. That reasoning assumed the bond was collectible. IT IS NOT: `bond_posted` is a
     # number the miner writes into their own commitment envelope (`miner/submit.py --bond` ->
