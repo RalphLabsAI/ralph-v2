@@ -109,10 +109,24 @@ compression step — llama.cpp supplies the kernels that RUN 1-bit weights, not 
 PRODUCES good ones. Round-to-nearest with group scales, which is what `llama-quantize` does, throws
 away the information at one bit no matter how good the imatrix is.
 
-So winning `binary` means producing the 1-bit weights yourself: quantization-aware training,
-error-compensated PTQ in the Optimal-Brain-Surgeon line, trellis/vector quantization, or PTQ plus a
-recovery distillation pass. Then export to `Q1_0` and the bit gate is satisfied. That is a real
-piece of work, and it is why the tier pays the most and is still uncrowned.
+So winning `binary` means producing the 1-bit weights yourself, then exporting to `Q1_0` — the bit
+gate is satisfied by the packing, and the quality has to be there before it.
+
+**You do not have to invent the method. Two published 1-bit PTQ frameworks are open source and need
+no retraining:**
+
+| | |
+|---|---|
+| [BiLLM](https://github.com/Aaronhuang-778/BiLLM) (ICML 2024) | splits salient / non-salient weights, binary residual approximation for the salient ones. Reports 8.41 ppl on LLaMA2-70B at **1.08 bit** |
+| [ARB-LLM](https://github.com/ZHITENGLI/ARB-LLM) | alternating refined binarization with row/column-wise scaling factors |
+
+**1.08 bit fits under this tier's 1.15 cap**, so the published operating point clears the budget
+with room for a 2-bit embedding on top. The remaining work is real but it is engineering rather
+than research: run the binarizer on the pinned parent, then get those weights into a `Q1_0` GGUF.
+
+**We have not run either on Qwen3-8B ourselves** — we are pointing at the state of the art, not
+handing you a verified recipe, and the export path in particular is unproven. If you get one
+working we would rather hear about it than have you assume we already know.
 
 **The bit budget is not the hard part**, and it is more generous than the reference: the cap is
 1.15 against Bonsai's 1.125, which buys **15% of parameters at 2-bit** or 5% at 4-bit. On Qwen3-8B
