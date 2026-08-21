@@ -133,6 +133,24 @@ working we would rather hear about it than have you assume we already know.
 the token embedding is 7.60% of parameters, so `--token-embedding-type Q2_K` measures **1.0760**
 and passes. Embedding *and* output both at `Q2_K` comes to 1.1520 and just misses.
 
+**What the bit gate actually measures, because it changes what you can build.** For a **GGUF** the
+code bits come from the TYPE NAME — `Q1_0` is 1, `IQ2_XXS` is 2 — mixed per tensor and averaged by
+parameter count. Nothing is level-counted, so an auditor recomputing it cannot disagree with us.
+(For safetensors we count distinct levels per group instead, which is a different rule and is why
+an affine int4 checkpoint measures 4 and not 9.)
+
+The consequence for a 1-bit method: **GGUF types are per-tensor and per-block, so a scheme whose
+salience varies per WEIGHT has nowhere to live.** BiLLM-style binary-plus-salient-outliers carries
+roughly 1.1 bits of information, and there is no GGML type that expresses it — pack it as `Q1_0`
+and you throw the salient handling away; pack it as anything wider and you pay that width across
+the whole tensor. The tier is therefore not purely an information bound: it is a bound on
+information **that llama.cpp can represent and run**, which is a real and deliberate narrowing, and
+it is why the reference is a 2-values-per-group structure rather than an arbitrary 1.1-bit code.
+
+Per-TENSOR mixing is fully supported and is where your headroom is — a 1-bit body with a 2-bit
+embedding is measured correctly at 1.0760. Per-weight salience is not, until a GGML type for it
+exists.
+
 **If you want a crown this month, `sub2` is the better target.** A `Q2_0` body with a
 higher-precision embedding measures ~2.23 against a 2.3 cap, it is reachable with stock
 `llama-quantize`, and the tier is uncrowned because its only entrant so far fails the degeneracy
