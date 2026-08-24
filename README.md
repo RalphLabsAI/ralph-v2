@@ -175,6 +175,10 @@ Check what intake will say before you commit:
 python -m eval.bitrate qwen3-8b-binary.gguf
 ```
 
+And `python -m eval.precheck` (no arguments, stdlib only) header-measures every artifact currently
+awaiting scoring and prints what intake will decide — the whole pending field, yours and your
+competitors', without downloading a single model.
+
 ---
 
 ## For anyone checking a crown
