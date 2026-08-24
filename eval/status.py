@@ -328,8 +328,9 @@ def _pending_from(commitments, latest_record: dict | None) -> dict:
     """
     subs = (latest_record or {}).get("submissions") or []
     scored_uri = {str(s.get("miner")): str(s.get("artifact_uri") or "") for s in subs}
-    seen = set(scored_uri) | {str(r[0]) for r in ((latest_record or {}).get("rejected") or [])
-                              if isinstance(r, (list, tuple)) and r}
+    rejected_hk = {str(r[0]) for r in ((latest_record or {}).get("rejected") or [])
+                   if isinstance(r, (list, tuple)) and r}
+    seen = set(scored_uri) | rejected_hk
     new_entrants, resubmitted, unchanged = [], [], []
     for c in commitments or []:
         hk, uri = str(c.get("hotkey", "")), str(c.get("artifact_uri") or "")
@@ -337,6 +338,16 @@ def _pending_from(commitments, latest_record: dict | None) -> dict:
         if hk not in seen:
             new_entrants.append(row)
         elif uri and scored_uri.get(hk) and uri != scored_uri[hk]:
+            resubmitted.append(row)
+        elif hk in rejected_hk and hk not in scored_uri:
+            # A REJECTED miner is not "unchanged since scoring" — they were never scored. Their
+            # rejection row carries no artifact_uri, so changed-vs-same bytes cannot be told apart
+            # here; what CAN be said is that the next round will read their commitment again. They
+            # were falling into `unchanged`, which is how a miner who fixed their commit-reveal and
+            # re-committed a brand-new artifact stayed invisible on the dashboard — the third
+            # member of the invisibility family after the orchestrator-side and remote-side silent
+            # drops. Filed as re-entering (the resubmitted bucket) rather than inventing a fourth
+            # category the UI would have to learn.
             resubmitted.append(row)
         else:
             unchanged.append(row)

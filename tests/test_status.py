@@ -510,12 +510,19 @@ def test_pending_separates_a_new_miner_from_one_who_resubmitted():
 
 def test_a_miner_rejected_last_round_is_not_reported_as_a_new_entrant():
     """They were seen, judged and told why. Calling them new would erase the rejection — the exact
-    thing `rejected` was added to the signed record to stop."""
+    thing `rejected` was added to the signed record to stop.
+
+    THIS TEST USED TO ALSO ASSERT `awaiting_scoring == 0`, which encoded the bug it now pins the
+    fix for: a rejected miner IS awaiting scoring — the next round reads every commitment, and
+    their artifact hash is not in the trail's submissions so skip-already-scored will not skip it.
+    Filing them under `unchanged` ("unchanged since scoring" — they were never scored) is how a
+    miner who fixed their commit-reveal and re-committed a real QAT artifact stayed invisible."""
     from eval.status import _pending_from
     last = _tl_rec(2, subs=[], rejected=[["dave", ["committed but never revealed"]]])
     p = _pending_from([{"hotkey": "dave", "tier": "sub4", "artifact_uri": "hf://dave/m@v1"}], last)
     assert p["new_entrants"] == [], p
-    assert p["awaiting_scoring"] == 0, p
+    assert [r["hotkey"] for r in p["resubmitted"]] == ["dave"], p
+    assert p["awaiting_scoring"] == 1, p
 
 
 def test_an_unreadable_trail_yields_no_timeline_rather_than_an_empty_one():
@@ -605,3 +612,20 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+def test_a_rejected_miner_who_recommits_is_not_filed_as_unchanged():
+    """Rejected rows carry no artifact_uri, so the classifier could not compare bytes and fell
+    through to `unchanged` — false twice over (never scored, possibly new bytes). A miner who fixed
+    their commit-reveal and re-committed a real QAT artifact stayed invisible exactly here."""
+    from eval.status import _pending_from
+    record = {"round": 2,
+              "submissions": [{"miner": "hk_scored", "artifact_uri": "hf://a@1"}],
+              "rejected": [["hk_rejected", ["commit-reveal: bytes are not what was committed"]]]}
+    commitments = [
+        {"hotkey": "hk_rejected", "tier": "binary", "artifact_uri": "hf://new-qat@2"},
+        {"hotkey": "hk_scored", "tier": "sub4", "artifact_uri": "hf://a@1"},
+    ]
+    p = _pending_from(commitments, record)
+    assert [r["hotkey"] for r in p["resubmitted"]] == ["hk_rejected"]
+    assert p["unchanged"] == 1, "the genuinely unchanged scored miner stays unchanged"
+    assert p["awaiting_scoring"] == 1

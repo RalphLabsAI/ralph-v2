@@ -65,6 +65,19 @@ Six gates, in order. Nothing loads your weights until all six pass.
 A 4-bit model shipped inside a 16-bit container is credited for the compression it achieved and
 rejected as an unshippable artifact — both budgets bind.
 
+### Commit the hash of what will be SERVED, not what you uploaded
+
+The most common self-inflicted rejection is a commit-reveal mismatch: the validator fetches your
+repo and its recomputed hash does not equal what you revealed, which reads — and is recorded — as
+the served bytes not being the committed ones. Nearly every time, the cause is hashing the wrong
+thing on your side: `content_hash` covers the whole directory (paths, sizes, bytes of `.gguf`,
+`.json`, and friends), so a hash of your local pre-upload file misses whatever the repo actually
+serves. Two miners lost round entries to this.
+
+Do what the validator does: download your own repo at the revision you will commit, hash that
+directory with the same rule, and commit that. Credit to the miner who diagnosed this after being
+rejected for it.
+
 ### Formats that can win
 
 **The crown has to run on a phone.** That is the product, so a format mainline `llama.cpp` cannot
