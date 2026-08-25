@@ -193,6 +193,10 @@ def score(job: dict, out_dir: str) -> dict:
                "kings_before": {t: k.model_id for t, k in (out.kings_before or {}).items()},
                "rejected": [[h, r] for h, r in out.rejected], "skipped": skipped,
                "identity": out.identity, "observer": out.observer,
+               # the canary's actual NUMBERS, not just the abort event's prose. When a round dies
+               # on reproducibility the operator's first question is "by how much", and the answer
+               # was being computed on the box and dropped on the floor.
+               "determinism": getattr(out, "determinism", None),
                "events": out.events, "weights": out.weights,
                "fetch": [list(map(str, e)) for e in fetch_log],
                "gpu": _gpu_name()}
