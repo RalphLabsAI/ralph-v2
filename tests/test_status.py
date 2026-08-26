@@ -695,10 +695,15 @@ def test_a_crown_carries_the_artifact_not_only_a_score():
     from eval.status import _crowns_from
     rec = {"round": 4,
            "events": [{"tier": "binary", "action": "hold", "king": "m1", "margin_lcb": -0.041}],
-           "submissions": [{"model_id": "m1", "miner": "hk", "role": "incumbent",
-                            "retention": 0.1886, "code_bits": 1.1477, "container_bits": 1.8681,
-                            "params": 8190427136,
-                            "artifact_uri": "hf://tensor-tailor/ralph-qwen3-8b-binary@abc"}]}
+           # THE INCUMBENT ROW CARRIES ZEROS — it is re-scored, not re-ingested. Reading bits from
+           # it published the binary crown as a zero-bit, zero-parameter model. The real
+           # measurement is on the challenger entry for the same model_id.
+           "submissions": [
+               {"model_id": "m1", "miner": "hk", "role": "incumbent", "retention": 0.1886,
+                "code_bits": 0.0, "container_bits": 0.0, "params": 0},
+               {"model_id": "m1", "miner": "hk", "role": "challenger", "retention": 0.1886,
+                "code_bits": 1.1477, "container_bits": 1.8681, "params": 8190427136,
+                "artifact_uri": "hf://tensor-tailor/ralph-qwen3-8b-binary@abc"}]}
     m = _crowns_from(rec, 4, 4, "hf://rec", True, "")
     k = m["value"]["binary"]
     assert k["code_bits"] == 1.1477 and k["container_bits"] == 1.8681

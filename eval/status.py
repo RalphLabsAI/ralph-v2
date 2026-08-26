@@ -178,13 +178,19 @@ def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err)
     # an earlier round is still a crown. `hold` names the tier and the model; the miner and the
     # retention come from the re-scored incumbent submission, never from the event, for the same
     # anti-circularity reason the audit gives.
-    by_model = {}
+    by_model, bits_of = {}, {}
     for sub in (rec.get("submissions") or []):
         mid_ = str(sub.get("model_id"))
         prior = by_model.get(mid_)
         # prefer the INCUMBENT entry: for a held crown that is the score it defended with
         if prior is None or str(sub.get("role")) == "incumbent":
             by_model[mid_] = sub
+        # ...BUT NOT FOR THE BIT MEASUREMENT. An incumbent is re-scored, not re-ingested, so its
+        # row carries code_bits=0.0 and params=0 — reading those would publish the binary crown as
+        # a zero-bit, zero-parameter model. The bits are a property of the BYTES, so take them from
+        # whichever row for this model_id actually measured them, which is the challenger entry.
+        if float(sub.get("code_bits") or 0) > 0 and mid_ not in bits_of:
+            bits_of[mid_] = sub
 
     crowns = {}
     for e in (rec.get("events") or []):
@@ -211,10 +217,11 @@ def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err)
             # nothing else — so a visitor could not tell that the binary crown is a 1.9 GB model at
             # 1.15 bits/weight, which IS the product. A score with no artifact behind it reads as a
             # leaderboard; the size and the bit budget are the reason the leaderboard exists.
-            "code_bits": sub.get("code_bits") or None,
-            "container_bits": sub.get("container_bits") or None,
-            "params": sub.get("params") or None,
-            "artifact_uri": sub.get("artifact_uri") or None,
+            "code_bits": (bits_of.get(mid) or {}).get("code_bits") or None,
+            "container_bits": (bits_of.get(mid) or {}).get("container_bits") or None,
+            "params": (bits_of.get(mid) or {}).get("params") or None,
+            "artifact_uri": (sub.get("artifact_uri")
+                             or (bits_of.get(mid) or {}).get("artifact_uri") or None),
         }
     if not crowns:
         return unmeasured(f"round {rec_round} published but no tier has a crown")
