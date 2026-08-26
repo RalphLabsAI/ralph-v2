@@ -305,8 +305,21 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
     # score, and that have no business in a status snapshot a browser polls. Ten fields answer what
     # a miner comes here to ask: was I in this round, what did I score, did I win, and if I am not
     # in the list, why not.
+    # A KING APPEARS TWICE IN A ROUND: once as the miner's own commitment, scored as a challenger,
+    # and once re-scored as the incumbent on this round's exam. Both rows are real and both belong
+    # in the record — the re-score is half of the paired dethrone test. But tagging both as the
+    # crown painted EIGHT crown labels across four tiers.
+    #
+    # The tag goes on the INCUMBENT row, because that is the score the crown was defended with and
+    # the one `_crowns_from` publishes. Where a crown has no incumbent row — the round it was first
+    # won — it falls back to the challenger entry, so a fresh crown is never left unlabelled.
+    has_incumbent = {str(s.get("model_id")) for s in subs
+                     if str(s.get("role")) == "incumbent" and s.get("model_id")}
+
     def _row(s):
-        crowned = bool(s.get("model_id")) and kings.get(s.get("tier")) == s.get("model_id")
+        mid_row = str(s.get("model_id") or "")
+        crowned = bool(mid_row) and kings.get(s.get("tier")) == mid_row and (
+            str(s.get("role")) == "incumbent" or mid_row not in has_incumbent)
         return {"miner": s.get("miner", ""), "tier": s.get("tier", ""),
                 "role": s.get("role", "challenger"),
                 "retention": s.get("retention"), "retention_lb": s.get("retention_lb"),

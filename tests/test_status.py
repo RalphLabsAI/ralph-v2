@@ -564,7 +564,9 @@ def test_a_round_carries_its_own_field_because_the_cohort_moves_on():
     rows = r["submissions"]
     assert [x["miner"] for x in rows] == ["alice", "alice", "bob"], "best retention first"
     assert rows[0]["role"] == "challenger" and rows[1]["role"] == "incumbent"
-    assert rows[0]["crowned"] and rows[1]["crowned"] and not rows[2]["crowned"]
+    # ONE crown tag, on the incumbent — the row the crown was defended with. This used to assert
+    # both rows were crowned, which is how four tiers painted eight crown labels.
+    assert not rows[0]["crowned"] and rows[1]["crowned"] and not rows[2]["crowned"]
     # the incumbent carries NO bit measurement — it is re-scored, not re-ingested
     assert rows[1]["code_bits"] == 0.0 and rows[0]["code_bits"] == 4.0
 
@@ -709,3 +711,31 @@ def test_a_crown_carries_the_artifact_not_only_a_score():
     assert k["code_bits"] == 1.1477 and k["container_bits"] == 1.8681
     assert k["params"] == 8190427136
     assert "tensor-tailor" in k["artifact_uri"]
+
+
+def test_one_crown_tag_per_tier_not_two():
+    """A king appears twice in a round — own commitment scored as a challenger, and re-scored as
+    the incumbent. Both rows are real; tagging both painted EIGHT crown labels across four tiers."""
+    from eval.status import _round_summary
+    rec = _tl_rec(4, subs=[
+        {"miner": "hk", "tier": "binary", "model_id": "m1", "role": "challenger",
+         "retention": 0.22, "gates_ok": True},
+        {"miner": "hk", "tier": "binary", "model_id": "m1", "role": "incumbent",
+         "retention": 0.22, "gates_ok": True},
+    ], events=[{"tier": "binary", "action": "hold", "king": "m1"}])
+    rows = _round_summary(rec)["submissions"]
+    assert sum(1 for r in rows if r["crowned"]) == 1
+    assert next(r for r in rows if r["crowned"])["role"] == "incumbent"
+
+
+def test_a_newly_won_crown_is_still_tagged():
+    """The round a crown is FIRST won has no incumbent row for it — falling back to the challenger
+    entry is what stops a fresh crown appearing untagged."""
+    from eval.status import _round_summary
+    rec = _tl_rec(3, subs=[
+        {"miner": "hk", "tier": "sub2", "model_id": "new", "role": "challenger",
+         "retention": 0.23, "gates_ok": True},
+    ], events=[{"tier": "sub2", "action": "crown", "king": "new"}])
+    rows = _round_summary(rec)["submissions"]
+    assert sum(1 for r in rows if r["crowned"]) == 1
+    assert next(r for r in rows if r["crowned"])["role"] == "challenger"
