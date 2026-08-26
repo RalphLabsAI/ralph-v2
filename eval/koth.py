@@ -309,6 +309,13 @@ class Tournament:
         if lcb > 0.0 and best.sub.model_id != king_scored.sub.model_id:
             self.runners_up[tier] = {"miner": best.sub.miner, "model_id": best.sub.model_id,
                                      "lcb": round(lcb, 6)}
+            # STATED IN THE EVENT, not left to be re-derived. The weight vector will show a payment
+            # to a hotkey that holds no crown, and an auditor should not have to know
+            # CHALLENGER_SHARE and join model_id against the submissions list to find out why. The
+            # record says who was paid, how much of the tier, and the margin that earned it.
+            event.update(challenger_miner=best.sub.miner,
+                         challenger_share=CHALLENGER_SHARE,
+                         challenger_lcb=round(lcb, 6))
         else:
             self.runners_up.pop(tier, None)
         return event

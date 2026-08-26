@@ -81,3 +81,38 @@ def test_stale_runner_up_evidence_is_cleared(monkeypatch):
     t.consider("binary", [_S("new", 0.10, "new_hk")], _S("king_model", 0.20, "king_hk"))
     assert "binary" not in t.runners_up
     assert abs(t.weights()["king_hk"] - 0.40 / 0.55) < 1e-9
+
+
+def test_the_record_says_who_was_paid_and_why(monkeypatch):
+    """A weight vector paying a hotkey that holds no crown must be explicable from the record
+    alone. Without this an auditor has to know CHALLENGER_SHARE and join model_id against the
+    submissions list to discover why a non-king was paid."""
+    class _S:
+        def __init__(self, mid, ret, miner):
+            self.valid, self.retention = True, ret
+            self.sub = type("x", (), {"model_id": mid, "miner": miner})()
+
+    t = _t()
+    monkeypatch.setattr("eval.koth.softmin_lcb_diff", lambda a, b, seed=0: 0.012)
+    monkeypatch.setattr("eval.koth.axis_regression", lambda a, b, seed=0: None)
+    ev = t.consider("binary", [_S("ch", 0.21, "ch_hk")], _S("king_model", 0.20, "king_hk"))
+    assert ev["action"] == "hold"
+    assert ev["challenger_miner"] == "ch_hk"
+    assert ev["challenger_share"] == CHALLENGER_SHARE
+    assert ev["challenger_lcb"] == 0.012
+    assert t.weights()["ch_hk"] > 0
+
+
+def test_no_challenger_fields_when_nobody_qualifies(monkeypatch):
+    """Absence must be unambiguous: a hold with no challenger_miner means the king kept the tier."""
+    class _S:
+        def __init__(self, mid, ret, miner):
+            self.valid, self.retention = True, ret
+            self.sub = type("x", (), {"model_id": mid, "miner": miner})()
+
+    t = _t()
+    monkeypatch.setattr("eval.koth.softmin_lcb_diff", lambda a, b, seed=0: -0.02)
+    monkeypatch.setattr("eval.koth.axis_regression", lambda a, b, seed=0: None)
+    ev = t.consider("binary", [_S("ch", 0.10, "ch_hk")], _S("king_model", 0.20, "king_hk"))
+    assert "challenger_miner" not in ev
+    assert "ch_hk" not in t.weights()
