@@ -231,6 +231,16 @@ def worst_axis_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000,
                for ax in shared)
 
 
+# Share of a tier's emission paid to the best challenger that BEAT the sitting king on the paired
+# worst-slice lower bound without clearing the 0.05 dethrone margin. The king keeps the rest, and
+# keeps all of it when no challenger qualifies.
+#
+# 0.20 is chosen to be worth a GPU-week and not worth a coup: enough that finding a real 0.01
+# improvement pays, small enough that camping second place is strictly worse than taking the crown,
+# which is still ~4x the income. Set to 0.0 to restore winner-take-all.
+CHALLENGER_SHARE = 0.20
+
+
 class Tournament:
     """Holds the reigning king per tier and applies dethrone-on-margin each round."""
 
@@ -241,6 +251,9 @@ class Tournament:
         self.tiers = {t.name: t for t in tiers}
         self.margin = margin
         self.kings: dict[str, King] = {}
+        # tier -> the best challenger that BEAT the sitting king without clearing the dethrone
+        # margin. Cleared every round it is not re-earned, so it never pays on stale evidence.
+        self.runners_up: dict[str, dict] = {}
         self.round = 0
 
     def consider(self, tier: str, scored: list[Scored], king_scored: Scored | None,
@@ -288,10 +301,21 @@ class Tournament:
             self.kings[tier].reign += 1
             event.update(action="hold", margin_lcb=round(lcb, 4),
                          best_challenger=best.sub.model_id)
+        # THE RUNNER-UP, IF THEY ACTUALLY BEAT THE KING. Recorded on every contested tier, whether
+        # the throne changed hands or not, because `weights()` pays it — see `CHALLENGER_SHARE`.
+        # STRICTLY POSITIVE `lcb` is the whole test: a copy of the king scores the same as the king,
+        # so its paired lower bound sits at ~0 and earns nothing, while a genuine 0.01 improvement
+        # that cannot yet clear the 0.05 dethrone margin earns something for the first time.
+        if lcb > 0.0 and best.sub.model_id != king_scored.sub.model_id:
+            self.runners_up[tier] = {"miner": best.sub.miner, "model_id": best.sub.model_id,
+                                     "lcb": round(lcb, 6)}
+        else:
+            self.runners_up.pop(tier, None)
         return event
 
     def weights(self) -> dict[str, float]:
-        """Emission per miner: each tier's weight goes to its king.
+        """Emission per miner: each tier's weight, split between its king and the best challenger
+        that provably beat it.
 
         SUMS TO 1 OVER THE OCCUPIED TIERS. Nothing is burned: a subnet that writes part of its
         weight vector to a burn uid is read in this ecosystem as taxing its own miners, and it is
@@ -313,7 +337,28 @@ class Tournament:
             return {}
         out: dict[str, float] = {}
         for t, k in live.items():
-            out[k.miner] = out.get(k.miner, 0.0) + self.tiers[t].weight / total_w
+            share = self.tiers[t].weight / total_w
+            up = self.runners_up.get(t)
+            # PAY THE BEST STRICTLY-IMPROVING CHALLENGER, or the king keeps the tier whole.
+            #
+            # Until this, progress below the 0.05 dethrone margin paid exactly zero: a challenger
+            # who genuinely beat the king by 0.01 — provably, paired on the same exam — earned the
+            # same as one who never submitted. With every throne defended that is every miner but
+            # four, and "why iterate?" is the honest question it invites. The margin itself is not
+            # the problem and is not moved: below it a dethrone is a coin flip, because it is the
+            # bootstrap's own resolution.
+            #
+            # `lcb > 0` is what makes this safe to pay. A copy of the king's artifact scores what
+            # the king scores, so its paired lower bound sits at ~0 and it earns NOTHING; the only
+            # way to collect is to actually be better on the worst slice. One slot per tier, so
+            # spraying hotkeys buys nothing either. Starting from the published crown and improving
+            # it is not the attack — it is the compounding the trail exists to enable, and the
+            # king's 80% plus the 0.05 moat is what protects the original author.
+            if up and up.get("miner") and up["miner"] != k.miner:
+                out[k.miner] = out.get(k.miner, 0.0) + share * (1.0 - CHALLENGER_SHARE)
+                out[up["miner"]] = out.get(up["miner"], 0.0) + share * CHALLENGER_SHARE
+            else:
+                out[k.miner] = out.get(k.miner, 0.0) + share
         return out
 
     def unclaimed(self) -> float:
