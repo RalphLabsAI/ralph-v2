@@ -478,8 +478,11 @@ def test_shakedown_and_live_are_declared_never_inferred():
     from eval.status import FIRST_LIVE_ROUND, _round_summary
     assert FIRST_LIVE_ROUND > 1000, "the default must not silently mark rounds as live"
     assert _round_summary(_tl_rec(4), first_live=7)["phase"] == "shakedown"
-    assert _round_summary(_tl_rec(7), first_live=7)["phase"] == "live"
-    assert _round_summary(_tl_rec(9), first_live=7)["phase"] == "live"
+    # "paid", NOT "live": the word rendered as a LIVE badge on every FINISHED round, so the
+    # dashboard showed three completed rounds all claiming to be running while the panel beside
+    # them said "no round in flight". The distinction being drawn is emission, not liveness.
+    assert _round_summary(_tl_rec(7), first_live=7)["phase"] == "paid"
+    assert _round_summary(_tl_rec(9), first_live=7)["phase"] == "paid"
 
 
 def test_a_held_crown_still_shows_the_tier_as_occupied():
@@ -629,3 +632,36 @@ def test_a_rejected_miner_who_recommits_is_not_filed_as_unchanged():
     assert [r["hotkey"] for r in p["resubmitted"]] == ["hk_rejected"]
     assert p["unchanged"] == 1, "the genuinely unchanged scored miner stays unchanged"
     assert p["awaiting_scoring"] == 1
+
+
+def test_a_skipped_unchanged_row_is_not_counted_as_a_rejection():
+    """Round 3 published twelve `rejected` rows: four real refusals and seven skip-already-scored
+    notes. The dashboard printed "12 rejected" in red for a round that refused four."""
+    from eval.status import _round_summary
+    rec = _tl_rec(3, subs=[], rejected=[
+        ["hk_fmt", ["unrunnable format TQ1_0: mainline llama.cpp has no Metal kernels"]],
+        ["hk_old", ["unchanged since round 1 — the same bytes were already scored there."]],
+        ["hk_old2", ["unchanged since round 1 — the same bytes were already scored there."]],
+    ])
+    r = _round_summary(rec)
+    assert r["rejected"] == 1, r
+    assert r["skipped_unchanged"] == 2, r
+    assert [x["hotkey"] for x in r["rejected_detail"]] == ["hk_fmt"]
+    assert len(r["unchanged_detail"]) == 2
+
+
+def test_an_unchanged_miner_is_not_awaiting_scoring():
+    """THE TWO FIXES MEETING BADLY. skip-already-scored writes an "unchanged" row so nobody is
+    silently absent; the pending classifier then read every `rejected` row as re-entering. Result:
+    "12 awaiting scoring" for a field where eleven could never be scored without new bytes — and it
+    would have said so again every round, forever."""
+    from eval.status import _pending_from
+    rec = _tl_rec(3, subs=[], rejected=[
+        ["hk_old", ["unchanged since round 1 — the same bytes were already scored there."]],
+        ["hk_bad", ["commit-reveal: the bytes are not what was committed"]],
+    ])
+    p = _pending_from([{"hotkey": "hk_old", "tier": "sub4", "artifact_uri": "hf://a@1"},
+                       {"hotkey": "hk_bad", "tier": "binary", "artifact_uri": "hf://b@2"}], rec)
+    assert [r["hotkey"] for r in p["resubmitted"]] == ["hk_bad"], p
+    assert p["awaiting_scoring"] == 1, p
+    assert p["unchanged"] == 1, p
