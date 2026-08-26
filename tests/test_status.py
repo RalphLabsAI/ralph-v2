@@ -562,13 +562,13 @@ def test_a_round_carries_its_own_field_because_the_cohort_moves_on():
               _tl_sub("bob", retention=0.21, code_bits=4.0, model_id="N")],
         events=[{"tier": "sub4", "action": "hold", "king": "M"}]))
     rows = r["submissions"]
-    assert [x["miner"] for x in rows] == ["alice", "alice", "bob"], "best retention first"
-    assert rows[0]["role"] == "challenger" and rows[1]["role"] == "incumbent"
-    # ONE crown tag, on the incumbent — the row the crown was defended with. This used to assert
-    # both rows were crowned, which is how four tiers painted eight crown labels.
-    assert not rows[0]["crowned"] and rows[1]["crowned"] and not rows[2]["crowned"]
-    # the incumbent carries NO bit measurement — it is re-scored, not re-ingested
-    assert rows[1]["code_bits"] == 0.0 and rows[0]["code_bits"] == 4.0
+    # ONE ROW PER ARTIFACT. alice's challenger entry and her incumbent re-score are the same bytes
+    # on the same exam; printing both put an identical model, score and repo on two adjacent lines.
+    assert [x["miner"] for x in rows] == ["alice", "bob"], "best retention first, merged"
+    assert rows[0]["crowned"] and rows[0]["rescored"] and not rows[1]["crowned"]
+    # the merged row keeps the entry that MEASURED the bytes — the incumbent carries 0.0 because
+    # it is re-scored, not re-ingested
+    assert rows[0]["code_bits"] == 4.0
 
 
 def test_the_field_never_carries_the_per_sample_measurement_blob():
@@ -724,8 +724,9 @@ def test_one_crown_tag_per_tier_not_two():
          "retention": 0.22, "gates_ok": True},
     ], events=[{"tier": "binary", "action": "hold", "king": "m1"}])
     rows = _round_summary(rec)["submissions"]
+    assert len(rows) == 1, "the two entries are one artifact"
     assert sum(1 for r in rows if r["crowned"]) == 1
-    assert next(r for r in rows if r["crowned"])["role"] == "incumbent"
+    assert rows[0]["rescored"] is True
 
 
 def test_a_newly_won_crown_is_still_tagged():
@@ -739,3 +740,45 @@ def test_a_newly_won_crown_is_still_tagged():
     rows = _round_summary(rec)["submissions"]
     assert sum(1 for r in rows if r["crowned"]) == 1
     assert next(r for r in rows if r["crowned"])["role"] == "challenger"
+
+
+def test_a_king_is_one_row_not_two():
+    """A king is scored twice — own commitment as challenger, plus the incumbent re-score — and
+    printing both put the same model, score and repo on two adjacent lines, four times over."""
+    from eval.status import _round_summary
+    rec = _tl_rec(4, subs=[
+        {"miner": "hk", "tier": "binary", "model_id": "m1", "role": "challenger",
+         "retention": 0.2249, "code_bits": 1.15, "container_bits": 1.87, "gates_ok": True,
+         "artifact_uri": "hf://t/binary@abc"},
+        {"miner": "hk", "tier": "binary", "model_id": "m1", "role": "incumbent",
+         "retention": 0.2249, "code_bits": 0.0, "container_bits": 0.0, "gates_ok": True},
+    ], events=[{"tier": "binary", "action": "hold", "king": "m1"}])
+    rows = _round_summary(rec)["submissions"]
+    assert len(rows) == 1, rows
+    r = rows[0]
+    assert r["crowned"] and r["rescored"]
+    assert r["code_bits"] == 1.15, "the merged row keeps the entry that measured the bytes"
+    assert r["artifact_uri"] == "hf://t/binary@abc"
+
+
+def test_a_gate_failure_survives_the_merge():
+    """A gate failure is a fact about the bytes. A clean second entry must never erase it."""
+    from eval.status import _round_summary
+    rec = _tl_rec(4, subs=[
+        {"miner": "hk", "tier": "sub2", "model_id": "m2", "role": "incumbent",
+         "retention": 0.19, "gates_ok": True},
+        {"miner": "hk", "tier": "sub2", "model_id": "m2", "role": "challenger",
+         "retention": 0.19, "code_bits": 2.1, "gates_ok": False,
+         "reasons": ["92% of responses are highly repetitive (looping)"]},
+    ], events=[])
+    r = _round_summary(rec)["submissions"][0]
+    assert r["gates_ok"] is False and "looping" in r["reasons"][0]
+
+
+def test_distinct_artifacts_are_never_merged():
+    from eval.status import _round_summary
+    rec = _tl_rec(4, subs=[
+        {"miner": "a", "tier": "sub4", "model_id": "x", "role": "challenger", "retention": 0.3},
+        {"miner": "b", "tier": "sub4", "model_id": "y", "role": "challenger", "retention": 0.2},
+    ], events=[])
+    assert len(_round_summary(rec)["submissions"]) == 2
