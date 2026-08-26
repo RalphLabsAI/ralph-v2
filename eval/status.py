@@ -353,6 +353,13 @@ def _pending_from(commitments, latest_record: dict | None) -> dict:
             if isinstance(r, (list, tuple)) and len(r) == 2]
     unchanged_hk = {str(r[0]) for r in rows if _is_unchanged_row(r[1])}
     rejected_hk = {str(r[0]) for r in rows if not _is_unchanged_row(r[1])}
+    # WHY they were refused, carried forward. A rejected row holds no artifact_uri, so nothing here
+    # can tell "rejected and since fixed" from "rejected and unchanged" — and calling both
+    # `resubmitted` picks the flattering guess. Four miners sat in the round-5 queue labelled as
+    # having resubmitted when they were the same TQ1_0 and the same commit-reveal mismatch that
+    # round 4 refused, and round 5 would refuse identically. Reporting the REASON says only what is
+    # known, and is the one thing those miners can act on.
+    why_rejected = {str(r[0]): list(r[1]) for r in rows if not _is_unchanged_row(r[1])}
     seen = set(scored_uri) | rejected_hk | unchanged_hk
     new_entrants, resubmitted, unchanged = [], [], []
     for c in commitments or []:
@@ -372,6 +379,7 @@ def _pending_from(commitments, latest_record: dict | None) -> dict:
             # it as a rejection is not.
             unchanged.append(row)
         elif hk in rejected_hk and hk not in scored_uri:
+            row["rejected_last_round"] = why_rejected.get(hk, [])
             # A genuinely REJECTED miner is not "unchanged since scoring" — they were never scored.
             # Their rejection row carries no artifact_uri, so changed-vs-same bytes cannot be told
             # apart here; what CAN be said is that the next round reads their commitment again.
