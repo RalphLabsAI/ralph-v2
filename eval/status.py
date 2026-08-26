@@ -207,6 +207,14 @@ def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err)
             # -slice paired bootstrap, so a reader saw a higher number next to a miner who did not
             # get the crown and had nothing to explain it.
             "margin_lcb": e.get("margin_lcb"),
+            # WHAT THE CROWN ACTUALLY IS. The page showed a hotkey and a retention score and
+            # nothing else — so a visitor could not tell that the binary crown is a 1.9 GB model at
+            # 1.15 bits/weight, which IS the product. A score with no artifact behind it reads as a
+            # leaderboard; the size and the bit budget are the reason the leaderboard exists.
+            "code_bits": sub.get("code_bits") or None,
+            "container_bits": sub.get("container_bits") or None,
+            "params": sub.get("params") or None,
+            "artifact_uri": sub.get("artifact_uri") or None,
         }
     if not crowns:
         return unmeasured(f"round {rec_round} published but no tier has a crown")

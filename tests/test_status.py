@@ -687,3 +687,20 @@ def test_a_clean_re_entrant_carries_no_rejection_reason():
     rec = _tl_rec(4, subs=[{"miner": "hk_ok", "artifact_uri": "hf://old@1"}], rejected=[])
     p = _pending_from([{"hotkey": "hk_ok", "tier": "sub4", "artifact_uri": "hf://new@2"}], rec)
     assert p["resubmitted"][0].get("rejected_last_round") is None
+
+
+def test_a_crown_carries_the_artifact_not_only_a_score():
+    """A hotkey and a retention number is a leaderboard. The size and bit budget are what the
+    subnet actually produces, and the page could not show them."""
+    from eval.status import _crowns_from
+    rec = {"round": 4,
+           "events": [{"tier": "binary", "action": "hold", "king": "m1", "margin_lcb": -0.041}],
+           "submissions": [{"model_id": "m1", "miner": "hk", "role": "incumbent",
+                            "retention": 0.1886, "code_bits": 1.1477, "container_bits": 1.8681,
+                            "params": 8190427136,
+                            "artifact_uri": "hf://tensor-tailor/ralph-qwen3-8b-binary@abc"}]}
+    m = _crowns_from(rec, 4, 4, "hf://rec", True, "")
+    k = m["value"]["binary"]
+    assert k["code_bits"] == 1.1477 and k["container_bits"] == 1.8681
+    assert k["params"] == 8190427136
+    assert "tensor-tailor" in k["artifact_uri"]
