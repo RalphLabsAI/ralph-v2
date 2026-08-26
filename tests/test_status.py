@@ -562,11 +562,13 @@ def test_a_round_carries_its_own_field_because_the_cohort_moves_on():
               _tl_sub("bob", retention=0.21, code_bits=4.0, model_id="N")],
         events=[{"tier": "sub4", "action": "hold", "king": "M"}]))
     rows = r["submissions"]
-    assert [x["miner"] for x in rows] == ["alice", "alice", "bob"], "best retention first"
-    assert rows[0]["role"] == "challenger" and rows[1]["role"] == "incumbent"
-    assert rows[0]["crowned"] and rows[1]["crowned"] and not rows[2]["crowned"]
-    # the incumbent carries NO bit measurement — it is re-scored, not re-ingested
-    assert rows[1]["code_bits"] == 0.0 and rows[0]["code_bits"] == 4.0
+    # ONE ROW PER ARTIFACT. alice's challenger entry and her incumbent re-score are the same bytes
+    # on the same exam; printing both put an identical model, score and repo on two adjacent lines.
+    assert [x["miner"] for x in rows] == ["alice", "bob"], "best retention first, merged"
+    assert rows[0]["crowned"] and rows[0]["rescored"] and not rows[1]["crowned"]
+    # the merged row keeps the entry that MEASURED the bytes — the incumbent carries 0.0 because
+    # it is re-scored, not re-ingested
+    assert rows[0]["code_bits"] == 4.0
 
 
 def test_the_field_never_carries_the_per_sample_measurement_blob():
@@ -665,3 +667,118 @@ def test_an_unchanged_miner_is_not_awaiting_scoring():
     assert [r["hotkey"] for r in p["resubmitted"]] == ["hk_bad"], p
     assert p["awaiting_scoring"] == 1, p
     assert p["unchanged"] == 1, p
+
+
+def test_a_miner_rejected_last_round_carries_its_reason_forward():
+    """Labelling them `resubmitted` implies new bytes. Four miners sat in the round-5 queue that
+    way while holding the same TQ1_0 and the same commit-reveal mismatch round 4 refused — round 5
+    would refuse identically. The reason is the only thing they can act on."""
+    from eval.status import _pending_from
+    rec = _tl_rec(4, subs=[], rejected=[
+        ["hk_fmt", ["unrunnable format TQ1_0: mainline llama.cpp has no Metal kernels"]],
+    ])
+    p = _pending_from([{"hotkey": "hk_fmt", "tier": "ternary", "artifact_uri": "hf://a@1"}], rec)
+    row = p["resubmitted"][0]
+    assert row["hotkey"] == "hk_fmt"
+    assert "TQ1_0" in row["rejected_last_round"][0]
+
+
+def test_a_clean_re_entrant_carries_no_rejection_reason():
+    """Absence has to mean something: a miner who was never refused must not be labelled as one."""
+    from eval.status import _pending_from
+    rec = _tl_rec(4, subs=[{"miner": "hk_ok", "artifact_uri": "hf://old@1"}], rejected=[])
+    p = _pending_from([{"hotkey": "hk_ok", "tier": "sub4", "artifact_uri": "hf://new@2"}], rec)
+    assert p["resubmitted"][0].get("rejected_last_round") is None
+
+
+def test_a_crown_carries_the_artifact_not_only_a_score():
+    """A hotkey and a retention number is a leaderboard. The size and bit budget are what the
+    subnet actually produces, and the page could not show them."""
+    from eval.status import _crowns_from
+    rec = {"round": 4,
+           "events": [{"tier": "binary", "action": "hold", "king": "m1", "margin_lcb": -0.041}],
+           # THE INCUMBENT ROW CARRIES ZEROS — it is re-scored, not re-ingested. Reading bits from
+           # it published the binary crown as a zero-bit, zero-parameter model. The real
+           # measurement is on the challenger entry for the same model_id.
+           "submissions": [
+               {"model_id": "m1", "miner": "hk", "role": "incumbent", "retention": 0.1886,
+                "code_bits": 0.0, "container_bits": 0.0, "params": 0},
+               {"model_id": "m1", "miner": "hk", "role": "challenger", "retention": 0.1886,
+                "code_bits": 1.1477, "container_bits": 1.8681, "params": 8190427136,
+                "artifact_uri": "hf://tensor-tailor/ralph-qwen3-8b-binary@abc"}]}
+    m = _crowns_from(rec, 4, 4, "hf://rec", True, "")
+    k = m["value"]["binary"]
+    assert k["code_bits"] == 1.1477 and k["container_bits"] == 1.8681
+    assert k["params"] == 8190427136
+    assert "tensor-tailor" in k["artifact_uri"]
+
+
+def test_one_crown_tag_per_tier_not_two():
+    """A king appears twice in a round — own commitment scored as a challenger, and re-scored as
+    the incumbent. Both rows are real; tagging both painted EIGHT crown labels across four tiers."""
+    from eval.status import _round_summary
+    rec = _tl_rec(4, subs=[
+        {"miner": "hk", "tier": "binary", "model_id": "m1", "role": "challenger",
+         "retention": 0.22, "gates_ok": True},
+        {"miner": "hk", "tier": "binary", "model_id": "m1", "role": "incumbent",
+         "retention": 0.22, "gates_ok": True},
+    ], events=[{"tier": "binary", "action": "hold", "king": "m1"}])
+    rows = _round_summary(rec)["submissions"]
+    assert len(rows) == 1, "the two entries are one artifact"
+    assert sum(1 for r in rows if r["crowned"]) == 1
+    assert rows[0]["rescored"] is True
+
+
+def test_a_newly_won_crown_is_still_tagged():
+    """The round a crown is FIRST won has no incumbent row for it — falling back to the challenger
+    entry is what stops a fresh crown appearing untagged."""
+    from eval.status import _round_summary
+    rec = _tl_rec(3, subs=[
+        {"miner": "hk", "tier": "sub2", "model_id": "new", "role": "challenger",
+         "retention": 0.23, "gates_ok": True},
+    ], events=[{"tier": "sub2", "action": "crown", "king": "new"}])
+    rows = _round_summary(rec)["submissions"]
+    assert sum(1 for r in rows if r["crowned"]) == 1
+    assert next(r for r in rows if r["crowned"])["role"] == "challenger"
+
+
+def test_a_king_is_one_row_not_two():
+    """A king is scored twice — own commitment as challenger, plus the incumbent re-score — and
+    printing both put the same model, score and repo on two adjacent lines, four times over."""
+    from eval.status import _round_summary
+    rec = _tl_rec(4, subs=[
+        {"miner": "hk", "tier": "binary", "model_id": "m1", "role": "challenger",
+         "retention": 0.2249, "code_bits": 1.15, "container_bits": 1.87, "gates_ok": True,
+         "artifact_uri": "hf://t/binary@abc"},
+        {"miner": "hk", "tier": "binary", "model_id": "m1", "role": "incumbent",
+         "retention": 0.2249, "code_bits": 0.0, "container_bits": 0.0, "gates_ok": True},
+    ], events=[{"tier": "binary", "action": "hold", "king": "m1"}])
+    rows = _round_summary(rec)["submissions"]
+    assert len(rows) == 1, rows
+    r = rows[0]
+    assert r["crowned"] and r["rescored"]
+    assert r["code_bits"] == 1.15, "the merged row keeps the entry that measured the bytes"
+    assert r["artifact_uri"] == "hf://t/binary@abc"
+
+
+def test_a_gate_failure_survives_the_merge():
+    """A gate failure is a fact about the bytes. A clean second entry must never erase it."""
+    from eval.status import _round_summary
+    rec = _tl_rec(4, subs=[
+        {"miner": "hk", "tier": "sub2", "model_id": "m2", "role": "incumbent",
+         "retention": 0.19, "gates_ok": True},
+        {"miner": "hk", "tier": "sub2", "model_id": "m2", "role": "challenger",
+         "retention": 0.19, "code_bits": 2.1, "gates_ok": False,
+         "reasons": ["92% of responses are highly repetitive (looping)"]},
+    ], events=[])
+    r = _round_summary(rec)["submissions"][0]
+    assert r["gates_ok"] is False and "looping" in r["reasons"][0]
+
+
+def test_distinct_artifacts_are_never_merged():
+    from eval.status import _round_summary
+    rec = _tl_rec(4, subs=[
+        {"miner": "a", "tier": "sub4", "model_id": "x", "role": "challenger", "retention": 0.3},
+        {"miner": "b", "tier": "sub4", "model_id": "y", "role": "challenger", "retention": 0.2},
+    ], events=[])
+    assert len(_round_summary(rec)["submissions"]) == 2

@@ -178,13 +178,19 @@ def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err)
     # an earlier round is still a crown. `hold` names the tier and the model; the miner and the
     # retention come from the re-scored incumbent submission, never from the event, for the same
     # anti-circularity reason the audit gives.
-    by_model = {}
+    by_model, bits_of = {}, {}
     for sub in (rec.get("submissions") or []):
         mid_ = str(sub.get("model_id"))
         prior = by_model.get(mid_)
         # prefer the INCUMBENT entry: for a held crown that is the score it defended with
         if prior is None or str(sub.get("role")) == "incumbent":
             by_model[mid_] = sub
+        # ...BUT NOT FOR THE BIT MEASUREMENT. An incumbent is re-scored, not re-ingested, so its
+        # row carries code_bits=0.0 and params=0 — reading those would publish the binary crown as
+        # a zero-bit, zero-parameter model. The bits are a property of the BYTES, so take them from
+        # whichever row for this model_id actually measured them, which is the challenger entry.
+        if float(sub.get("code_bits") or 0) > 0 and mid_ not in bits_of:
+            bits_of[mid_] = sub
 
     crowns = {}
     for e in (rec.get("events") or []):
@@ -207,6 +213,15 @@ def _crowns_from(rec, rounds_published, rec_round, rec_uri, trail_ok, trail_err)
             # -slice paired bootstrap, so a reader saw a higher number next to a miner who did not
             # get the crown and had nothing to explain it.
             "margin_lcb": e.get("margin_lcb"),
+            # WHAT THE CROWN ACTUALLY IS. The page showed a hotkey and a retention score and
+            # nothing else — so a visitor could not tell that the binary crown is a 1.9 GB model at
+            # 1.15 bits/weight, which IS the product. A score with no artifact behind it reads as a
+            # leaderboard; the size and the bit budget are the reason the leaderboard exists.
+            "code_bits": (bits_of.get(mid) or {}).get("code_bits") or None,
+            "container_bits": (bits_of.get(mid) or {}).get("container_bits") or None,
+            "params": (bits_of.get(mid) or {}).get("params") or None,
+            "artifact_uri": (sub.get("artifact_uri")
+                             or (bits_of.get(mid) or {}).get("artifact_uri") or None),
         }
     if not crowns:
         return unmeasured(f"round {rec_round} published but no tier has a crown")
@@ -261,6 +276,34 @@ def _is_unchanged_row(reasons) -> bool:
     return any("unchanged since round" in str(x).lower() for x in (reasons or []))
 
 
+def _merge_rows(rows):
+    """Collapse the challenger and incumbent entries for one artifact into a single row.
+
+    They are the same bytes on the same exam, so the retention is the same number twice; what
+    differs is that the incumbent carries no bit measurement and the challenger is not the entry
+    the crown was defended with. Merging keeps the measured bits from whichever row has them and
+    records that a re-score happened, instead of asking a reader to notice that two identical lines
+    are one model."""
+    out: dict = {}
+    for r in rows:
+        key = (r.get("tier"), r.get("model_id") or r.get("artifact_uri") or id(r))
+        prior = out.get(key)
+        if prior is None:
+            out[key] = dict(r, rescored=(r.get("role") == "incumbent"))
+            continue
+        prior["rescored"] = True
+        prior["crowned"] = bool(prior.get("crowned") or r.get("crowned"))
+        # keep the entry that actually measured the artifact
+        if not prior.get("code_bits") and r.get("code_bits"):
+            for f in ("code_bits", "container_bits", "artifact_uri"):
+                prior[f] = r.get(f) or prior.get(f)
+        # a gate failure is a fact about the bytes; never let a clean re-score erase it
+        if not r.get("gates_ok", True):
+            prior["gates_ok"], prior["reasons"] = False, list(r.get("reasons") or [])
+        prior["role"] = "challenger"
+    return list(out.values())
+
+
 def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
     """One round, reduced to what a miner wants to know: did it run, who was in it, who won.
 
@@ -290,9 +333,24 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
     # score, and that have no business in a status snapshot a browser polls. Ten fields answer what
     # a miner comes here to ask: was I in this round, what did I score, did I win, and if I am not
     # in the list, why not.
+    # A KING APPEARS TWICE IN A ROUND: once as the miner's own commitment, scored as a challenger,
+    # and once re-scored as the incumbent on this round's exam. Both rows are real and both belong
+    # in the record — the re-score is half of the paired dethrone test. But tagging both as the
+    # crown painted EIGHT crown labels across four tiers.
+    #
+    # The tag goes on the INCUMBENT row, because that is the score the crown was defended with and
+    # the one `_crowns_from` publishes. Where a crown has no incumbent row — the round it was first
+    # won — it falls back to the challenger entry, so a fresh crown is never left unlabelled.
+    has_incumbent = {str(s.get("model_id")) for s in subs
+                     if str(s.get("role")) == "incumbent" and s.get("model_id")}
+
     def _row(s):
-        crowned = bool(s.get("model_id")) and kings.get(s.get("tier")) == s.get("model_id")
+        mid_row = str(s.get("model_id") or "")
+        crowned = bool(mid_row) and kings.get(s.get("tier")) == mid_row and (
+            str(s.get("role")) == "incumbent" or mid_row not in has_incumbent)
         return {"miner": s.get("miner", ""), "tier": s.get("tier", ""),
+                # the artifact's identity, and the key the challenger/incumbent merge joins on
+                "model_id": mid_row,
                 "role": s.get("role", "challenger"),
                 "retention": s.get("retention"), "retention_lb": s.get("retention_lb"),
                 "code_bits": s.get("code_bits"), "container_bits": s.get("container_bits"),
@@ -316,9 +374,13 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
         "rejected_detail": [{"hotkey": r[0], "reasons": r[1]} for r in rejected],
         "unchanged_detail": [{"hotkey": r[0], "reasons": r[1]} for r in unchanged],
         "by_tier": by_tier,
-        # Every row, best first, incumbents included and labelled — the re-score is half of the
-        # paired dethrone test, so hiding it would leave the margin unexplainable.
-        "submissions": sorted((_row(s) for s in subs),
+        # ONE ROW PER ARTIFACT. A king is scored twice in a round — its miner's own commitment as a
+        # challenger, and the incumbent re-score that is half of the paired dethrone test — and
+        # printing both put the same model, the same score and the same repo on two adjacent lines
+        # four times over. The re-score is not hidden: the row carries `rescored`, and the incumbent
+        # is where the bit measurement is absent (re-scored, not re-ingested) so the merged row
+        # keeps whichever entry actually measured the bytes.
+        "submissions": sorted(_merge_rows(_row(s) for s in subs),
                               key=lambda r: -(r["retention"] or 0)),
         "crowns": kings,
         "events": [{"tier": e.get("tier"), "action": e.get("action")}
@@ -353,6 +415,13 @@ def _pending_from(commitments, latest_record: dict | None) -> dict:
             if isinstance(r, (list, tuple)) and len(r) == 2]
     unchanged_hk = {str(r[0]) for r in rows if _is_unchanged_row(r[1])}
     rejected_hk = {str(r[0]) for r in rows if not _is_unchanged_row(r[1])}
+    # WHY they were refused, carried forward. A rejected row holds no artifact_uri, so nothing here
+    # can tell "rejected and since fixed" from "rejected and unchanged" — and calling both
+    # `resubmitted` picks the flattering guess. Four miners sat in the round-5 queue labelled as
+    # having resubmitted when they were the same TQ1_0 and the same commit-reveal mismatch that
+    # round 4 refused, and round 5 would refuse identically. Reporting the REASON says only what is
+    # known, and is the one thing those miners can act on.
+    why_rejected = {str(r[0]): list(r[1]) for r in rows if not _is_unchanged_row(r[1])}
     seen = set(scored_uri) | rejected_hk | unchanged_hk
     new_entrants, resubmitted, unchanged = [], [], []
     for c in commitments or []:
@@ -372,6 +441,7 @@ def _pending_from(commitments, latest_record: dict | None) -> dict:
             # it as a rejection is not.
             unchanged.append(row)
         elif hk in rejected_hk and hk not in scored_uri:
+            row["rejected_last_round"] = why_rejected.get(hk, [])
             # A genuinely REJECTED miner is not "unchanged since scoring" — they were never scored.
             # Their rejection row carries no artifact_uri, so changed-vs-same bytes cannot be told
             # apart here; what CAN be said is that the next round reads their commitment again.
