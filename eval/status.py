@@ -252,6 +252,15 @@ FIRST_LIVE_ROUND = int(os.environ.get("RALPH_FIRST_LIVE_ROUND", "1000000"))
 ROUND_WINDOW = 12
 
 
+def _is_unchanged_row(reasons) -> bool:
+    """Is this `rejected` row a skip-already-scored note rather than a judgement?
+
+    Matched on the phrase `run_orchestrated` writes, and deliberately narrow: anything it does not
+    recognise counts as a real rejection, because under-reporting a refusal is the failure that
+    matters. See `_round_summary`."""
+    return any("unchanged since round" in str(x).lower() for x in (reasons or []))
+
+
 def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
     """One round, reduced to what a miner wants to know: did it run, who was in it, who won.
 
@@ -265,7 +274,15 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
     by_tier: dict = {}
     for s in challengers:
         by_tier[s.get("tier") or "?"] = by_tier.get(s.get("tier") or "?", 0) + 1
-    rejected = rec.get("rejected") or []
+    rejected_all = [r for r in (rec.get("rejected") or [])
+                    if isinstance(r, (list, tuple)) and len(r) == 2]
+    # NOT EVERY `rejected` ROW IS A REJECTION. Since skip-already-scored, a miner whose bytes the
+    # trail has already measured gets a row here so they are not silently absent — but they were
+    # not judged and did not fail anything. Counting them as rejections told round 3's readers "12
+    # rejected" for a round that refused four submissions and simply declined to re-measure seven.
+    # The signed record keeps one list, which is right; the DASHBOARD has to tell them apart.
+    unchanged = [r for r in rejected_all if _is_unchanged_row(r[1])]
+    rejected = [r for r in rejected_all if not _is_unchanged_row(r[1])]
     kings = kings_from_events(rec.get("events") or [])
 
     # THE ROWS, PROJECTED HARD. The record's submissions carry `steps`, `effects`, `slices` and
@@ -288,12 +305,16 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
     started, published = float(rec.get("started_at") or 0), float(rec.get("published_at") or 0)
     return {
         "round": n,
-        "phase": "live" if n >= first_live else "shakedown",
+        # "live" MEANT "pays emission, unlike the shakedown rounds" and RENDERED as a LIVE badge on
+        # every finished round, while the same page said "no round in flight". Three completed
+        # rounds all claiming to be live is the single most confusing thing on the dashboard.
+        "phase": "paid" if n >= first_live else "shakedown",
         "scored": len(challengers),
         "rescored_incumbents": len(subs) - len(challengers),
         "rejected": len(rejected),
-        "rejected_detail": [{"hotkey": r[0], "reasons": r[1]} for r in rejected
-                            if isinstance(r, (list, tuple)) and len(r) == 2],
+        "skipped_unchanged": len(unchanged),
+        "rejected_detail": [{"hotkey": r[0], "reasons": r[1]} for r in rejected],
+        "unchanged_detail": [{"hotkey": r[0], "reasons": r[1]} for r in unchanged],
         "by_tier": by_tier,
         # Every row, best first, incumbents included and labelled — the re-score is half of the
         # paired dethrone test, so hiding it would leave the margin unexplainable.
@@ -328,9 +349,11 @@ def _pending_from(commitments, latest_record: dict | None) -> dict:
     """
     subs = (latest_record or {}).get("submissions") or []
     scored_uri = {str(s.get("miner")): str(s.get("artifact_uri") or "") for s in subs}
-    rejected_hk = {str(r[0]) for r in ((latest_record or {}).get("rejected") or [])
-                   if isinstance(r, (list, tuple)) and r}
-    seen = set(scored_uri) | rejected_hk
+    rows = [r for r in ((latest_record or {}).get("rejected") or [])
+            if isinstance(r, (list, tuple)) and len(r) == 2]
+    unchanged_hk = {str(r[0]) for r in rows if _is_unchanged_row(r[1])}
+    rejected_hk = {str(r[0]) for r in rows if not _is_unchanged_row(r[1])}
+    seen = set(scored_uri) | rejected_hk | unchanged_hk
     new_entrants, resubmitted, unchanged = [], [], []
     for c in commitments or []:
         hk, uri = str(c.get("hotkey", "")), str(c.get("artifact_uri") or "")
@@ -339,15 +362,22 @@ def _pending_from(commitments, latest_record: dict | None) -> dict:
             new_entrants.append(row)
         elif uri and scored_uri.get(hk) and uri != scored_uri[hk]:
             resubmitted.append(row)
+        elif hk in unchanged_hk:
+            # SKIPPED, NOT REJECTED, AND NOT AWAITING ANYTHING. `run_orchestrated` writes an
+            # "unchanged since round N" row so the miner is not silently absent — but those bytes
+            # are already measured and the NEXT round will skip them again. Counting them as
+            # re-entering produced "12 awaiting scoring" for a field where eleven of the twelve
+            # could never be scored without new bytes, and would have said so again every round
+            # forever. Two fixes from the same day meeting badly: the skip row is real, and reading
+            # it as a rejection is not.
+            unchanged.append(row)
         elif hk in rejected_hk and hk not in scored_uri:
-            # A REJECTED miner is not "unchanged since scoring" — they were never scored. Their
-            # rejection row carries no artifact_uri, so changed-vs-same bytes cannot be told apart
-            # here; what CAN be said is that the next round will read their commitment again. They
-            # were falling into `unchanged`, which is how a miner who fixed their commit-reveal and
-            # re-committed a brand-new artifact stayed invisible on the dashboard — the third
-            # member of the invisibility family after the orchestrator-side and remote-side silent
-            # drops. Filed as re-entering (the resubmitted bucket) rather than inventing a fourth
-            # category the UI would have to learn.
+            # A genuinely REJECTED miner is not "unchanged since scoring" — they were never scored.
+            # Their rejection row carries no artifact_uri, so changed-vs-same bytes cannot be told
+            # apart here; what CAN be said is that the next round reads their commitment again.
+            # They were falling into `unchanged`, which is how a miner who fixed their
+            # commit-reveal and re-committed a brand-new artifact stayed invisible — the third
+            # member of the invisibility family after the two silent drops.
             resubmitted.append(row)
         else:
             unchanged.append(row)

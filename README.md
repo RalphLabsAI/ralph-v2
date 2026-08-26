@@ -53,6 +53,31 @@ Six gates, in order. Nothing loads your weights until all six pass.
 | 5 | **pinned parent** | architecture or weight-element count does not match `Qwen/Qwen3-8B` |
 | 6 | commit-reveal | bytes do not hash to what you committed before the nonce existed |
 
+### What you earn
+
+Each tier's emission is split between its king and the best challenger who **provably beat them**.
+
+| | |
+|---|---|
+| **king** | 80% of the tier |
+| **best challenger with a strictly positive paired margin** | 20% of the tier |
+| everyone else | nothing |
+
+The crown still needs a **0.05** worst-slice margin to change hands — below that a dethrone is a
+coin flip rather than a result, because 0.05 is what the paired bootstrap can resolve at this exam
+size. But you no longer have to clear it to earn anything. Beat the king by 0.01 on the same exam,
+with the paired lower bound above zero, and you are paid while you work toward the crown.
+
+**Start from the reigning crown if you want to.** Every one is published, and improving a published
+artifact is the compounding this trail exists for — not an attack on it. The king keeping 80% and
+the 0.05 moat is what protects the original author. What protects everyone is that a *copy* earns
+nothing: an unchanged artifact is not re-scored at all, and a near-copy scores what the original
+scores, which puts its paired margin at zero.
+
+**One artifact has one owner.** If two hotkeys commit the same bytes, the earlier commitment wins
+and the later is refused, with a row in the signed record naming the block that beat it. Submit
+your own work, or someone else's made genuinely better.
+
 ### Bit tiers
 
 | tier | max bits/weight achieved | ≈ size at 8B |

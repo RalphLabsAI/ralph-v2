@@ -564,13 +564,34 @@ def gpu_devices(inst: Instance, spec: GpuSpec, timeout: int = 120) -> list:
 
 
 def assert_gpu_present(inst: Instance, spec: GpuSpec) -> list:
-    """Refuse a rental with no GPU, in seconds rather than after the install."""
+    """Refuse a rental with no GPU, or with the WRONG one, in seconds rather than after the round.
+
+    The wrong-GPU half was open until 2026-08-18. `require_gpu` was enforced only in
+    `verify_returned_record`, which runs after the box has been installed, has scored every
+    submission and has come back — so renting an `H100_sxm5` against a round pinned to
+    `NVIDIA H100 PCIe` cost the full hour and the full bill before anything objected, and then
+    threw the work away. Shadeform sells both under `gpu_type=H100`, so this is not a rare
+    mis-click: it is what you get whenever the SXM variant happens to be the cheapest available.
+
+    Catching it HERE is what makes it cheap. This runs inside the caller's rent-retry loop, so a
+    mismatch is just a dud region — destroy, add to `tried`, rent elsewhere — exactly like a box
+    that never booted. Raising it any later is a dead round instead of a retry."""
     devs = gpu_devices(inst, spec)
     if not devs:
         raise RemoteRoundError(
             "this rental reports NO GPU (`nvidia-smi -L` lists none). The provider called it ready "
             "and it is reachable, but there is no card attached — installing on it would cost "
             "fifteen minutes and produce a CPU-only box. Destroy it and rent elsewhere.")
+    # SUBSTRING, NOT EQUALITY. `require_gpu` is torch's `get_device_name`, while these come from
+    # `nvidia-smi -L`, which wraps the same name in "GPU 0: ... (UUID: ...)". Demanding equality
+    # here would reject every box including the right one; the audit still does the exact check on
+    # torch's own string, so this is a cheap pre-filter and not a replacement for it.
+    want = (spec.require_gpu or "").strip()
+    if want and not any(want in d for d in devs):
+        raise RemoteRoundError(
+            f"this rental is a {devs[0]!r}, but the round is pinned to {want!r}. A crown scored on "
+            f"other hardware is not comparable with one defended on this hardware, so the record "
+            f"would be refused at audit AFTER the whole round had been paid for. Rent elsewhere.")
     return devs
 
 
@@ -1007,7 +1028,20 @@ def _run_on(inst, plan, provider, spec, job_path, work_dir, repo_dir, remote_dir
         pool_path = os.path.join(work_dir, "pool.jsonl")
         raw = json.loads(open(rec_path).read())
         if raw is None:
-            raise RemoteRoundError("the remote scored no record (no usable submissions?)")
+            # SAY WHY, when the remote already said. A null record is the shape of several very
+            # different outcomes, and "no usable submissions?" — a guess, with a question mark —
+            # was printed for all of them. Round 3 aborted here because the DETERMINISM CANARY
+            # caught the student path scoring one model 29/72 and then 32/72 on the same box, and
+            # the operator was told the round had nothing to score. It had eleven things to score
+            # and correctly refused to crown from a box whose results are a lottery.
+            #
+            # The abort event travels home in the summary; this stops throwing it away.
+            why = next((str(e.get("reason") or "") for e in (summary.get("events") or [])
+                        if isinstance(e, dict) and e.get("action") == "abort"), "")
+            det = summary.get("determinism") or {}
+            raise RemoteRoundError(
+                why or (f"the remote returned no record. determinism={det}" if det else
+                        "the remote scored no record (no usable submissions?)"))
         from .rerun import load_pool, record_from_blob
         rec = record_from_blob(json.dumps(raw).encode())
         pool = load_pool(pool_path)

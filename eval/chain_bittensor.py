@@ -68,6 +68,47 @@ from dataclasses import dataclass, field
 from .chain import Commitment
 
 
+def _first_commit_wins(commits: list, wrote_at: dict, skipped: list) -> list:
+    """One artifact, one owner: the hotkey that committed those bytes FIRST.
+
+    Every challenger's artifact is public on HuggingFace the moment it is committed, so without
+    this a sniper can download a competitor's file and commit the identical bytes under their own
+    hotkey. That was survivable while only crowns were paid — a duplicate of the king scores what
+    the king scores and cannot clear the dethrone margin — and it stops being survivable the moment
+    a strictly-improving CHALLENGER is paid (`koth.CHALLENGER_SHARE`), because the sniper would
+    collect for someone else's improvement.
+
+    Earliest `wrote_at` wins, ties broken on hotkey so the outcome is not iteration-order. The loser
+    is told, in a row that reaches the signed record.
+
+    PERTURBING THE BYTES TO DODGE THIS IS NOT A LOOPHOLE: a changed artifact has a different hash,
+    so it is a different submission and must earn its own score — and a near-copy scores what the
+    original scores, which puts its paired lower bound at ~0 and pays nothing. Dedup and the
+    strictly-positive test close the loop from opposite ends."""
+    by_hash: dict = {}
+    for c in commits:
+        h = str(getattr(c, "revealed_hash", "") or "")
+        if not h:
+            continue                      # unrevealed: nothing to collide on yet
+        cur = by_hash.get(h)
+        if cur is None or (wrote_at.get(c.hotkey, 0), c.hotkey) < (wrote_at.get(cur.hotkey, 0),
+                                                                   cur.hotkey):
+            by_hash[h] = c
+    keep, out = set(), []
+    for c in commits:
+        h = str(getattr(c, "revealed_hash", "") or "")
+        owner = by_hash.get(h)
+        if h and owner is not None and owner.hotkey != c.hotkey:
+            skipped.append((c.hotkey, (
+                f"these bytes were already committed by {owner.hotkey[:12]}… at block "
+                f"{wrote_at.get(owner.hotkey, 0)} (yours: block {wrote_at.get(c.hotkey, 0)}). "
+                f"One artifact has one owner — the first commitment of it. Submit your own work.")))
+            continue
+        keep.add(c.hotkey)
+        out.append(c)
+    return out
+
+
 @dataclass
 class BittensorChainIO:
     """`chain.ChainIO` over the live network, with no v1 in the path."""
@@ -176,6 +217,7 @@ class BittensorChainIO:
         from a block after the window closes, so the commit-then-generate ordering that makes the
         score un-pre-fittable is unaffected."""
         out: list[Commitment] = []
+        seen_at: dict[str, int] = {}
         cmap = self.commitments_map()
         for uid, hotkey in enumerate(self._hotkeys()):
             entry = cmap.get(hotkey) if cmap else (self._commitment_of(uid, hotkey), 0)
@@ -239,7 +281,8 @@ class BittensorChainIO:
                 committed_value=str(env.get("cv", "")),
                 artifact_uri=str(env.get("uri", "")),
             ))
-        return out
+            seen_at[hotkey] = int(wrote_at or 0)
+        return _first_commit_wins(out, seen_at, self.skipped)
 
     def commit_root(self, min_block: int, max_block: int) -> str:
         """Deterministic digest over the window's sealed values. Binds the item/observer seeds to
