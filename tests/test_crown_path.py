@@ -4682,21 +4682,26 @@ def test_the_student_path_must_reproduce_or_the_round_aborts():
             self.score, self.slice_samples = score, slices
 
     same = MS(0.3, {"en|shallow": [0.30, 0.31], "zh|deep": [0.5]})
-    assert _determinism_drift(same, MS(0.3, {"en|shallow": [0.30, 0.31], "zh|deep": [0.5]})) == 0.0
+    assert _determinism_drift(same, MS(0.3, {"en|shallow": [0.30, 0.31], "zh|deep": [0.5]}))[0] == 0.0
 
     # the round-2 shape: aggregate moved, one slice moved
-    drifted = _determinism_drift(MS(0.3030, {"en|shallow": [0.3030], "zh|deep": [0.5956]}),
-                                 MS(0.2875, {"en|shallow": [0.2875], "zh|deep": [0.5956]}))
+    drifted, _w = _determinism_drift(MS(0.3030, {"en|shallow": [0.3030], "zh|deep": [0.5956]}),
+                                     MS(0.2875, {"en|shallow": [0.2875], "zh|deep": [0.5956]}))
     assert abs(drifted - 0.0155) < 1e-9, drifted
 
     # A SLICE MAY MOVE WITHOUT MOVING THE MINIMUM — and that still has to count, because the slice
     # that did not decide the score this time can decide it next time.
-    hidden = _determinism_drift(MS(0.30, {"worst": [0.30], "other": [0.80]}),
-                                MS(0.30, {"worst": [0.30], "other": [0.90]}))
+    hidden, where = _determinism_drift(MS(0.30, {"worst": [0.30], "other": [0.80]}),
+                                       MS(0.30, {"worst": [0.30], "other": [0.90]}))
+    # AND IT MUST NAME ITSELF. A bare drift figure cost two rounds: the next occurrence has to say
+    # which slice moved and whether the generated TEXT changed, because "the model generated
+    # something else" and "the same text scored differently" have different fixes.
+    assert where["slice"] == "other" and where["index"] == 0
+    assert where["text_changed"] is False, "no steps supplied means the text did not move"
     assert hidden > 0.0, "a slice moved underneath an unchanged aggregate and was reported clean"
 
     # a different sample count is a break, not a drift
-    assert _determinism_drift(MS(0.3, {"a": [0.1, 0.2]}), MS(0.3, {"a": [0.1]})) == float("inf")
+    assert _determinism_drift(MS(0.3, {"a": [0.1, 0.2]}), MS(0.3, {"a": [0.1]}))[0] == float("inf")
 
 
 def test_a_reference_is_scored_and_can_never_win_anything():
@@ -5027,3 +5032,44 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_the_canary_says_whether_the_text_moved():
+    """A drift figure alone cost two rounds and a day of bisecting.
+
+    Under test the student generates identically at production scale and the observer is bit-exact,
+    yet production drifts — so the next occurrence has to distinguish "the model generated
+    something else" from "the same text scored differently". Those have completely different fixes
+    and nothing in the record could tell them apart."""
+    from eval.validator_observer_loop import _determinism_drift
+
+    class MS:
+        def __init__(self, score, slices, steps=None):
+            self.score, self.slice_samples, self.steps = score, slices, steps or []
+
+    a = MS(0.30, {"en|deep": [0.30, 0.55]}, steps=["the answer is 7", "so x = 4"])
+    b = MS(0.30, {"en|deep": [0.30, 0.74]}, steps=["the answer is 7", "so x = 9"])
+    drift, where = _determinism_drift(a, b)
+    assert abs(drift - 0.19) < 1e-9
+    assert where["slice"] == "en|deep" and where["index"] == 1
+    assert where["text_changed"] is True and where["steps_differ"] == 1
+    assert where["first_divergence"]["step"] == 1
+    assert "4" in where["first_divergence"]["run1"] and "9" in where["first_divergence"]["run2"]
+
+    # same text, different score: a numerics problem, not a generation one
+    c = MS(0.30, {"en|deep": [0.30, 0.55]}, steps=["identical", "identical"])
+    d = MS(0.30, {"en|deep": [0.30, 0.58]}, steps=["identical", "identical"])
+    _drift2, where2 = _determinism_drift(c, d)
+    assert where2["text_changed"] is False and where2["steps_differ"] == 0
+
+
+def test_a_changed_sample_count_still_reports_where():
+    from eval.validator_observer_loop import _determinism_drift
+
+    class MS:
+        def __init__(self, score, slices):
+            self.score, self.slice_samples, self.steps = score, slices, []
+
+    drift, where = _determinism_drift(MS(0.3, {"k": [0.1, 0.2]}), MS(0.3, {"k": [0.1]}))
+    assert drift == float("inf")
+    assert where["reason"] == "sample count changed" and where["n_first"] == 2

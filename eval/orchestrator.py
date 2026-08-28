@@ -1370,6 +1370,13 @@ def _default_runner(inst, spec, plan, job_path, work_dir, repo_dir, remote_dir, 
         _ssh(inst, spec, f"umask 077 && mkdir -p {remote_dir} && cat > {remote_dir}/.hf_read",
              timeout=60, stdin=read_tok)
         env = f"HF_TOKEN=$(cat {remote_dir}/.hf_read) "
+    # PASSED THROUGH VERBATIM to the scorer, for a box we did not rent. The only use so far is
+    # `CUDA_VISIBLE_DEVICES=<n>` when scoring on a multi-GPU machine that is running someone else's
+    # work on the other cards — without it the scorer takes device 0 and would sit on top of them.
+    # Empty in production, where the box is ours alone.
+    _extra = os.environ.get("RALPH_REMOTE_ENV", "").strip()
+    if _extra:
+        env = f"{_extra} {env}"
     # Eager attention allocates one enormous contiguous score matrix per batch; the default caching
     # allocator fragments around it and then fails a request the card could physically satisfy.
     # This does not change any number — only whether the allocation succeeds.
