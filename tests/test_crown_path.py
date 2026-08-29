@@ -3917,11 +3917,22 @@ def test_gguf_is_loadable_because_nothing_else_can_pass_the_tiers():
         def fake_llama(path):
             seen["path"] = path
 
-            def call(prompt, **kw):
-                seen["kw"] = kw
-                return {"choices": [{"text": f"step<{prompt[-2:]}>"}]}
+            # A REAL BACKEND EXPOSES reset(), and the runner now calls it before every prompt so a
+            # step's output cannot depend on the steps before it. The double has to carry it, and
+            # counts the calls, because losing that reset silently reintroduces the cache carryover
+            # that made one submission score 0.281379 and then 0.257174 from the same bytes.
+            class _Fake:
+                def __init__(self):
+                    seen["resets"] = 0
 
-            return call
+                def reset(self):
+                    seen["resets"] += 1
+
+                def __call__(self, prompt, **kw):
+                    seen["kw"] = kw
+                    return {"choices": [{"text": f"step<{prompt[-2:]}>"}]}
+
+            return _Fake()
 
         # dispatch picks the GGUF loader for a gguf-only artifact...
         r = student_runner(str(d), backend=fake_llama)
@@ -5073,3 +5084,43 @@ def test_a_changed_sample_count_still_reports_where():
     drift, where = _determinism_drift(MS(0.3, {"k": [0.1, 0.2]}), MS(0.3, {"k": [0.1]}))
     assert drift == float("inf")
     assert where["reason"] == "sample count changed" and where["n_first"] == 2
+
+
+def test_every_prompt_starts_from_a_clean_context():
+    """A step's output must not depend on the steps generated before it.
+
+    llama.cpp keeps its KV cache across calls and prefix-matches the next prompt against whatever
+    is still resident, so `generate()` was order-dependent: scoring one submission twice on the
+    same runner produced genuinely different TEXT on 14 of 72 steps and aborted two live rounds.
+    The determinism canary was correctly reporting a difference it had created itself, by being the
+    only caller that scores a runner twice.
+
+    Rounds 1-4 were internally fair — each submission got a freshly loaded runner — but an auditor
+    replaying the same items in a different order would not have reproduced our numbers, which is
+    the claim the whole record rests on."""
+    import sys
+    import types
+
+    from eval.runners import GGUFStudentRunner
+
+    calls = []
+
+    class _Fake:
+        def reset(self):
+            calls.append("reset")
+
+        def __call__(self, prompt, **kw):
+            calls.append(f"gen:{prompt}")
+            return {"choices": [{"text": "x"}]}
+
+    mod = types.ModuleType("llama_cpp")
+    mod.Llama = lambda **kw: _Fake()
+    sys.modules["llama_cpp"] = mod
+    try:
+        r = GGUFStudentRunner.__new__(GGUFStudentRunner)
+        r.path, r.name, r._llm = "/nonexistent/model.gguf", "t", _Fake()
+        r.generate(["alpha", "beta", "gamma"], max_new_tokens=4)
+    finally:
+        sys.modules.pop("llama_cpp", None)
+
+    assert calls == ["reset", "gen:alpha", "reset", "gen:beta", "reset", "gen:gamma"], calls

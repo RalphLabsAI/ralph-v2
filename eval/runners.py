@@ -636,6 +636,20 @@ class GGUFStudentRunner:
             # rounds that were going to succeed. Instrumenting the fast path and forgetting the
             # slow one is how you build exactly that.
             tick("student", f"{self.name} {n}/{len(prompts)} @{max_new_tokens} tok")
+            # EVERY PROMPT STARTS FROM THE SAME STATE. llama.cpp keeps its KV cache across calls
+            # and prefix-matches the next prompt against whatever is still in it, so a step's
+            # output depended on the steps generated before it — and on whether the model had been
+            # used at all. Scoring one submission twice therefore compared a clean-start run
+            # against a warm-start one and produced genuinely different TEXT on 14 of 72 steps,
+            # which the determinism canary correctly reported and which aborted two live rounds.
+            #
+            # The canary was measuring this, not the hardware: a round scores each submission once
+            # on a freshly loaded runner, so rounds 1-4 were not wrong. But "the answer depends on
+            # what was asked before it" is not a property a recomputable record can carry — an
+            # auditor who replays the items in a different order must get our numbers, and now
+            # does. Trajectory prefixes are unrelated to each other, so there is no prefix reuse
+            # being given up here.
+            llm.reset()
             r = llm(p, max_tokens=int(max_new_tokens), temperature=0.0, top_k=1, top_p=1.0,
                     repeat_penalty=1.0, echo=False)
             try:
