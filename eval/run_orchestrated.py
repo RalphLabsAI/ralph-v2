@@ -93,7 +93,7 @@ class Config:
             wallet=e("RALPH_WALLET", "ralph"), hotkey=e("RALPH_HOTKEY", "owner"),
             parent_key=e("RALPH_PARENT_KEY", "qwen3-8b"),
             records_repo=e("RALPH_HF_REPO", "RalphLabsAI/ralph-v2-rounds"),
-            n_items=int(e("RALPH_N_ITEMS", "72")), pool_size=int(e("RALPH_POOL_SIZE", "900")),
+            n_items=int(e("RALPH_N_ITEMS", "144")), pool_size=int(e("RALPH_POOL_SIZE", "900")),
             work_dir=e("RALPH_WORK_DIR", "/workspace/ralph-v2-work"),
             observers=tuple(x.strip() for x in e("RALPH_OBSERVERS", "").split(",") if x.strip())
                       or cls.observers,

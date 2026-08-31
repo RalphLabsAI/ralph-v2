@@ -29,7 +29,7 @@ def score(job: dict, out_dir: str) -> dict:
     from .economics import RegistrationLedger
     from .fetch import resolver
     from .gates import TierBudget
-    from .koth import Tier, Tournament
+    from .koth import DETHRONE_MARGIN, Tier, Tournament
     from .parent import PARENTS
     from .pool import build_pool, check_balance, dump_pool
     from .progress import tick
@@ -131,7 +131,7 @@ def score(job: dict, out_dir: str) -> dict:
     # orchestrator (eval/lineage.py) and supplied here, and the king's artifact is refetched so the
     # incumbent is RE-SCORED on this round's items rather than defended on last round's number.
     from .lineage import Reign
-    tournament = Tournament(tiers, margin=float(job.get("margin", 0.05)))
+    tournament = Tournament(tiers, margin=float(job.get("margin", DETHRONE_MARGIN)))
     # STAMP THE ROUND, or every event this round emits says it happened in round 0. `Tournament`
     # initialises `self.round = 0` and each event copies it, so the number is not decorative: it is
     # what a `crown` event means by "since", and what an auditor reads to say when a tier changed
