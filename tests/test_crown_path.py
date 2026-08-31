@@ -3535,6 +3535,43 @@ def test_audit_binds_emission_to_the_crowns():
         a = rigged(lambda r: r.update(weights={challenger["miner"]: 0.4}))
         assert any("weights normalised" in n for n in names(a)), names(a)
 
+        # ---- 7. A CHALLENGER EVENT IS NOT A PAY ORDER. The runner-up split is real (koth pays
+        #         CHALLENGER_SHARE on lcb > 0), so the weighted set may exceed the kings — but only
+        #         through a scored, gates-passing submission. An event naming a stranger is the
+        #         old attack wearing the new feature.
+        def _one_tier(r, extra_events):
+            tier = challenger["tier"]
+            r["submissions"] = [x for x in r["submissions"] if x["tier"] == tier]
+            kings = [x for x in r["submissions"] if x["role"] == "incumbent"]
+            r["events"] = [{"tier": tier, "round": 2, "action": "hold",
+                            "king": kings[0]["model_id"], **extra_events}]
+            return kings[0]["miner"], tier
+
+        def rig7(r):
+            km, tier = _one_tier(r, {"challenger_miner": ATTACKER, "challenger_share": 0.2,
+                                     "challenger_lcb": 0.01})
+            r["weights"] = {km: 0.8, ATTACKER: 0.2}
+        a = rigged(rig7)
+        assert any("is a scored challenger" in n for n in names(a)), names(a)
+
+        # ---- 8. NOR IS THE SHARE THE OPERATOR'S TO CHOOSE — it is the protocol constant, or the
+        #         event's own number would bless any split it also wrote.
+        def rig8(r):
+            km, tier = _one_tier(r, {"challenger_miner": challenger["miner"],
+                                     "challenger_share": 0.5, "challenger_lcb": 0.01})
+            r["weights"] = {km: 0.5, challenger["miner"]: 0.5}
+        a = rigged(rig8)
+        assert any("protocol constant" in n for n in names(a)), names(a)
+
+        # ---- 9. AND THE HONEST SPLIT PASSES: real challenger, protocol share, matching vector.
+        def rig9(r):
+            km, tier = _one_tier(r, {"challenger_miner": challenger["miner"],
+                                     "challenger_share": 0.2, "challenger_lcb": 0.01})
+            r["weights"] = {km: 0.8, challenger["miner"]: 0.2}
+        a = rigged(rig9)
+        weight_fails = [n for n in names(a) if "weight" in n or "challenger" in n]
+        assert not weight_fails, weight_fails
+
 
 def test_auditor_verifies_then_diverges():
     """THE POINT OF AN AUDITOR. "Other validators set weights aligned with the owner validator" is
