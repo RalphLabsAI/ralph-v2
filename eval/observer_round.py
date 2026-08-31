@@ -278,14 +278,22 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
     alloc = {}
     for lang in langs:
         alloc[lang] = min(min_per_lang, len(by_lang[lang]), max(1, k // len(langs)))
-    # then share the remainder in proportion to availability, never exceeding a stratum's size
+    # then share the remainder to the SMALLEST slice first, never exceeding a stratum's size.
+    # The aggregate is a soft-MIN over slices, so precision bought on the largest slice never
+    # reaches the decision. Sharing in proportion to availability spent the remainder on English
+    # (~67% of the pool): a 72-item draw put 22 points in en/shallow while the slice that
+    # actually decided the crown sat at its floor of 11. Levelling up instead puts every spare
+    # item where the dethrone test is resolved, at no extra scoring cost, and makes the deciding
+    # slice grow with n_items as intended rather than pinned near the floor. Still one RNG seeded
+    # from the same post-commit value, ties broken by draw over a sorted list, so the selection is
+    # exactly as unpredictable and exactly as re-derivable as before.
     remaining = k - sum(alloc.values())
     while remaining > 0:
         room = [l for l in langs if alloc[l] < len(by_lang[l])]
         if not room:
             break
-        weights = [len(by_lang[l]) for l in room]
-        pick = rng.choices(room, weights=weights, k=1)[0]
+        low = min(alloc[l] for l in room)
+        pick = rng.choice([l for l in room if alloc[l] == low])
         alloc[pick] += 1
         remaining -= 1
 

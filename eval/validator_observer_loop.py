@@ -59,13 +59,35 @@ def _determinism_drift(a, b) -> float:
     instability, not only the occasion it happened to matter."""
     sa, sb = dict(getattr(a, "slice_samples", {}) or {}), dict(getattr(b, "slice_samples", {}) or {})
     worst = abs(float(getattr(a, "score", 0.0)) - float(getattr(b, "score", 0.0)))
-    for k in set(sa) | set(sb):
+    where = None
+    for k in sorted(set(sa) | set(sb)):
         va, vb = sa.get(k) or [], sb.get(k) or []
         if len(va) != len(vb):
-            return float("inf")          # a different sample count is not a drift, it is a break
-        for x, y in zip(va, vb):
-            worst = max(worst, abs(float(x) - float(y)))
-    return worst
+            return float("inf"), {"slice": k, "reason": "sample count changed",
+                                  "n_first": len(va), "n_second": len(vb)}
+        for i, (x, y) in enumerate(zip(va, vb)):
+            d = abs(float(x) - float(y))
+            if d > worst:
+                worst, where = d, {"slice": k, "index": i,
+                                   "first": round(float(x), 6), "second": round(float(y), 6)}
+    # WHICH SAMPLE, AND WHETHER THE TEXT MOVED. A drift figure alone cost two rounds and a day of
+    # bisecting: the student generates identically under test, the observer is bit-exact under
+    # test, and yet production drifts — so the next occurrence has to say whether the STEP TEXT
+    # changed (a generation problem) or only its score did (a numerics problem). Those have
+    # completely different fixes and nothing in the record could tell them apart.
+    if where is not None:
+        sta, stb = list(getattr(a, "steps", []) or []), list(getattr(b, "steps", []) or [])
+        n = min(len(sta), len(stb))
+        moved = [i for i in range(n) if sta[i] != stb[i]]
+        where["steps_differ"] = len(moved)
+        where["text_changed"] = bool(moved)
+        if moved:
+            i = moved[0]
+            j = next((c for c in range(min(len(sta[i]), len(stb[i]))) if sta[i][c] != stb[i][c]), 0)
+            where["first_divergence"] = {"step": i, "char": j,
+                                         "run1": sta[i][max(0, j - 60):j + 60],
+                                         "run2": stb[i][max(0, j - 60):j + 60]}
+    return worst, (where or {})
 
 
 def _close_runner(runner) -> None:
@@ -445,17 +467,23 @@ def run_observer_round(
                                             f"path reproduces", force=True)
                 again = score_submission(shared, runner, observer,
                                          max_step_tokens=max_step_tokens)
-                drift = _determinism_drift(ms, again)
+                drift, where = _determinism_drift(ms, again)
                 out.determinism = {"model_id": sub.model_id, "first": round(ms.score, 6),
                                    "second": round(again.score, 6),
-                                   "max_slice_drift": round(drift, 6), "reproduced": drift == 0.0}
+                                   "max_slice_drift": round(drift, 6), "reproduced": drift == 0.0,
+                                   "where": where}
                 if drift != 0.0:
                     out.events.append({
                         "round": round_no, "action": "abort",
                         "reason": f"the student path is not reproducible: scoring "
                                   f"{sub.model_id[:12]}… twice on this box gave "
                                   f"{ms.score:.6f} and {again.score:.6f} (worst slice drifted "
-                                  f"{drift:.6f}). A crown decided inside that drift is a lottery.",
+                                  f"{drift:.6f}"
+                                  + (" — THE GENERATED TEXT CHANGED"
+                                     if where.get("text_changed") else
+                                     " — the text was identical, only its score moved")
+                                  + f", slice {where.get('slice')}). "
+                                  f"A crown decided inside that drift is a lottery.",
                         "determinism": out.determinism})
                     return out
         except Exception as e:

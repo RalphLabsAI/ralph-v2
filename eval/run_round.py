@@ -213,7 +213,7 @@ def run(cfg: Config, round_no: int = 1) -> int:
     from .chain_bittensor import BittensorChainIO
     from .economics import RegistrationLedger
     from .fetch import resolver
-    from .koth import Tier, Tournament
+    from .koth import DETHRONE_MARGIN, Tier, Tournament
     from .parent import PARENTS
     from .pool import build_pool, check_balance
     from .publish import HFSink, RecordPublisher
@@ -259,7 +259,7 @@ def run(cfg: Config, round_no: int = 1) -> int:
     print(f"\n  running round {round_no} (live={cfg.live})…")
     res = run_v2_observer_epoch(
         chain, round_no, pool, parent, observers, tiers, budgets,
-        Tournament(tiers, margin=0.05), RegistrationLedger(), {},
+        Tournament(tiers, margin=DETHRONE_MARGIN), RegistrationLedger(), {},
         make_safe_runner=lambda cd: SafeStudentRunner(cd),
         signer=_signer(cfg), n_items=cfg.n_items,
         corpus_spec=pspec.as_corpus_spec(), publisher=publisher,

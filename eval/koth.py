@@ -232,7 +232,7 @@ def worst_axis_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000,
 
 
 # Share of a tier's emission paid to the best challenger that BEAT the sitting king on the paired
-# worst-slice lower bound without clearing the 0.05 dethrone margin. The king keeps the rest, and
+# worst-slice lower bound without clearing the dethrone margin. The king keeps the rest, and
 # keeps all of it when no challenger qualifies.
 #
 # 0.20 is chosen to be worth a GPU-week and not worth a coup: enough that finding a real 0.01
@@ -240,14 +240,32 @@ def worst_axis_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000,
 # which is still ~4x the income. Set to 0.0 to restore winner-take-all.
 CHALLENGER_SHARE = 0.20
 
+# THE dethrone margin. One constant because the money path does not use the class default: both
+# `score_job` (orchestrated rounds) and `run_round` construct their own Tournament, so a default
+# changed here alone would have moved nothing that pays. Import this rather than writing a number.
+DETHRONE_MARGIN = 0.02
+
 
 class Tournament:
     """Holds the reigning king per tier and applies dethrone-on-margin each round."""
 
-    def __init__(self, tiers: list[Tier], margin: float = 0.05):
-        # 0.05 production floor: at the small end of eval sizes the paired bootstrap
-        # can't resolve a dethrone below ~this margin (adversarial-review Q4). Raise
-        # toward 0.07 for tiny piles, lower only with n >= ~1500 points/round.
+    def __init__(self, tiers: list[Tier], margin: float = DETHRONE_MARGIN):
+        # THE MARGIN IS AN EFFECT-SIZE FLOOR STACKED ON A SIGNIFICANCE TEST, AND IT MUST STAY
+        # INSIDE THE METRIC'S RANGE. `softmin_lcb_diff` already refuses a dethrone that the
+        # paired bootstrap cannot separate from zero at 95%; the margin only adds "and by at
+        # least this much". Measured on the signed records, the bootstrap gives up ~0.030 of
+        # the mean advantage to uncertainty at n_items=72, so margin 0.05 demanded a true
+        # advantage of ~0.080 while the whole observed spread within a tier was 0.074 (binary)
+        # and 0.078 (sub2). A bar wider than the range of the thing it measures cannot be
+        # cleared on merit, only inherited on an open throne — so first occupancy became
+        # permanent in exactly the two tiers the subnet exists to push on.
+        #
+        # 0.02 with n_items=144 asks for ~0.039, about half a tier's spread. The anti-grinding
+        # job the old floor was hired for is now done by economics.per_coldkey_round_cap = 1
+        # per (coldkey, tier): one draw per round against an exam derived post-commit, so a
+        # miner cannot buy attempts at the 5% false-positive rate the LCB already bounds.
+        # Re-derive both numbers together if n_items moves — the penalty scales ~1/sqrt(n),
+        # validated by subsampling real pairs (0.5x -> 1.48x, 0.25x -> 2.22x).
         self.tiers = {t.name: t for t in tiers}
         self.margin = margin
         self.kings: dict[str, King] = {}
@@ -305,7 +323,7 @@ class Tournament:
         # the throne changed hands or not, because `weights()` pays it — see `CHALLENGER_SHARE`.
         # STRICTLY POSITIVE `lcb` is the whole test: a copy of the king scores the same as the king,
         # so its paired lower bound sits at ~0 and earns nothing, while a genuine 0.01 improvement
-        # that cannot yet clear the 0.05 dethrone margin earns something for the first time.
+        # that cannot yet clear the dethrone margin earns something for the first time.
         if lcb > 0.0 and best.sub.model_id != king_scored.sub.model_id:
             self.runners_up[tier] = {"miner": best.sub.miner, "model_id": best.sub.model_id,
                                      "lcb": round(lcb, 6)}
@@ -348,7 +366,7 @@ class Tournament:
             up = self.runners_up.get(t)
             # PAY THE BEST STRICTLY-IMPROVING CHALLENGER, or the king keeps the tier whole.
             #
-            # Until this, progress below the 0.05 dethrone margin paid exactly zero: a challenger
+            # Until this, progress below the dethrone margin paid exactly zero: a challenger
             # who genuinely beat the king by 0.01 — provably, paired on the same exam — earned the
             # same as one who never submitted. With every throne defended that is every miner but
             # four, and "why iterate?" is the honest question it invites. The margin itself is not
@@ -360,7 +378,7 @@ class Tournament:
             # way to collect is to actually be better on the worst slice. One slot per tier, so
             # spraying hotkeys buys nothing either. Starting from the published crown and improving
             # it is not the attack — it is the compounding the trail exists to enable, and the
-            # king's 80% plus the 0.05 moat is what protects the original author.
+            # king's 80% plus the margin is what protects the original author.
             if up and up.get("miner") and up["miner"] != k.miner:
                 out[k.miner] = out.get(k.miner, 0.0) + share * (1.0 - CHALLENGER_SHARE)
                 out[up["miner"]] = out.get(up["miner"], 0.0) + share * CHALLENGER_SHARE

@@ -93,7 +93,7 @@ class Config:
             wallet=e("RALPH_WALLET", "ralph"), hotkey=e("RALPH_HOTKEY", "owner"),
             parent_key=e("RALPH_PARENT_KEY", "qwen3-8b"),
             records_repo=e("RALPH_HF_REPO", "RalphLabsAI/ralph-v2-rounds"),
-            n_items=int(e("RALPH_N_ITEMS", "72")), pool_size=int(e("RALPH_POOL_SIZE", "900")),
+            n_items=int(e("RALPH_N_ITEMS", "144")), pool_size=int(e("RALPH_POOL_SIZE", "900")),
             work_dir=e("RALPH_WORK_DIR", "/workspace/ralph-v2-work"),
             observers=tuple(x.strip() for x in e("RALPH_OBSERVERS", "").split(",") if x.strip())
                       or cls.observers,
@@ -321,7 +321,7 @@ def _milestone_writer(out):
 def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout) -> int:
     from .chain_bittensor import BittensorChainIO
     from .orchestrator import GpuSpec, RoundPlan, ShadeformProvider, run_remote_round
-    from .publish import HFSink, PublishError, RecordPublisher, publish_and_gate
+    from .publish import HFSink, LocalSink, PublishError, RecordPublisher, publish_and_gate
     from .signing import Ed25519Signer
 
     w = _milestone_writer(out)
@@ -346,7 +346,16 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     # empty production repo, and the very first real round refuses to write with "history has
     # shrunk". The guard would be correct about the count and wrong about the question.
     hwm = os.path.join(cfg.work_dir, f"publish-hwm-{cfg.records_repo.replace('/', '_')}.json")
-    publisher = RecordPublisher(HFSink(cfg.records_repo), window=8, state_path=hwm)
+    # A LOCAL TRAIL, for a run that must leave no public trace. `RALPH_RECORDS_DIR` swaps the HF
+    # sink for a directory: the record is still built, signed and gated exactly as in production —
+    # it simply lands on disk. Seed that directory with the published records first or the lineage
+    # replays as empty, every tier takes the open-throne branch, and the run crowns the best
+    # entrant outright instead of testing anyone against a sitting king.
+    _local = os.environ.get("RALPH_RECORDS_DIR", "").strip()
+    sink = LocalSink(_local) if _local else HFSink(cfg.records_repo)
+    if _local:
+        w(f"  records   : LOCAL {_local} — nothing is published\n")
+    publisher = RecordPublisher(sink, window=8, state_path=hwm)
 
     now = chain.current_block()
     lo, hi = now - cfg.commit_window, now
