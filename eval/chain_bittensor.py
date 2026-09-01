@@ -68,6 +68,21 @@ from dataclasses import dataclass, field
 from .chain import Commitment
 
 
+def _earliest_first(commits: list, wrote_at: dict) -> list:
+    """Score in the order miners committed, not the order they registered.
+
+    The list used to flow onward in metagraph uid order, which is registration order — an
+    accident with a real consequence: intake applies the per-(coldkey, tier) cap to the first
+    submission it meets, so which of a coldkey's artifacts got its one slot was decided by uid.
+    Chain write height is the order the subnet actually observed; a re-commit moves that hotkey
+    to its new height, so refreshing an artifact is choosing to queue behind older commitments.
+
+    Hotkey breaks ties (two writes can land in one block); the per-uid fallback path has no
+    write heights at all, where this degrades to plain hotkey order — still deterministic,
+    still not uid."""
+    return sorted(commits, key=lambda c: (wrote_at.get(c.hotkey, 0), c.hotkey))
+
+
 def _first_commit_wins(commits: list, wrote_at: dict, skipped: list) -> list:
     """One artifact, one owner: the hotkey that committed those bytes FIRST.
 
@@ -282,7 +297,7 @@ class BittensorChainIO:
                 artifact_uri=str(env.get("uri", "")),
             ))
             seen_at[hotkey] = int(wrote_at or 0)
-        return _first_commit_wins(out, seen_at, self.skipped)
+        return _earliest_first(_first_commit_wins(out, seen_at, self.skipped), seen_at)
 
     def commit_root(self, min_block: int, max_block: int) -> str:
         """Deterministic digest over the window's sealed values. Binds the item/observer seeds to

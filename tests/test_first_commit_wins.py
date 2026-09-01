@@ -58,3 +58,27 @@ def test_one_miner_re_committing_their_own_bytes_is_not_punished():
     """A single hotkey is its own owner — the rule is about a SECOND hotkey taking your work."""
     kept = _first_commit_wins([_C("a", "h")], {"a": 5}, [])
     assert [c.hotkey for c in kept] == ["a"]
+
+
+def test_scoring_order_is_commit_height_not_uid():
+    """The committed list reaches intake in chain-write order. uid order was registration
+    order, and it silently decided which of a coldkey's submissions took the one
+    per-(coldkey, tier) slot."""
+    from eval.chain_bittensor import _earliest_first
+
+    class C:
+        def __init__(self, hk):
+            self.hotkey = hk
+
+    a, b, c = C("5A"), C("5B"), C("5C")
+    # uid order is b, a, c (as read from the metagraph); commit order is a (100), c (150), b (200)
+    out = _earliest_first([b, a, c], {"5A": 100, "5B": 200, "5C": 150})
+    assert [x.hotkey for x in out] == ["5A", "5C", "5B"]
+
+    # same block: hotkey breaks the tie, so the order is never iteration luck
+    out = _earliest_first([c, b, a], {"5A": 7, "5B": 7, "5C": 7})
+    assert [x.hotkey for x in out] == ["5A", "5B", "5C"]
+
+    # the per-uid fallback has no write heights: plain hotkey order, still deterministic
+    out = _earliest_first([c, a, b], {})
+    assert [x.hotkey for x in out] == ["5A", "5B", "5C"]
