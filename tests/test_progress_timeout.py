@@ -370,12 +370,23 @@ def test_the_supervisor_deadline_must_be_outside_our_own():
     outer_h = spec.max_hours + spec.provider_deadline_slack_h
 
     class _Run:
-        def __init__(self, value):
-            self.stdout, self.returncode = value, 0
+        def __init__(self, value, load_state="loaded"):
+            # EXACTLY WHAT systemctl EMITS. `show -p LoadState -p TimeoutStartUSec` prints KEY=VALUE
+            # in systemd's OWN canonical order — the timeout first, whatever order the flags were
+            # given in. A fixture that emitted them the other way round would pass a reader that
+            # parses by position and hide the inversion.
+            self.stdout = f"TimeoutStartUSec={value}\nLoadState={load_state}\n" if value else ""
+            self.returncode = 0
 
     import subprocess
     real = subprocess.run
     try:
+        # A UNIT THAT DOES NOT EXIST IS NOT A SUPERVISOR. `systemctl show` answers for an unknown
+        # unit with the compiled-in default (1min 30s) instead of failing, which read as a deadline
+        # tighter than any round and refused every hand-started round on a box with no unit.
+        subprocess.run = lambda *a, **k: _Run("1min 30s", load_state="not-found")
+        assert _supervisor_deadline_problems(spec) == [], "an absent unit supervises nothing"
+
         # inside our deadlines -> a finding, naming both numbers
         subprocess.run = lambda *a, **k: _Run("6h")
         bad = _supervisor_deadline_problems(spec)

@@ -72,9 +72,9 @@ import secrets
 
 sub = build_submission(
     ckpt_dir="path/to/your/compressed/model",   # safetensors or .gguf + config/tokenizer
-    tier="ternary-4b",                           # the bit tier you compete in
-    teacher_pair="glm-4-9b",                     # the pinned parent for that tier
-    student_base="THUDM/glm-4-9b-chat-hf",
+    tier="ternary",                              # binary | ternary | sub2 | sub4
+    teacher_pair="qwen3-8b",                     # the pinned parent (Qwen/Qwen3-8B)
+    student_base="Qwen/Qwen3-8B",
     declared_compute_h100h=42.0,
     salt=secrets.token_hex(16),                  # keep secret until reveal
 )
@@ -82,6 +82,14 @@ sub = build_submission(
 # 2) publish the checkpoint and note its artifact_uri
 # 3) after the round opens, reveal sub["reveal"] = {content_hash, salt}
 ```
+
+**The order of 1 and 2 is protection, not pedantry.** A commitment binds bytes, not authorship:
+anyone can hash a *public* artifact and seal a commitment to it, and duplicate reveals are settled
+first-commit-wins — so an artifact that sits public before your commitment lands is, for that
+window, up for grabs by whoever commits it faster. Commit first, or upload to a **private** repo,
+commit, and only then flip it public: a private upload cannot be hashed by anyone else, so the
+race disappears. (Salt discipline is the same idea at reveal time: the salt stays secret until
+you reveal, or your sealed value can be replayed.)
 
 `build_submission` runs the validator's own inspector, so an artifact that would fail intake
 tells you immediately rather than at scoring time.

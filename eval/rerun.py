@@ -373,12 +373,57 @@ def audit_emission(rec, a: Audit) -> None:
               f"kings with no scored submission here: {unbound} — their share of emission cannot "
               f"be checked against this record alone", required=True)
     else:
-        want = set(king_miner.values())
+        # A RUNNER-UP IS A LEGITIMATE PAYEE. koth pays CHALLENGER_SHARE of a tier to the best
+        # challenger that beat the king on the paired bound without clearing the margin, and the
+        # event records who and how much. "Weights name exactly the kings" predates that split and
+        # rejected the first honest round in which a challenger qualified. The expected set is
+        # kings PLUS the challengers the record itself names — and the per-tier ratio must match
+        # the recorded share, so an operator still cannot smuggle an arbitrary payee in.
+        # The event's fields are operator-written, so they bind nothing by themselves: the share
+        # must be the CODE's constant (not whatever the event claims), and the named challenger
+        # must be a scored, gates-passing challenger in that tier — the same
+        # through-the-submission binding the crown checks use. What L0 cannot verify is the
+        # paired bound that QUALIFIED the runner-up; that is what the auditor's own re-run is for.
+        from .koth import CHALLENGER_SHARE as _CS
+        chal = {}
+        for e in rec.events or []:
+            m, sh = e.get("challenger_miner"), float(e.get("challenger_share") or 0.0)
+            tier = e.get("tier")
+            if not m or sh <= 0.0 or tier not in king_miner:
+                continue
+            a.ok("L0", f"challenger share for {tier} is the protocol constant",
+                 abs(sh - _CS) <= 1e-9,
+                 fail=f"event claims challenger_share={sh} but the protocol pays {_CS} — the "
+                      f"share is not the operator's to choose")
+            bound = any(x.role == "challenger" and x.tier == tier and x.gates_ok
+                        and x.miner == m for x in rec.submissions)
+            a.ok("L0", f"paid challenger for {tier} is a scored challenger",
+                 bound,
+                 fail=f"tier {tier} pays challenger {str(m)[:12]}… but no gates-passing "
+                      f"challenger submission by that miner appears in the record")
+            if abs(sh - _CS) <= 1e-9 and bound:
+                chal[tier] = (m, sh)
+        want = set(king_miner.values()) | {m for m, _ in chal.values()}
         got = {m for m, w in (rec.weights or {}).items() if w > 0}
-        a.ok("L0", "weights name exactly the kings", got == want,
-             fail=f"weighted {sorted(got)} but the record's own kings are {sorted(want)} "
+        a.ok("L0", "weights name exactly the kings and recorded challengers", got == want,
+             fail=f"weighted {sorted(got)} but the record's own kings are "
+                  f"{sorted(set(king_miner.values()))} and its recorded challengers "
+                  f"{sorted(m for m, _ in chal.values())} "
                   f"(extra: {sorted(got - want)}, missing: {sorted(want - got)})",
-             info=f"{len(want)} king(s) across {len(kings)} tier(s)")
+             info=f"{len(king_miner)} king(s), {len(chal)} paid challenger(s)")
+        for tier, (m, share) in sorted(chal.items()):
+            km = king_miner.get(tier)
+            if m == km:
+                continue                      # same hotkey holds both models: one merged weight
+            wk = float((rec.weights or {}).get(km, 0.0))
+            wc = float((rec.weights or {}).get(m, 0.0))
+            ratio = wc / (wk + wc) if (wk + wc) > 0 else -1.0
+            a.ok("L0", f"challenger share for {tier} matches the event",
+                 abs(ratio - share) <= 1e-6,
+                 fail=f"tier {tier} pays the challenger {ratio:.4f} of the tier but the event "
+                      f"records challenger_share={share} — the vector was not produced by "
+                      f"Tournament.weights()",
+                 info=f"{wc:.4f} of {wk + wc:.4f} = {share}")
 
 
 # ---------------------------------------------------------------- L1: selection
@@ -424,10 +469,30 @@ def audit_selection(rec, pool, a: Audit) -> list:
     scored_ids = [p.get("rollout_id") for p in rec.points]
     drawn_ids = [t.id for t in items]
     missing = [i for i in drawn_ids if i not in set(scored_ids)]
-    a.ok("L1", "every drawn item was scored", not missing,
-         fail=f"{len(missing)} of {len(drawn_ids)} drawn items are absent from the record "
-              f"({missing[:5]}) — the exam was pruned after it was drawn",
-         info=f"all {len(drawn_ids)} drawn items appear in the record")
+    # AN ABSENT ITEM MUST BE AN ACCOUNTED ITEM. build_shared drops a sample only for
+    # miner-independent reasons (empty parent step, silent observer, parent effect under the
+    # floor) — decided before any miner runs, and re-derivable by a full L3 re-run. The record
+    # must NAME each drop with its reason; an absence the record does not explain is pruning.
+    dropped = {str(d.get("id")): str(d.get("reason") or "")
+               for d in (man.get("exam_dropped") or [])}
+    unexplained = [i for i in missing if not dropped.get(i)]
+    a.ok("L1", "every drawn item was scored or dropped for a stated reason", not unexplained,
+         fail=f"{len(unexplained)} of {len(drawn_ids)} drawn items are absent from the record "
+              f"with no recorded reason ({unexplained[:5]}) — the exam was pruned after it was "
+              f"drawn",
+         info=f"{len(drawn_ids) - len(missing)} scored, {len(missing)} dropped with reasons"
+              + (f" ({sorted(set(dropped.get(i) for i in missing if dropped.get(i)))})"
+                 if missing else ""))
+    ghost = [i for i in dropped if i in set(scored_ids)]
+    a.ok("L1", "no item is both scored and dropped", not ghost,
+         fail=f"{ghost[:5]} appear in the points AND in exam_dropped — the drop list is not "
+              f"describing this record")
+    frac = len(missing) / len(drawn_ids) if drawn_ids else 0.0
+    a.ok("L1", "the drops are a sliver of the exam", frac <= 0.25,
+         fail=f"{len(missing)} of {len(drawn_ids)} drawn items dropped ({frac:.0%}) — an exam "
+              f"three-quarters replaced by drops is not the exam the nonce drew, whatever the "
+              f"stated reasons",
+         info=f"{frac:.1%} dropped")
     dupes = len(scored_ids) - len(set(scored_ids))
     a.ok("L1", "no duplicated items", dupes == 0,
          fail=f"{dupes} duplicated rollout_ids — repeating an easy item inflates its slice")

@@ -248,6 +248,7 @@ class ObserverRoundOutcome:
     observer: str = ""
     noise: dict = field(default_factory=dict)
     item_indices: list = field(default_factory=list)
+    exam_dropped: list = field(default_factory=list)   # [{id, reason}] — drawn but unusable
     corpus_spec: str = ""
     identity: dict = field(default_factory=dict)
     # What re-scoring ONE submission twice on this box produced. `identity` checks the PARENT
@@ -373,6 +374,12 @@ def run_observer_round(
     shared = build_shared(trajectories, parent, observer, obs_name,
                           max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens)
     usable = [s for s in shared if s.usable]
+    # THE DROPS GO IN THE SIGNED RECORD. An unusable sample (empty parent step, silent observer,
+    # parent effect under the floor) is a miner-independent, recomputable fact — but an auditor
+    # reading the record can only tell "dropped for a stated reason" from "pruned after the draw"
+    # if the record SAYS so. Round 5 scored 143/144 drawn items for exactly this reason and the
+    # audit refused to sign its own honest record.
+    out.exam_dropped = [{"id": s.traj_id, "reason": s.reason} for s in shared if not s.usable]
     if not usable:
         out.events.append({"round": round_no, "action": "abort",
                            "reason": "no usable trajectories (parent moved the observer nowhere)"})
@@ -648,6 +655,7 @@ def run_observer_round(
         "pool_sha256": _pool_sha(trajectory_pool),
         "item_indices": list(out.item_indices),
         "n_items_requested": n_items,
+        "exam_dropped": list(out.exam_dropped),
         "observer": obs_name,
         "observer_pool": sorted(observers),
         "parent": parent_id,

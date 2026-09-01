@@ -24,6 +24,9 @@ from eval.run_orchestrated import Config, run
 
 HOST = os.environ.get("RALPH_BYO_HOST", "160.202.129.159")
 USER = os.environ.get("RALPH_BYO_USER", "root")
+# NOT EVERY BORROWED BOX LISTENS ON 22. A RunPod pod publishes ssh on a mapped high port, and a
+# hard-coded 22 sends every command of the round to whatever answers there instead.
+PORT = int(os.environ.get("RALPH_BYO_PORT", "22"))
 
 
 class ByoProvider:
@@ -34,7 +37,7 @@ class ByoProvider:
     and `destroy` deliberately does nothing."""
 
     def rent(self, spec, name: str, exclude: tuple = ()) -> Instance:
-        return Instance(id=f"byo-{HOST}", ip=HOST, ssh_user=USER, ssh_port=22,
+        return Instance(id=f"byo-{HOST}", ip=HOST, ssh_user=USER, ssh_port=PORT,
                         cloud="byo", region="local", instance_type="H100",
                         price_per_hour=0.0, status="active")
 
@@ -55,7 +58,7 @@ def main() -> int:
     cfg = Config.from_env()
     cfg.live = False                            # no anchor, no weights, ever, from this entrypoint
     cfg.publish_crowns = False
-    sys.stdout.write(f"  private round on {USER}@{HOST}"
+    sys.stdout.write(f"  private round on {USER}@{HOST}:{PORT}"
                      f" (CUDA_VISIBLE_DEVICES={os.environ.get('RALPH_REMOTE_ENV', 'unset')})\n")
     return run(cfg, provider=ByoProvider())
 

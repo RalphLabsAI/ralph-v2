@@ -83,6 +83,10 @@ class Config:
     gpu_type: str = "H100"
     require_gpu: str = ""          # "" on the FIRST round: learn it, then pin it. See below.
     max_price_per_hour: float = 4.50
+    # Bounds the rental AND the supervisor deadline, so a stuck round tears its own GPU down.
+    # Scales with n_items: at 144 a full field no longer fits the 8 h that sufficed at 72, and
+    # overrunning kills the round at the deadline with the rental already paid for.
+    max_hours: float = 8.0
     live: bool = False
 
     @classmethod
@@ -108,7 +112,8 @@ class Config:
                                   if x.strip()),
             references=tuple(x.strip() for x in e("RALPH_REFERENCES", "").split(",") if x.strip()),
             gpu_type=e("RALPH_GPU_TYPE", "H100"), require_gpu=e("RALPH_REQUIRE_GPU", ""),
-            max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")))
+            max_price_per_hour=float(e("RALPH_MAX_GPU_PRICE", "4.50")),
+            max_hours=float(e("RALPH_MAX_HOURS", "8.0")))
 
 
 def _merge_dropped(rec, commits, skipped, w=lambda _s: None) -> list:
@@ -163,12 +168,22 @@ def _supervisor_deadline_problems(spec) -> list:
     import subprocess
 
     unit = os.environ.get("RALPH_VALIDATOR_UNIT", "ralph-validator.service")
+    # CHECK LoadState, AND READ IT BY KEY. `systemctl show` answers for a unit that does not exist,
+    # handing back the compiled-in default (1min 30s) rather than an error — which reads as a
+    # supervisor deadline tighter than any round and blocks every hand-started run on a box with no
+    # validator unit. An unloaded unit supervises nothing, so there is no outer ring to invert.
+    # `--value` is deliberately NOT used: systemd prints properties in ITS canonical order, not the
+    # order asked for (TimeoutStartUSec comes back before LoadState), so positional parsing silently
+    # inverts the test. The KEY=VALUE form cannot be read in the wrong order.
     try:
-        r = subprocess.run(["systemctl", "show", unit, "-p", "TimeoutStartUSec", "--value"],
+        r = subprocess.run(["systemctl", "show", unit, "-p", "LoadState", "-p", "TimeoutStartUSec"],
                            capture_output=True, text=True, timeout=15)
-        raw = (r.stdout or "").strip()
+        got = dict(x.split("=", 1) for x in (r.stdout or "").splitlines() if "=" in x)
     except Exception:
         return []
+    if got.get("LoadState", "").strip() not in ("loaded",):
+        return []
+    raw = got.get("TimeoutStartUSec", "").strip()
     if not raw or raw in ("infinity", "0"):
         return []
     # systemd prints things like "10h", "6h", "1h 30min", "21600s"
@@ -215,6 +230,7 @@ def preflight(cfg: Config, out=sys.stdout) -> list:
     from .orchestrator import GpuSpec
     bad.extend(_supervisor_deadline_problems(GpuSpec(
         gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,
+        max_hours=cfg.max_hours,
         max_price_per_hour=cfg.max_price_per_hour)))
 
     from .parent import PARENTS
@@ -345,13 +361,20 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     # alone means switching trails (shakedown -> production) carries the shakedown's count to an
     # empty production repo, and the very first real round refuses to write with "history has
     # shrunk". The guard would be correct about the count and wrong about the question.
-    hwm = os.path.join(cfg.work_dir, f"publish-hwm-{cfg.records_repo.replace('/', '_')}.json")
     # A LOCAL TRAIL, for a run that must leave no public trace. `RALPH_RECORDS_DIR` swaps the HF
     # sink for a directory: the record is still built, signed and gated exactly as in production —
     # it simply lands on disk. Seed that directory with the published records first or the lineage
     # replays as empty, every tier takes the open-throne branch, and the run crowns the best
     # entrant outright instead of testing anyone against a sitting king.
     _local = os.environ.get("RALPH_RECORDS_DIR", "").strip()
+    # …AND THE MARK MUST FOLLOW THE SINK. Keying the high-water mark by repo name alone while the
+    # sink pointed elsewhere meant a private run advanced the PUBLIC repo's count: its local
+    # round 5 bumped the mark to 5, and the next live round read the honest 4-round index as
+    # "history has shrunk" and refused to write. The mark answers "how many rounds has THIS trail
+    # shown me" — so a local trail carries its own.
+    hwm = os.path.join(cfg.work_dir, "publish-hwm-" +
+                       (_local if _local else cfg.records_repo).replace('/', '_').strip('_') +
+                       ".json")
     sink = LocalSink(_local) if _local else HFSink(cfg.records_repo)
     if _local:
         w(f"  records   : LOCAL {_local} — nothing is published\n")
@@ -446,6 +469,7 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
 
     spec = GpuSpec(gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,
                    max_price_per_hour=cfg.max_price_per_hour,
+                   max_hours=cfg.max_hours,
                    exclude_regions=cfg.exclude_regions)
     res = run_remote_round(plan, provider or ShadeformProvider(), spec,
                            os.path.join(cfg.work_dir, f"round-{idx_round}"), out=out)
