@@ -243,7 +243,7 @@ CHALLENGER_SHARE = 0.20
 # THE dethrone margin. One constant because the money path does not use the class default: both
 # `score_job` (orchestrated rounds) and `run_round` construct their own Tournament, so a default
 # changed here alone would have moved nothing that pays. Import this rather than writing a number.
-DETHRONE_MARGIN = 0.02
+DETHRONE_MARGIN = 0.01
 
 
 class Tournament:
@@ -260,12 +260,18 @@ class Tournament:
         # cleared on merit, only inherited on an open throne — so first occupancy became
         # permanent in exactly the two tiers the subnet exists to push on.
         #
-        # 0.02 with n_items=144 asks for ~0.039, about half a tier's spread. The anti-grinding
-        # job the old floor was hired for is now done by economics.per_coldkey_round_cap = 1
-        # per (coldkey, tier): one draw per round against an exam derived post-commit, so a
-        # miner cannot buy attempts at the 5% false-positive rate the LCB already bounds.
-        # Re-derive both numbers together if n_items moves — the penalty scales ~1/sqrt(n),
-        # validated by subsampling real pairs (0.5x -> 1.48x, 0.25x -> 2.22x).
+        # 0.01 with n_items=144 asks for ~0.03 uniform, a third of a tier's spread. Six rounds
+        # of signed records put exactly three challengers inside the margin window
+        # (lcb 0.0187, 0.0111, 0.0112) — every one a miner who went on to prove real, none a
+        # copy — so 0.02 was delaying genuine dethrones by rounds while refusing nothing it was
+        # built to refuse. A byte copy still bounds at exactly 0 and never clears any positive
+        # margin; a GGUF cannot be re-quantized upward without its source weights, so "copy + a
+        # sliver" is not a cheap path to +0.01 uniform. The anti-grinding job the old floor was
+        # hired for is done by economics.per_coldkey_round_cap = 1 per (coldkey, tier): one draw
+        # per round against an exam derived post-commit, so a miner cannot buy attempts at the
+        # 5% false-positive rate the LCB already bounds; under the null, clearing 0.01 needs a
+        # ~2.5-sigma draw. Re-derive with n_items — the penalty scales ~1/sqrt(n), validated by
+        # subsampling real pairs (0.5x -> 1.48x, 0.25x -> 2.22x).
         self.tiers = {t.name: t for t in tiers}
         self.margin = margin
         self.kings: dict[str, King] = {}
