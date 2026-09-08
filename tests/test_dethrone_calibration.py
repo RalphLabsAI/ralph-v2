@@ -17,8 +17,8 @@ ROOT = Path(__file__).resolve().parents[1] / "eval"
 def test_margin_is_inside_the_observed_spread_of_a_tier():
     # Worst-slice retention spread within a tier, measured over the signed records, is ~0.074
     # (binary) and ~0.078 (sub2). The bootstrap gives up ~0.019 of the mean advantage to
-    # uncertainty at n_items=144. A challenger must therefore find margin + penalty ~= 0.039,
-    # about half a tier's range. If the margin ever exceeds the spread again, a contested
+    # uncertainty at n_items=144. A challenger must therefore find margin + penalty ~= 0.03,
+    # about a third of a tier's range. If the margin ever exceeds the spread again, a contested
     # throne can only be inherited, never taken.
     penalty_at_144 = 0.019
     narrowest_tier_spread = 0.074
