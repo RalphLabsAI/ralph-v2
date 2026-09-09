@@ -88,3 +88,22 @@ def test_levelling_beats_proportional_on_the_deciding_slice():
         rem -= 1
     assert min(v for v in _alloc(144, avail).values() if v >= 8) > \
            min(v for v in prop.values() if v >= 8)
+
+
+def test_the_plan_the_gpu_receives_carries_the_protocol_margin():
+    """RoundPlan is serialised to job.json and shipped to the scorer, and the scorer used to trust
+    job["margin"] over the constant. The plan's dataclass default was a stale 0.05, so every
+    orchestrated round scored at a margin two changes had already retired. Round-trip the real
+    writer: the job the GPU receives must say what koth says, and a plan that disagrees must abort
+    the scorer rather than be obeyed."""
+    import json
+    from eval.orchestrator import RoundPlan
+
+    plan = RoundPlan(round=7, commit_root="c" * 64, round_nonce="n" * 64, prev_anchor="p" * 64)
+    job = json.loads(json.dumps(plan.as_job()))
+    assert job["margin"] == DETHRONE_MARGIN
+
+    # the scorer's own guard, exercised the way score_job runs it
+    src = (ROOT / "score_job.py").read_text()
+    assert 'Tournament(tiers, margin=DETHRONE_MARGIN)' in src
+    assert 'job.get("margin", DETHRONE_MARGIN)' not in src, "plan must not override the constant"
