@@ -148,6 +148,8 @@ def score(job: dict, out_dir: str) -> dict:
     # stamped round 0. Same shape as the scorer-parity bug: the money path missed what the older
     # entrypoints did correctly.
     tournament.round = int(job.get("round", 0) or 0)
+    tournament.contenders = {t: {"model_id": c.get("model_id", ""), "streak": int(c.get("streak", 0) or 0)}
+                             for t, c in (job.get("contenders") or {}).items()}
     registry = {}
     for tier, k in (job.get("kings") or {}).items():
         r = Reign(**k)

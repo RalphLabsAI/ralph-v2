@@ -88,6 +88,33 @@ def apply_events(kings: dict, events, round_no: int = -1, submissions=None) -> d
     return out
 
 
+def replay_contenders(records) -> dict:
+    """tier -> {model_id, streak, miner, artifact_uri}: the standing contender per tier.
+
+    A contender is the best challenger of the most recent round that HELD; its streak is how many
+    consecutive rounds it has cleared koth.PERSIST_MARGIN. Any crown/dethrone/vacate on the tier
+    clears it, so a streak can only be built against the same king on consecutive fresh exams.
+    Bound to the miner and locator through the record's submissions, as the kings are."""
+    out: dict = {}
+    for rec in sorted(records, key=lambda r: int(getattr(r, "round", 0) or 0)):
+        subs = getattr(rec, "submissions", None) or []
+        by_model = {}
+        for s in subs:
+            by_model.setdefault(getattr(s, "model_id", None) or s.get("model_id"), s)
+        def field(s, name, default=""):
+            return (getattr(s, name, None) if not isinstance(s, dict) else s.get(name)) or default
+        for e in getattr(rec, "events", None) or []:
+            tier, action = e.get("tier"), e.get("action")
+            if action in ("crown", "dethrone", "vacate"):
+                out.pop(tier, None)
+            elif action == "hold" and e.get("contender"):
+                s = by_model.get(e["contender"])
+                out[tier] = {"model_id": e["contender"], "streak": int(e.get("contender_streak", 0) or 0),
+                             "miner": field(s, "miner") if s is not None else "",
+                             "artifact_uri": field(s, "artifact_uri") if s is not None else ""}
+    return out
+
+
 def replay(records) -> dict:
     """Walk published records IN ROUND ORDER and return the current tier->Reign map.
 
@@ -167,3 +194,20 @@ def replay_with_history(publisher, max_rounds: int = 0, out=None) -> tuple:
             # FIRST round wins, so the message names when it was actually measured
             already.setdefault(sub.model_id, int(getattr(rec, "round", 0) or 0))
     return kings, already
+
+
+def replay_full(publisher, max_rounds: int = 0, out=None) -> tuple:
+    """`(kings, already_scored, contenders)` — the 2-tuple walk plus the standing contenders,
+    read from the same verified records. Contenders are exempt from the unchanged-skip: they must
+    be re-scored each round on a fresh exam or the persistence path can never complete."""
+    kings, already = replay_with_history(publisher, max_rounds=max_rounds, out=out)
+    from .rerun import record_from_blob
+    idx = publisher.load_index()
+    entries = sorted(idx.get("rounds", []), key=lambda r: int(r["round"]))
+    if max_rounds:
+        entries = entries[-max_rounds:]
+    recs = [record_from_blob(b) for b in (publisher.sink.get(e["name"]) for e in entries) if b]
+    contenders = replay_contenders(recs)
+    if out is not None and contenders:
+        out.write(f"  contenders: { {t: (c['model_id'][:10] + '…', c['streak']) for t, c in contenders.items()} }\n")
+    return kings, already, contenders

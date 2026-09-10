@@ -522,10 +522,11 @@ class RoundPlan:
     # tier -> Reign, replayed from the published trail. Without it the rented box opens every
     # throne and crowns max(retention) outright, and the dethrone margin never runs.
     kings: dict = field(default_factory=dict)
+    contenders: dict = field(default_factory=dict)   # tier -> {model_id, streak}, from the trail
     parent_key: str = "qwen3-8b"
     observers: list = field(default_factory=list)
     tiers: list = field(default_factory=list)
-    n_items: int = 72
+    n_items: int = 288
     pool_size: int = 900
     margin: float = field(default_factory=_protocol_margin)
     # Artifacts scored on this round's exam that cannot win anything: a stock quantisation of the

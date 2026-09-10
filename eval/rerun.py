@@ -349,8 +349,37 @@ def audit_emission(rec, a: Audit) -> None:
                       f"{best.model_id[:12]}… scored {best.retention:.4f} — the crown is not the "
                       f"argmax the tournament claims to compute",
                  info=f"{s.retention:.4f}, best of {len(rivals)} valid challengers")
+    # THE DETHRONE TEST IS RECOMPUTABLE FROM THE RECORD. The crown is decided on the displayed
+    # metric (point lead on the same exam) with either the single-round margin or the persistence
+    # path, plus the floor rule: no challenger slice below the incumbent's worst slice. All three
+    # are arithmetic over the record's own slices — an operator who crowns on a lead the record
+    # does not show, or over a slice that fell under the throne, is caught here for free. The
+    # streak the persistence path relies on lives in earlier records; the trail walk verifies it.
+    from .koth import DETHRONE_MARGIN as _PM, PERSIST_MARGIN as _PS, PERSIST_ROUNDS as _PR
+    import statistics as _st
     for e in (x for x in rec.events if x.get("action") == "dethrone"):
         inc = [s for s in rec.submissions if s.role == "incumbent" and s.tier == e.get("tier")]
+        ch = by_model.get(e.get("king"))
+        if inc and ch is not None and getattr(ch, "slices", None) and getattr(inc[0], "slices", None):
+            lead = float(ch.retention) - float(inc[0].retention)
+            by = e.get("dethrone_by", "margin")
+            need = _PM if by == "margin" else _PS
+            a.ok("L0", f"dethrone lead clears the {by} margin {str(e.get('king'))[:12]}…",
+                 lead + 1e-9 >= need,
+                 fail=f"tier {e.get('tier')} dethroned on a lead of {lead:+.4f} but the {by} path "
+                      f"needs {need}",
+                 info=f"lead {lead:+.4f} vs {need}")
+            if by == "persistence":
+                a.ok("L0", f"persistence dethrone carries a full streak {str(e.get('king'))[:12]}…",
+                     int(e.get("contender_streak", 0) or 0) >= _PR,
+                     fail=f"streak {e.get('contender_streak')} < {_PR} — the record claims a "
+                          f"persistence dethrone without the rounds to back it")
+            kf = min(_st.fmean(v) for v in inc[0].slices.values() if v)
+            low = [ax for ax, v in ch.slices.items() if v and ax in inc[0].slices and _st.fmean(v) < kf]
+            a.ok("L0", f"no challenger slice fell below the old floor {str(e.get('king'))[:12]}…",
+                 not low,
+                 fail=f"tier {e.get('tier')} crowned a model whose {low[:2]} sit below the "
+                      f"incumbent's worst slice {kf:.4f} — the worst case got worse")
         a.ok("L0", f"dethrone names the re-scored incumbent {str(e.get('king'))[:12]}…",
              bool(inc) and e.get("beaten") == inc[0].model_id,
              fail=f"claims to have beaten {str(e.get('beaten'))[:12]}… but the record's incumbent "
