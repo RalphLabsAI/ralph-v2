@@ -63,14 +63,11 @@ Each tier's emission is split between its king and the best challenger who **pro
 | **best challenger with a strictly positive paired margin** | 20% of the tier |
 | everyone else | nothing |
 
-The crown still needs a **0.05** worst-slice margin to change hands — below that a dethrone is a
-coin flip rather than a result, because 0.05 is what the paired bootstrap can resolve at this exam
-size. But you no longer have to clear it to earn anything. Beat the king by 0.01 on the same exam,
-with the paired lower bound above zero, and you are paid while you work toward the crown.
+The crown changes hands on the **displayed metric itself**, on the same exam as the re-scored king: a lead of **0.02** in one round, or **0.01 in two consecutive rounds** — the best challenger of a round stays in as the tier's *contender* and is re-scored on the next exam, so a small real edge accumulates instead of being lost to one draw. One rule on top: no slice of the challenger may sit below the king's worst slice — reshaping is allowed, the worst case getting worse is not. A tied pair false-dethrones ~2% of contests at 288-item exams; a copy leads by exactly 0 and a copy with English polish by ~0.008, under both margins. The paired lower bound above zero is what pays the runner-up.
 
 **Start from the reigning crown if you want to.** Every one is published, and improving a published
 artifact is the compounding this trail exists for — not an attack on it. The king keeping 80% and
-the 0.05 moat is what protects the original author. What protects everyone is that a *copy* earns
+the 0.02 margin is what protects the original author. What protects everyone is that a *copy* earns
 nothing: an unchanged artifact is not re-scored at all, and a near-copy scores what the original
 scores, which puts its paired margin at zero.
 

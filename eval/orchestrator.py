@@ -502,6 +502,15 @@ class ShadeformProvider(Provider):
         return killed
 
 
+def _protocol_margin() -> float:
+    """koth.DETHRONE_MARGIN, resolved at plan-build time. The plan is serialised into job.json
+    and shipped to the scorer, which used to read job["margin"] ahead of the constant — so a
+    stale literal default here silently overrode two margin changes and every orchestrated
+    round scored at 0.05. Lazy import: koth must stay importable without this module."""
+    from .koth import DETHRONE_MARGIN
+    return DETHRONE_MARGIN
+
+
 @dataclass
 class RoundPlan:
     """Everything the CPU decided, which the GPU is merely told."""
@@ -513,12 +522,13 @@ class RoundPlan:
     # tier -> Reign, replayed from the published trail. Without it the rented box opens every
     # throne and crowns max(retention) outright, and the dethrone margin never runs.
     kings: dict = field(default_factory=dict)
+    contenders: dict = field(default_factory=dict)   # tier -> {model_id, streak}, from the trail
     parent_key: str = "qwen3-8b"
     observers: list = field(default_factory=list)
     tiers: list = field(default_factory=list)
-    n_items: int = 72
+    n_items: int = 288
     pool_size: int = 900
-    margin: float = 0.05
+    margin: float = field(default_factory=_protocol_margin)
     # Artifacts scored on this round's exam that cannot win anything: a stock quantisation of the
     # parent, a competitor's published model. `[{"name", "tier", "artifact_uri"}, ...]`. They carry
     # no hotkey and no commitment because they are not miners — see run_observer_round.

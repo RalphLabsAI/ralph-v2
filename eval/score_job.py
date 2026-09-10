@@ -131,7 +131,15 @@ def score(job: dict, out_dir: str) -> dict:
     # orchestrator (eval/lineage.py) and supplied here, and the king's artifact is refetched so the
     # incumbent is RE-SCORED on this round's items rather than defended on last round's number.
     from .lineage import Reign
-    tournament = Tournament(tiers, margin=float(job.get("margin", DETHRONE_MARGIN)))
+    # THE MARGIN IS NOT THE PLAN'S TO SET. job["margin"] used to win over the constant, and the
+    # plan's dataclass default was a stale literal, so the money path ran a margin nobody had
+    # chosen for it. The constant is the protocol; a plan that disagrees is version skew and
+    # aborts here rather than scoring a round under a rule the record cannot explain.
+    _plan_margin = job.get("margin")
+    if _plan_margin is not None and abs(float(_plan_margin) - DETHRONE_MARGIN) > 1e-12:
+        raise SystemExit(f"job.json says margin={_plan_margin} but koth.DETHRONE_MARGIN is "
+                         f"{DETHRONE_MARGIN}: orchestrator and scorer disagree on the protocol")
+    tournament = Tournament(tiers, margin=DETHRONE_MARGIN)
     # STAMP THE ROUND, or every event this round emits says it happened in round 0. `Tournament`
     # initialises `self.round = 0` and each event copies it, so the number is not decorative: it is
     # what a `crown` event means by "since", and what an auditor reads to say when a tier changed
@@ -140,6 +148,8 @@ def score(job: dict, out_dir: str) -> dict:
     # stamped round 0. Same shape as the scorer-parity bug: the money path missed what the older
     # entrypoints did correctly.
     tournament.round = int(job.get("round", 0) or 0)
+    tournament.contenders = {t: {"model_id": c.get("model_id", ""), "streak": int(c.get("streak", 0) or 0)}
+                             for t, c in (job.get("contenders") or {}).items()}
     registry = {}
     for tier, k in (job.get("kings") or {}).items():
         r = Reign(**k)

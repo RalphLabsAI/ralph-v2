@@ -97,7 +97,7 @@ class Config:
             wallet=e("RALPH_WALLET", "ralph"), hotkey=e("RALPH_HOTKEY", "owner"),
             parent_key=e("RALPH_PARENT_KEY", "qwen3-8b"),
             records_repo=e("RALPH_HF_REPO", "RalphLabsAI/ralph-v2-rounds"),
-            n_items=int(e("RALPH_N_ITEMS", "144")), pool_size=int(e("RALPH_POOL_SIZE", "900")),
+            n_items=int(e("RALPH_N_ITEMS", "288")), pool_size=int(e("RALPH_POOL_SIZE", "900")),
             work_dir=e("RALPH_WORK_DIR", "/workspace/ralph-v2-work"),
             observers=tuple(x.strip() for x in e("RALPH_OBSERVERS", "").split(",") if x.strip())
                       or cls.observers,
@@ -397,8 +397,8 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     # records are signed, hash-chained and anchored, so the lineage is recoverable by anyone — and
     # a local kings.json would be a second source of truth the operator controls, which is exactly
     # what BittensorChainIO.get_king returns None to avoid.
-    from .lineage import replay_with_history
-    kings, already_scored = replay_with_history(publisher, out=out)
+    from .lineage import replay_full
+    kings, already_scored, contenders = replay_full(publisher, out=out)
 
     # DO NOT PAY TO MEASURE THE SAME BYTES TWICE. The exam is redrawn every round, so a score from
     # round N is not comparable with one from round N+1 and cannot simply be carried forward — but
@@ -418,7 +418,9 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     # definition, and it IS re-scored this round — through the incumbent path, on this round's
     # exam, which is what makes the comparison fair. Skipping it here is what removes the duplicate
     # row that made a 13-miner round publish 15 submissions.
-    crowned = {r.model_id for r in kings.values()}
+    # kings AND contenders are re-scored every round: a throne is defended on a fresh exam, and a
+    # contender's persistence streak can only be built on one.
+    crowned = {r.model_id for r in kings.values()} | {c["model_id"] for c in contenders.values()}
     repeats = [c for c in commits
                if c.revealed_hash and c.revealed_hash in already_scored
                and c.revealed_hash not in crowned]
@@ -465,6 +467,7 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
                     "declared_compute_h100h": c.declared_compute_h100h,
                     "bond_posted": c.bond_posted} for c in commits])
     plan.kings = {t: vars(r) for t, r in kings.items()}
+    plan.contenders = {t: {"model_id": c["model_id"], "streak": int(c["streak"])} for t, c in contenders.items()}
     plan.references = _parse_references(cfg.references, out)
 
     spec = GpuSpec(gpu_type=cfg.gpu_type, require_gpu=cfg.require_gpu,

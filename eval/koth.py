@@ -187,6 +187,26 @@ def softmin_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000, alpha: float 
     return diffs[int(alpha * z_reps)]
 
 
+def floor_regression(a: "Scored", b: "Scored") -> str | None:
+    """Name of a slice where the challenger `a` sits BELOW the king `b`'s worst slice, else None.
+
+    Replaces per-slice significance as the no-regression rule. That rule refused exactly the
+    challengers the metric exists to reward: a floor-lifter that reshapes (sub4 preview: +0.063 on
+    hi/deep, -0.051 on en/shallow, every slice still above the old king's floor). The guarantee
+    that matters is that the WORST CASE never gets worse — so a challenger may trade a strong slice
+    down as long as nothing falls under the throne it is taking. Point comparison on the same exam."""
+    if not getattr(a, "per_axis", None) or not getattr(b, "per_axis", None):
+        return None                       # no slices on one side: nothing to judge a floor against
+    shared = [ax for ax in _shared_axes(a, b) if a.per_axis[ax] and b.per_axis[ax]]
+    if not shared:
+        return None
+    king_floor = min(sum(b.per_axis[ax]) / len(b.per_axis[ax]) for ax in shared)
+    for ax in shared:
+        if sum(a.per_axis[ax]) / len(a.per_axis[ax]) < king_floor:
+            return ax
+    return None
+
+
 def axis_regression(a: "Scored", b: "Scored", z_reps: int = 1000, alpha: float = 0.05,
                     seed: int = 0) -> str | None:
     """Name of an axis where `a` is CONFIDENTLY worse than `b`, else None.
@@ -243,37 +263,35 @@ CHALLENGER_SHARE = 0.20
 # THE dethrone margin. One constant because the money path does not use the class default: both
 # `score_job` (orchestrated rounds) and `run_round` construct their own Tournament, so a default
 # changed here alone would have moved nothing that pays. Import this rather than writing a number.
-DETHRONE_MARGIN = 0.01
+# THE CROWN IS DECIDED ON THE POINT ESTIMATE, NOT ON A BOUND. Six rounds showed the paired
+# bootstrap cannot certify a real +0.026 floor lift at 29 items per slice — the honest challenger
+# (sub4, round-7 preview) bounded at +0.0025, inside the band a clone-with-polish also lands in
+# (+0.001). No threshold on the bound separates them. So the dethrone test is the displayed metric
+# itself, on the same exam, with a margin sized to the exam's cross-draw noise (~0.010 at 288 items):
+#   * a single-round lead of POINT_MARGIN (2 sigma: a tied pair false-dethrones ~2% of contests), or
+#   * a lead of PERSIST_MARGIN in PERSIST_ROUNDS consecutive rounds (same bytes, re-scored each
+#     round as the tier's CONTENDER on a fresh exam and usually a fresh observer) — the same
+#     false-positive rate as one draw at 2 sigma, but a real +0.015 lands it in a few rounds.
+# A byte copy leads by exactly 0; a copy with English polish moves the worst-slice aggregate by
+# ~+0.008 (the strong slice carries ~16% of the soft-min) — under both margins. The bootstrap bound
+# is kept for what it can still answer: `lcb > 0` pays the runner-up share.
+DETHRONE_MARGIN = 0.02      # single-round point margin
+PERSIST_MARGIN = 0.01       # per-round point margin on the persistence path
+PERSIST_ROUNDS = 2          # consecutive rounds a contender must clear PERSIST_MARGIN
 
 
 class Tournament:
     """Holds the reigning king per tier and applies dethrone-on-margin each round."""
 
     def __init__(self, tiers: list[Tier], margin: float = DETHRONE_MARGIN):
-        # THE MARGIN IS AN EFFECT-SIZE FLOOR STACKED ON A SIGNIFICANCE TEST, AND IT MUST STAY
-        # INSIDE THE METRIC'S RANGE. `softmin_lcb_diff` already refuses a dethrone that the
-        # paired bootstrap cannot separate from zero at 95%; the margin only adds "and by at
-        # least this much". Measured on the signed records, the bootstrap gives up ~0.030 of
-        # the mean advantage to uncertainty at n_items=72, so margin 0.05 demanded a true
-        # advantage of ~0.080 while the whole observed spread within a tier was 0.074 (binary)
-        # and 0.078 (sub2). A bar wider than the range of the thing it measures cannot be
-        # cleared on merit, only inherited on an open throne — so first occupancy became
-        # permanent in exactly the two tiers the subnet exists to push on.
-        #
-        # 0.01 with n_items=144 asks for ~0.03 uniform, a third of a tier's spread. Six rounds
-        # of signed records put exactly three challengers inside the margin window
-        # (lcb 0.0187, 0.0111, 0.0112) — every one a miner who went on to prove real, none a
-        # copy — so 0.02 was delaying genuine dethrones by rounds while refusing nothing it was
-        # built to refuse. A byte copy still bounds at exactly 0 and never clears any positive
-        # margin; a GGUF cannot be re-quantized upward without its source weights, so "copy + a
-        # sliver" is not a cheap path to +0.01 uniform. The anti-grinding job the old floor was
-        # hired for is done by economics.per_coldkey_round_cap = 1 per (coldkey, tier): one draw
-        # per round against an exam derived post-commit, so a miner cannot buy attempts at the
-        # 5% false-positive rate the LCB already bounds; under the null, clearing 0.01 needs a
-        # ~2.5-sigma draw. Re-derive with n_items — the penalty scales ~1/sqrt(n), validated by
-        # subsampling real pairs (0.5x -> 1.48x, 0.25x -> 2.22x).
+        # `margin` is the single-round POINT margin on the displayed metric (DETHRONE_MARGIN);
+        # the persistence path and the floor rule are fixed by PERSIST_MARGIN / PERSIST_ROUNDS
+        # and floor_regression. See the block above the constants for the calibration.
         self.tiers = {t.name: t for t in tiers}
         self.margin = margin
+        # tier -> {model_id, streak}: the best challenger of the last round and how many
+        # consecutive rounds it has cleared PERSIST_MARGIN. Seeded from the trail.
+        self.contenders: dict = {}
         self.kings: dict[str, King] = {}
         # tier -> the best challenger that BEAT the sitting king without clearing the dethrone
         # margin. Cleared every round it is not re-earned, so it never pays on stale evidence.
@@ -310,21 +328,34 @@ class Tournament:
         # axis" the paying strategy; the regression check keeps the old guarantee that you
         # cannot sell one capability to buy another.
         lcb = softmin_lcb_diff(best, king_scored, seed=seed)
-        regressed = axis_regression(best, king_scored, seed=seed) if lcb > self.margin else None
-        if regressed:
+        lead = best.retention - king_scored.retention          # the displayed metric, same exam
+        same = best.sub.model_id == king_scored.sub.model_id
+        prev = self.contenders.get(tier) or {}
+        prev_streak = int(prev.get("streak", 0)) if prev.get("model_id") == best.sub.model_id else 0
+        regressed = floor_regression(best, king_scored)
+        event.update(margin_lcb=round(lcb, 4), lead=round(lead, 4), contender=best.sub.model_id)
+        if regressed and not same:
             self.kings[tier].reign += 1
-            event.update(action="hold", margin_lcb=round(lcb, 4),
-                         best_challenger=best.sub.model_id, regressed_axis=regressed)
-            return event
-        if lcb > self.margin and best.sub.model_id != king_scored.sub.model_id:
+            self.contenders[tier] = {"model_id": best.sub.model_id, "streak": 0}
+            event.update(action="hold", best_challenger=best.sub.model_id, regressed_axis=regressed,
+                         contender_streak=0)
+        elif not same and lead >= self.margin:
             self.kings[tier] = King(best.sub.miner, best.sub.model_id, best.retention, self.round)
+            self.contenders.pop(tier, None)
             event.update(action="dethrone", king=best.sub.model_id, miner=best.sub.miner,
-                         retention=round(best.retention, 4), margin_lcb=round(lcb, 4),
-                         beaten=king_scored.sub.model_id)
+                         retention=round(best.retention, 4), beaten=king_scored.sub.model_id,
+                         dethrone_by="margin")
+        elif not same and lead >= PERSIST_MARGIN and prev_streak + 1 >= PERSIST_ROUNDS:
+            self.kings[tier] = King(best.sub.miner, best.sub.model_id, best.retention, self.round)
+            self.contenders.pop(tier, None)
+            event.update(action="dethrone", king=best.sub.model_id, miner=best.sub.miner,
+                         retention=round(best.retention, 4), beaten=king_scored.sub.model_id,
+                         dethrone_by="persistence", contender_streak=prev_streak + 1)
         else:
+            streak = prev_streak + 1 if (not same and lead >= PERSIST_MARGIN) else 0
             self.kings[tier].reign += 1
-            event.update(action="hold", margin_lcb=round(lcb, 4),
-                         best_challenger=best.sub.model_id)
+            self.contenders[tier] = {"model_id": best.sub.model_id, "streak": streak}
+            event.update(action="hold", best_challenger=best.sub.model_id, contender_streak=streak)
         # THE RUNNER-UP, IF THEY ACTUALLY BEAT THE KING. Recorded on every contested tier, whether
         # the throne changed hands or not, because `weights()` pays it — see `CHALLENGER_SHARE`.
         # STRICTLY POSITIVE `lcb` is the whole test: a copy of the king scores the same as the king,
