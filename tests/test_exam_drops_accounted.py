@@ -67,7 +67,7 @@ def _epoch(dd, pool, parent):
                               artifact_uri=f"file://{dd}")]),
         1, pool, parent, {"kimi": Obs(), "qwen": Obs()}, tiers,
         {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)},
-        Tournament(tiers, margin=0.03), RegistrationLedger(), {},
+        Tournament(tiers), RegistrationLedger(), {},
         make_safe_runner=lambda cd: Step("X"),
         signer=Ed25519Signer(seed=b"z" * 32), n_items=20,
         corpus_spec="glaive_r1@rev=abc123|dedup=none|order=stream")
@@ -87,7 +87,9 @@ def test_a_recorded_drop_passes_and_an_unexplained_absence_fails():
         res = _epoch(dd, pool, Step("X", silent_on={victim.prefix}))
         rec = res.outcome.record
         man = rec.manifest
-        assert man["exam_dropped"] == [{"id": victim.id, "reason": "parent produced an empty step"}]
+        # two judges in this fixture: the drop names every judge's reason
+        assert [d["id"] for d in man["exam_dropped"]] == [victim.id]
+        assert "parent produced an empty step" in man["exam_dropped"][0]["reason"]
         assert victim.id not in {p.get("rollout_id") for p in rec.points}
 
         rec_path, pool_path = str(Path(dd) / "record.json"), str(Path(dd) / "pool.jsonl")

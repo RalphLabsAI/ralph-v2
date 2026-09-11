@@ -146,6 +146,22 @@ def _shared_axes(a: "Scored", b: "Scored") -> list[str]:
             and len(a.per_axis[ax]) == len(b.per_axis[ax])]
 
 
+def judge_of(axis: str) -> str:
+    """The judge a slice belongs to: `obs=NAME|lang=..|depth=..` -> `obs=NAME`. Keys with no
+    observer component (legacy capability axes) all belong to one unnamed judge."""
+    head = (axis or "").split("|", 1)[0]
+    return head if head.startswith("obs=") else ""
+
+
+def by_judge(axes) -> dict:
+    """{judge: [axis, ...]} in input order. A single-judge round yields exactly one group, so
+    every per-judge rule below reduces to its single-judge form."""
+    out: dict = {}
+    for ax in axes:
+        out.setdefault(judge_of(ax), []).append(ax)
+    return out
+
+
 def softmin_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000, alpha: float = 0.05,
                      seed: int = 0, p: float = SOFTMIN_P) -> float:
     """Dethrone statistic: bootstrap lower bound on the difference of WORST-DOMAIN AGGREGATES.
@@ -174,6 +190,11 @@ def softmin_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000, alpha: float 
         return bootstrap_lcb_diff(a.per_point, b.per_point, z_reps, alpha, seed)
     rng = random.Random(seed)
     vecs = [(a.per_axis[ax], b.per_axis[ax]) for ax in shared]
+    # PER JUDGE, THEN THE MEAN — the same combination the crown metric uses when several judges
+    # score a round. The resampling loop is untouched, so a single-judge record draws the identical
+    # replicates and recomputes the identical bound it was published with.
+    pos = {ax: i for i, ax in enumerate(shared)}
+    groups = list(by_judge(shared).values())
     diffs = []
     for _ in range(z_reps):
         ar, br = [], []
@@ -182,7 +203,9 @@ def softmin_lcb_diff(a: "Scored", b: "Scored", z_reps: int = 2000, alpha: float 
             idx = [rng.randrange(n) for _ in range(n)]
             ar.append(sum(av[i] for i in idx) / n)
             br.append(sum(bv[i] for i in idx) / n)
-        diffs.append(_soft_min(ar, p) - _soft_min(br, p))
+        da = [_soft_min([ar[pos[ax]] for ax in g], p) for g in groups]
+        db = [_soft_min([br[pos[ax]] for ax in g], p) for g in groups]
+        diffs.append(sum(da) / len(da) - sum(db) / len(db))
     diffs.sort()
     return diffs[int(alpha * z_reps)]
 
@@ -191,19 +214,28 @@ def floor_regression(a: "Scored", b: "Scored") -> str | None:
     """Name of a slice where the challenger `a` sits BELOW the king `b`'s worst slice, else None.
 
     Replaces per-slice significance as the no-regression rule. That rule refused exactly the
-    challengers the metric exists to reward: a floor-lifter that reshapes (sub4 preview: +0.063 on
-    hi/deep, -0.051 on en/shallow, every slice still above the old king's floor). The guarantee
+    challengers the metric exists to reward: a floor-lifter that reshapes — large gains on its weak
+    slices, a smaller loss on a strong one, every slice still above the old king's floor. The guarantee
     that matters is that the WORST CASE never gets worse — so a challenger may trade a strong slice
     down as long as nothing falls under the throne it is taking. Point comparison on the same exam."""
     if not getattr(a, "per_axis", None) or not getattr(b, "per_axis", None):
         return None                       # no slices on one side: nothing to judge a floor against
     shared = [ax for ax in _shared_axes(a, b) if a.per_axis[ax] and b.per_axis[ax]]
-    if not shared:
-        return None
-    king_floor = min(sum(b.per_axis[ax]) / len(b.per_axis[ax]) for ax in shared)
-    for ax in shared:
-        if sum(a.per_axis[ax]) / len(a.per_axis[ax]) < king_floor:
-            return ax
+    return floor_regression_slices({ax: a.per_axis[ax] for ax in shared},
+                                   {ax: b.per_axis[ax] for ax in shared})
+
+
+def floor_regression_slices(ch: dict, king: dict) -> str | None:
+    """`floor_regression` over plain {slice: samples} maps, shared with the audit so the round and
+    its L0 check apply one rule. PER JUDGE: judges read on different scales (the binary king read
+    0.2385 under OLMo-2 in round 5 and 0.2086 under SmolLM2 in round 6), so a slice is compared with
+    the incumbent's worst slice UNDER THE SAME JUDGE, never with a floor another judge set."""
+    shared = [ax for ax in sorted(ch) if ax in king and ch[ax] and king[ax]]
+    for g in by_judge(shared).values():
+        floor = min(sum(king[ax]) / len(king[ax]) for ax in g)
+        for ax in g:
+            if sum(ch[ax]) / len(ch[ax]) < floor:
+                return ax
     return None
 
 
@@ -263,10 +295,10 @@ CHALLENGER_SHARE = 0.20
 # THE dethrone margin. One constant because the money path does not use the class default: both
 # `score_job` (orchestrated rounds) and `run_round` construct their own Tournament, so a default
 # changed here alone would have moved nothing that pays. Import this rather than writing a number.
-# THE CROWN IS DECIDED ON THE POINT ESTIMATE, NOT ON A BOUND. Six rounds showed the paired
-# bootstrap cannot certify a real +0.026 floor lift at 29 items per slice — the honest challenger
-# (sub4, round-7 preview) bounded at +0.0025, inside the band a clone-with-polish also lands in
-# (+0.001). No threshold on the bound separates them. So the dethrone test is the displayed metric
+# THE CROWN IS DECIDED ON THE POINT ESTIMATE, NOT ON A BOUND. At 29 items per slice the paired
+# bootstrap cannot certify a real floor lift of a few points: a genuine improver and a synthetic
+# clone-with-polish land in the same band of bounds just above zero, and no threshold on the bound
+# separates them. So the dethrone test is the displayed metric
 # itself, on the same exam, with a margin sized to the exam's cross-draw noise (~0.010 at 288 items):
 #   * a single-round lead of POINT_MARGIN (2 sigma: a tied pair false-dethrones ~2% of contests), or
 #   * a lead of PERSIST_MARGIN in PERSIST_ROUNDS consecutive rounds (same bytes, re-scored each
@@ -278,6 +310,23 @@ CHALLENGER_SHARE = 0.20
 DETHRONE_MARGIN = 0.02      # single-round point margin
 PERSIST_MARGIN = 0.01       # per-round point margin on the persistence path
 PERSIST_ROUNDS = 2          # consecutive rounds a contender must clear PERSIST_MARGIN
+
+# A LONG REIGN LOWERS THE BAR. Once a king has held REIGN_DECAY_AFTER consecutive rounds, both
+# margins above are multiplied by REIGN_DECAY_FACTOR. A king-of-the-hill drifts into stale thrones:
+# the first competent entry in a tier sets a bar every later improvement must clear on a fresh
+# exam, and a king that is merely not-worse keeps the tier indefinitely. This decays that. It
+# applies to every tier alike and to whoever holds the throne, and it opens nothing to copying — a
+# byte copy leads by exactly 0, under any margin. The price is stated, not hidden: against a
+# long-reigning king a genuinely tied challenger dethrones more often than 2%.
+REIGN_DECAY_AFTER = 3
+REIGN_DECAY_FACTOR = 0.5
+
+
+def margins_for_reign(reign: int, margin: float = DETHRONE_MARGIN) -> tuple[float, float]:
+    """(single-round margin, persistence margin) against a king that has held `reign` rounds.
+    The ONE place the rule lives — the tournament applies it and the audit re-derives it."""
+    f = REIGN_DECAY_FACTOR if int(reign or 0) >= REIGN_DECAY_AFTER else 1.0
+    return margin * f, PERSIST_MARGIN * f
 
 
 class Tournament:
@@ -333,26 +382,32 @@ class Tournament:
         prev = self.contenders.get(tier) or {}
         prev_streak = int(prev.get("streak", 0)) if prev.get("model_id") == best.sub.model_id else 0
         regressed = floor_regression(best, king_scored)
-        event.update(margin_lcb=round(lcb, 4), lead=round(lead, 4), contender=best.sub.model_id)
+        reign = int(getattr(self.kings[tier], "reign", 0) or 0)
+        m_apply, pm_apply = margins_for_reign(reign, self.margin)
+        # THE MARGIN APPLIED IS IN THE EVENT, with the reign that produced it, so the audit checks
+        # the arithmetic from the record and the trail walk checks the reign.
+        event.update(margin_lcb=round(lcb, 4), lead=round(lead, 4), contender=best.sub.model_id,
+                     king_reign=reign, margin_applied=round(m_apply, 6),
+                     persist_margin_applied=round(pm_apply, 6))
         if regressed and not same:
             self.kings[tier].reign += 1
             self.contenders[tier] = {"model_id": best.sub.model_id, "streak": 0}
             event.update(action="hold", best_challenger=best.sub.model_id, regressed_axis=regressed,
                          contender_streak=0)
-        elif not same and lead >= self.margin:
+        elif not same and lead >= m_apply:
             self.kings[tier] = King(best.sub.miner, best.sub.model_id, best.retention, self.round)
             self.contenders.pop(tier, None)
             event.update(action="dethrone", king=best.sub.model_id, miner=best.sub.miner,
                          retention=round(best.retention, 4), beaten=king_scored.sub.model_id,
                          dethrone_by="margin")
-        elif not same and lead >= PERSIST_MARGIN and prev_streak + 1 >= PERSIST_ROUNDS:
+        elif not same and lead >= pm_apply and prev_streak + 1 >= PERSIST_ROUNDS:
             self.kings[tier] = King(best.sub.miner, best.sub.model_id, best.retention, self.round)
             self.contenders.pop(tier, None)
             event.update(action="dethrone", king=best.sub.model_id, miner=best.sub.miner,
                          retention=round(best.retention, 4), beaten=king_scored.sub.model_id,
                          dethrone_by="persistence", contender_streak=prev_streak + 1)
         else:
-            streak = prev_streak + 1 if (not same and lead >= PERSIST_MARGIN) else 0
+            streak = prev_streak + 1 if (not same and lead >= pm_apply) else 0
             self.kings[tier].reign += 1
             self.contenders[tier] = {"model_id": best.sub.model_id, "streak": streak}
             event.update(action="hold", best_challenger=best.sub.model_id, contender_streak=streak)

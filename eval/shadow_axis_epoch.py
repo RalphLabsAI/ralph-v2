@@ -289,7 +289,7 @@ def main() -> int:
 
     result = run_v2_axis_epoch(
         chain, 1, specs, glm, base, tiers, budgets,
-        Tournament(tiers, margin=0.03), RegistrationLedger(), {},
+        Tournament(tiers), RegistrationLedger(), {},
         make_safe_runner=lambda cd: SafeStudentRunner(cd, name=runners[cd].split("/")[-1]),
         items_per_axis=ITEMS, overfit_check=overfit_check, surprise_k=surprise_k,
         signer=Ed25519Signer(seed=b"shadow-operator-key-000000000000"[:32]),

@@ -361,17 +361,16 @@ def run(cfg: Config, round_no: int | None = None, provider=None, out=sys.stdout)
     # alone means switching trails (shakedown -> production) carries the shakedown's count to an
     # empty production repo, and the very first real round refuses to write with "history has
     # shrunk". The guard would be correct about the count and wrong about the question.
-    # A LOCAL TRAIL, for a run that must leave no public trace. `RALPH_RECORDS_DIR` swaps the HF
+    # A LOCAL TRAIL, for development and testing. `RALPH_RECORDS_DIR` swaps the HF
     # sink for a directory: the record is still built, signed and gated exactly as in production —
     # it simply lands on disk. Seed that directory with the published records first or the lineage
     # replays as empty, every tier takes the open-throne branch, and the run crowns the best
     # entrant outright instead of testing anyone against a sitting king.
     _local = os.environ.get("RALPH_RECORDS_DIR", "").strip()
     # …AND THE MARK MUST FOLLOW THE SINK. Keying the high-water mark by repo name alone while the
-    # sink pointed elsewhere meant a private run advanced the PUBLIC repo's count: its local
-    # round 5 bumped the mark to 5, and the next live round read the honest 4-round index as
-    # "history has shrunk" and refused to write. The mark answers "how many rounds has THIS trail
-    # shown me" — so a local trail carries its own.
+    # sink pointed at a local directory let a local run advance the public repo's count, and the
+    # next live round then read the honest index as "history has shrunk" and refused to write. The
+    # mark answers "how many rounds has THIS trail shown me" — so a local trail carries its own.
     hwm = os.path.join(cfg.work_dir, "publish-hwm-" +
                        (_local if _local else cfg.records_repo).replace('/', '_').strip('_') +
                        ".json")

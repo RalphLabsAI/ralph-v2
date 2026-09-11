@@ -344,11 +344,17 @@ class Auditor:
 
         Returns (runner, name). Runners are cached: an auditor following a live subnet loads each
         observer once, not once per round."""
-        want = (rec.manifest or {}).get("observer") or ""
-        if not self.cfg.observers or not want:
+        man = rec.manifest or {}
+        want = man.get("observer") or ""
+        # A MULTI-JUDGE ROUND NAMES NO SINGLE OBSERVER (manifest says "all"): every judge in
+        # `observers_scored` read every item, so any of them this auditor carries re-derives that
+        # judge's points. The first configured match is used; the L2 check states its coverage.
+        judges = list(man.get("observers_scored") or ([want] if want else []))
+        if not self.cfg.observers or not judges:
             return None, want
         from .rerun import _obs_key
-        match = [o for o in self.cfg.observers if _obs_key(o) == _obs_key(want)]
+        keys = {_obs_key(j) for j in judges}
+        match = [o for o in self.cfg.observers if _obs_key(o) in keys]
         if not match:
             return None, want
         repo = match[0]

@@ -172,7 +172,7 @@ def _run(round_no, specs, tiers, tour, reg, subs, glm, base):
 def test_axis_round_gates():
     specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
     tiers = [Tier("t", 10 ** 12, 1.0)]
-    tour, reg = Tournament(tiers, margin=0.03), {}
+    tour, reg = Tournament(tiers), {}
     glm = _Sim("glm", {"x": 1.0, "y": 1.0})
     base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
 
@@ -326,7 +326,7 @@ def test_axis_round_overfit_precondition():
     crown precondition demotes it even though it would win the axes outright."""
     specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
     tiers = [Tier("t", 10 ** 12, 1.0)]
-    tour, reg = Tournament(tiers, margin=0.03), {}
+    tour, reg = Tournament(tiers), {}
     glm = _Sim("glm", {"x": 1.0, "y": 1.0})
     base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
     honest = (Submission("m_h", "t", "honest", 1, 1.0), _Sim("honest", {"x": 0.85, "y": 0.85}, seed=1))
@@ -492,7 +492,7 @@ def test_validator_axis_loop_end_to_end():
         specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
         tiers = [Tier("t", 10 ** 12, 1.0)]
         budgets = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
-        tour, ledger, reg = Tournament(tiers, margin=0.03), RegistrationLedger(), {}
+        tour, ledger, reg = Tournament(tiers), RegistrationLedger(), {}
         glm = _Sim("glm", {"x": 1.0, "y": 1.0})
         base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
 
@@ -561,7 +561,7 @@ def test_axis_chain_epoch_end_to_end():
 
         result = run_v2_axis_epoch(
             chain, 1, specs, glm, base, tiers, budgets,
-            Tournament(tiers, margin=0.03), RegistrationLedger(), {},
+            Tournament(tiers), RegistrationLedger(), {},
             make_safe_runner=lambda cd: runners[cd], items_per_axis=120, max_new_tokens=8,
             signer=Ed25519Signer(seed=b"k" * 32))
 
@@ -619,7 +619,7 @@ def test_overfit_check_wired_into_crown():
 
     specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
     tiers = [Tier("t", 10 ** 12, 1.0)]
-    tour, reg = Tournament(tiers, margin=0.03), {}
+    tour, reg = Tournament(tiers), {}
     glm = _Sim("glm", {"x": 1.0, "y": 1.0})
     base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
     oc = make_overfit_check(docs, 100, glm_reader, base_reader, seed=1)
@@ -824,7 +824,7 @@ def test_generator_specialist_denied_crown():
         AxisSpec(_FakeAxis("instruction"), "instruction", 1.0, role="floor"),
     ]
     tiers = [Tier("t", 10 ** 12, 1.0)]
-    tour, reg = Tournament(tiers, margin=0.03), {}
+    tour, reg = Tournament(tiers), {}
     glm = _RoutingSim("glm", axis_prob=1.0, read_prob=0.95)
     base = _RoutingSim("base", axis_prob=0.30, read_prob=0.30, seed=9)
     specialist = (Submission("m_spec", "t", "spec", 1, 1.0),
@@ -1232,7 +1232,7 @@ def test_surprise_selection_in_crown_round():
     specs = [AxisSpec(_FakeAxis(n), n, 1.0, role="crown") for n in ("cA", "cB", "cC")] + \
             [AxisSpec(_FakeAxis("fl"), "fl", 1.0, role="floor")]
     tiers = [Tier("t", 10 ** 12, 1.0)]
-    tour, reg = Tournament(tiers, margin=0.03), {}
+    tour, reg = Tournament(tiers), {}
     probs = {n: 1.0 for n in ("cA", "cB", "cC", "fl")}
     glm = _Sim("glm", probs)
     base = _Sim("base", {n: 0.30 for n in probs}, seed=9)
@@ -1375,7 +1375,7 @@ def test_king_is_revalidated_and_vacated():
     A crown certificate has to keep being true."""
     specs = [AxisSpec(_FakeAxis("x"), "x", 1.0), AxisSpec(_FakeAxis("y"), "y", 1.0)]
     tiers = [Tier("t", 10 ** 12, 1.0)]
-    tour, reg = Tournament(tiers, margin=0.03), {}
+    tour, reg = Tournament(tiers), {}
     glm = _Sim("glm", {"x": 1.0, "y": 1.0})
     base = _Sim("base", {"x": 0.30, "y": 0.30}, seed=9)
 
@@ -1970,7 +1970,7 @@ def test_observer_epoch_end_to_end():
         tiers = [Tier("t", 10 ** 12, 1.0)]
         budgets = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
         chain = FakeChain(commits)
-        tour = Tournament(tiers, margin=0.03)
+        tour = Tournament(tiers)
 
         res = run_v2_observer_epoch(
             chain, 1, trajs, Step("X"), {"kimi": Obs(), "qwen": Obs()},
@@ -1979,7 +1979,9 @@ def test_observer_epoch_end_to_end():
             signer=Ed25519Signer(seed=b"o" * 32))
 
         assert set(res.outcome.accepted) == {"hot0", "hot1"}, res.outcome.rejected
-        assert res.outcome.observer in {"kimi", "qwen"}, res.outcome.observer
+        # every candidate judge scores the round; nothing is drawn
+        assert res.outcome.observer == "all", res.outcome.observer
+        assert res.outcome.record.manifest["observers_scored"] == ["kimi", "qwen"]
         # the miner that reproduces the parent's EFFECT wins; the one that moves the observer
         # elsewhere does not — and neither was compared on wording
         h0 = content_hash(da)
@@ -2315,7 +2317,7 @@ def test_nonce_selects_items_and_record_is_rerunnable():
         res = run_v2_observer_epoch(
             chain, 1, pool, Step("X"), {"kimi": Obs(), "qwen": Obs()}, tiers,
             {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)},
-            Tournament(tiers, margin=0.03), RegistrationLedger(), {},
+            Tournament(tiers), RegistrationLedger(), {},
             make_safe_runner=lambda cd: Step("X"),
             signer=Ed25519Signer(seed=b"z" * 32), n_items=20,
             corpus_spec="glaive_r1@rev=abc123|dedup=none|order=stream")
@@ -2326,7 +2328,8 @@ def test_nonce_selects_items_and_record_is_rerunnable():
         # the exam is pinned: which corpus, which ordering, which items, which observer
         assert m["corpus_spec"] == "glaive_r1@rev=abc123|dedup=none|order=stream"
         assert m["item_indices"] == res.outcome.item_indices and len(m["item_indices"]) == 20
-        assert m["observer"] in m["observer_pool"] and len(m["observer_pool"]) == 2
+        assert len(m["observer_pool"]) == 2
+        assert m["observers_scored"] == m["observer_pool"] and m["observer"] == "all"
         assert m["frozen_rollouts"] is True
         assert "torch" in m["versions"] or "topk" in m["versions"], m["versions"]
 
@@ -2413,7 +2416,7 @@ def test_rerun_audits_and_catches_a_rigged_record():
                                   artifact_uri=f"file://{dd}")]),
             1, pool, Step("X"), {"kimi": Obs(), "qwen": Obs()}, tiers,
             {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)},
-            Tournament(tiers, margin=0.03), RegistrationLedger(), {},
+            Tournament(tiers), RegistrationLedger(), {},
             make_safe_runner=lambda cd: Step("X"),
             signer=Ed25519Signer(seed=b"z" * 32), n_items=20, corpus_spec=spec)
 
@@ -2427,7 +2430,8 @@ def test_rerun_audits_and_catches_a_rigged_record():
 
         # a real auditor loads the model the manifest NAMES and re-runs with that. Passing the
         # name is what lets L2 refuse to certify a round it re-ran with some other model.
-        obs_name = res.outcome.record.manifest["observer"]
+        _m = res.outcome.record.manifest
+        obs_name = (_m.get("observers_scored") or [_m["observer"]])[0]
 
         # L3 loads the actual checkpoint. Honest case: the record's frozen steps ARE what the
         # model emits, so re-generating reproduces them byte for byte.
@@ -2544,7 +2548,7 @@ def test_rerun_audits_and_catches_a_rigged_record():
         weak, strong = ck("weak", 4), ck("strong", 6)
         runners = {weak: Step("W"), strong: Step("X")}   # W moves the observer partway, X matches
         obs2 = {"kimi": Obs(), "qwen": Obs()}
-        tour, ledger, reg = Tournament(tiers, margin=0.03), RegistrationLedger(), {}
+        tour, ledger, reg = Tournament(tiers), RegistrationLedger(), {}
         budgets = {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)}
         sig = Ed25519Signer(seed=b"z" * 32)
 
@@ -2572,7 +2576,8 @@ def test_rerun_audits_and_catches_a_rigged_record():
         p2 = str(Path(dd) / "dethrone.json")
         Path(p2).write_text(_json.dumps(asdict(r2.outcome.record)))
         a2 = audit(p2, pool_path, Obs(),
-                   observer_name=r2.outcome.record.manifest["observer"],
+                   observer_name=(r2.outcome.record.manifest.get("observers_scored")
+                                  or [r2.outcome.record.manifest["observer"]])[0],
                    make_runner=lambda mid, uri: Step("X") if mid == content_hash(strong)
                    else Step("W"))
         assert a2.exit_code == 0, [(c.name, c.detail) for c in a2.checks if c.status != "PASS"]
@@ -2595,7 +2600,8 @@ def test_rerun_audits_and_catches_a_rigged_record():
         rr.sign(sig)
         Path(p3).write_text(_json.dumps(asdict(rr)))
         a3 = audit(p3, pool_path, Obs(),
-                   observer_name=r2.outcome.record.manifest["observer"],
+                   observer_name=(r2.outcome.record.manifest.get("observers_scored")
+                                  or [r2.outcome.record.manifest["observer"]])[0],
                    make_runner=lambda mid, uri: Step("X") if mid == content_hash(strong)
                    else Step("W"))
         assert any(c.name.startswith("dethrone margin") and c.status == "FAIL"
@@ -2606,16 +2612,20 @@ def test_rerun_audits_and_catches_a_rigged_record():
         #          only "some model reproduces these numbers", which is not the claim being made.
         a_wrong = audit(rec_path, pool_path, Obs(), observer_name="some-other-model",
                         make_runner=honest_runner)
-        assert any(c.name.startswith("audited with the round's observer") and c.status == "FAIL"
-                   for c in a_wrong.checks)
+        assert any((c.name.startswith("audited with the round's observer")
+                    or c.name.startswith("audited with one of the round's judges"))
+                   and c.status == "FAIL" for c in a_wrong.checks)
         assert a_wrong.exit_code == 1
 
         # ---- 6c. THE OPERATOR PICKS THE GRADER. The observer is drawn from the nonce; a manifest
         #          naming a different one out of the pool means the choice was made by hand.
-        other = [o for o in res.outcome.record.manifest["observer_pool"] if o != obs_name][0]
-        r_obs = rigged(lambda raw: raw["manifest"].update(observer=other))
-        assert any(c.name.startswith("observer derives from the nonce") and c.status == "FAIL"
-                   for c in r_obs.checks), [c.name for c in r_obs.checks if c.level == "L2"]
+        #          With every candidate judge scoring, the same forgery is SCORING WITH A SUBSET —
+        #          dropping the judge that disfavours a model. The record must name the whole pool.
+        r_obs = rigged(lambda raw: raw["manifest"].update(observers_scored=[obs_name]))
+        assert any(c.name.startswith(("every candidate judge scored the round",
+                                      "observer derives from the nonce"))
+                   and c.status == "FAIL" for c in r_obs.checks), \
+            [(c.name, c.status) for c in r_obs.checks if c.level == "L2"]
 
 
 def test_publisher_is_fail_closed():
@@ -2723,7 +2733,7 @@ def test_publisher_is_fail_closed():
         pubr = RecordPublisher(LocalSink(root), window=8,
                               state_path=str(Path(dd) / "hwm1.json"))
         chain = AnchoringChain([])
-        tour, reg, led = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        tour, reg, led = Tournament(tiers), {}, RegistrationLedger()
         r1 = epoch(chain, 1, weak, pubr, tour, reg, led)
         assert r1.publish.ok, r1.publish
         assert r1.weights_set and chain.weight_calls == 1
@@ -2857,7 +2867,7 @@ def test_publisher_is_fail_closed():
         import os as _os
         _os.environ["RALPH_REQUIRE_PUBLISH"] = "1"
         try:
-            epoch(AnchoringChain([]), 3, strong, None, Tournament(tiers, margin=0.03), {},
+            epoch(AnchoringChain([]), 3, strong, None, Tournament(tiers), {},
                   RegistrationLedger())
             raise AssertionError("ran a round with no publisher while RALPH_REQUIRE_PUBLISH=1")
         except PublishError as e:
@@ -2887,7 +2897,7 @@ def test_publisher_is_fail_closed():
         rootc = str(Path(dd) / "sinkc")
         pc = RecordPublisher(LocalSink(rootc), state_path=str(Path(dd) / "hwmc.json"))
         chc = AnchoringChain([])
-        tc, rc, lc = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        tc, rc, lc = Tournament(tiers), {}, RegistrationLedger()
         recs = [epoch(chc, n, strong if n > 1 else weak, pc, tc, rc, lc) for n in (1, 2, 3)]
         assert all(e.publish.ok and e.weights_set for e in recs), [e.publish for e in recs]
         h = verify_history(pc, chc.record_anchors, head_anchor_fn=chc.head_anchor)
@@ -2913,7 +2923,7 @@ def test_publisher_is_fail_closed():
         rootd = str(Path(dd) / "sinkd")
         pd = RecordPublisher(LocalSink(rootd), state_path=str(Path(dd) / "hwmd.json"))
         chd = AnchoringChain([])
-        td, rd, ld = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        td, rd, ld = Tournament(tiers), {}, RegistrationLedger()
         e1 = epoch(chd, 1, weak, pd, td, rd, ld)
         e2 = epoch(chd, 2, strong, pd, td, rd, ld)
         idxd = _json.loads((Path(rootd) / INDEX).read_text())
@@ -2946,7 +2956,7 @@ def test_publisher_is_fail_closed():
         _os2 = __import__("os")
         _os2.environ["RALPH_REQUIRE_PUBLISH"] = "1"
         try:
-            epoch(AnchoringChain([]), 5, strong, None, Tournament(tiers, margin=0.03), {},
+            epoch(AnchoringChain([]), 5, strong, None, Tournament(tiers), {},
                   RegistrationLedger(), require_publish=False)
             raise AssertionError("require_publish=False defeated RALPH_REQUIRE_PUBLISH=1")
         except PublishError:
@@ -2971,7 +2981,7 @@ def test_publisher_is_fail_closed():
         root_g = str(Path(dd) / "sinkg")
         pg = RecordPublisher(LocalSink(root_g), state_path=str(Path(dd) / "hwmg.json"))
         chg = AnchoringChain([])
-        tg, rg, lg = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        tg, rg, lg = Tournament(tiers), {}, RegistrationLedger()
         for rnd in (1, 2, 4):                       # round 3 never published
             e = epoch(chg, rnd, strong if rnd > 1 else weak, pg, tg, rg, lg)
             assert e.publish.ok, (rnd, e.publish)
@@ -2986,7 +2996,7 @@ def test_publisher_is_fail_closed():
         root10 = str(Path(dd) / "sink10")
         p10 = RecordPublisher(LocalSink(root10), window=8, state_path=str(Path(dd) / "hwm10.json"))
         ch10 = AnchoringChain([])
-        t10, r10, l10 = Tournament(tiers, margin=0.03), {}, RegistrationLedger()
+        t10, r10, l10 = Tournament(tiers), {}, RegistrationLedger()
         e10 = epoch(ch10, 4, strong, p10, t10, r10, l10)
         assert e10.publish.ok and e10.weights_set and ch10.weight_calls == 1
         assert e10.publish.anchors_checked == 1, e10.publish
@@ -3076,7 +3086,7 @@ def test_identity_canary_catches_a_nondeterministic_box():
                                  make_runner=lambda: Steady())],
             trajs, Flaky(), {"kimi": obs}, tiers,
             {"t": TierBudget(name="t", max_params=10 ** 12, max_effective_bits=32.0)},
-            Tournament(tiers, margin=0.03), RegistrationLedger(), {}, n_items=16)
+            Tournament(tiers), RegistrationLedger(), {}, n_items=16)
         assert any(e.get("action") == "abort" and "identity" in e.get("reason", "")
                    for e in out.events), out.events
         assert not out.weights, "crowned on a box that cannot reproduce the identity"
@@ -3428,7 +3438,7 @@ def _auditor_fixture(dd):
     root = str(Path(dd) / "sink")
     pubr = RecordPublisher(LocalSink(root), window=8, state_path=str(Path(dd) / "hwm.json"))
     chain = AnchoringChain([])
-    tour, led, reg = Tournament(tiers, margin=0.03), RegistrationLedger(), {}
+    tour, led, reg = Tournament(tiers), RegistrationLedger(), {}
 
     for rnd, cd in ((1, weak), (2, strong)):
         hh, ss = content_hash(cd), f"s{rnd}"
@@ -4061,7 +4071,7 @@ def test_one_bad_artifact_cannot_take_the_round_down():
             1, "root", "nonce",
             [cm("attacker", poison, boom), wrong_tier, cm("honest", good, lambda: Step())],
             pool, Step(), {"kimi": Obs(), "qwen": Obs()}, tiers, bud,
-            Tournament(tiers, margin=0.03), RegistrationLedger(), {}, n_items=20,
+            Tournament(tiers), RegistrationLedger(), {}, n_items=20,
             corpus_spec="glaive_r1@rev=abc|order=stream")
 
         # the poison artifact is REJECTED WITH A REASON, and the honest miner is still scored
@@ -4815,7 +4825,7 @@ def test_a_reference_is_scored_and_can_never_win_anything():
 
         out = run_observer_round(
             1, "root", "nonce", [miner], pool, Step(), {"kimi": Obs()}, tiers, bud,
-            Tournament(tiers, margin=0.03), RegistrationLedger(), {}, n_items=20,
+            Tournament(tiers), RegistrationLedger(), {}, n_items=20,
             corpus_spec="glaive_r1@rev=abc|order=stream",
             # the reference matches the best miner exactly
             references=[("stock-q4", "t", Step(), "hf://ref/stock@1")])

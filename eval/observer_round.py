@@ -63,7 +63,8 @@ class SharedSample:
 
 def build_shared(trajectories, parent: Stepper, observer: Observer, observer_name: str,
                  max_step_tokens: int = 256, max_cont_tokens: int = 128,
-                 min_parent_effect: float = MIN_TEACHER_EFFECT) -> list[SharedSample]:
+                 min_parent_effect: float = MIN_TEACHER_EFFECT,
+                 parent_steps: list | None = None) -> list[SharedSample]:
     """The once-per-round work. Batches the parent's steps in one call, then one observer pass
     per sample for C, P_G and P_0.
 
@@ -78,7 +79,15 @@ def build_shared(trajectories, parent: Stepper, observer: Observer, observer_nam
     # chat=False ON BOTH LEGS — see score_submission. A prefix is text to be continued, and the
     # parent's step is the reference every miner is measured against, so this is the leg that
     # defines what the question even is.
-    steps = continuation(parent, [t.prefix for t in trajectories], max_step_tokens)
+    # ONE PARENT GENERATION PER ROUND, however many judges read it. The parent's step is the
+    # reference every judge measures against; regenerating it per judge would triple the round's
+    # most expensive miner-independent leg to reproduce text the round already has.
+    if parent_steps is None:
+        steps = continuation(parent, [t.prefix for t in trajectories], max_step_tokens)
+    else:
+        steps = list(parent_steps)
+        if len(steps) != len(trajectories):
+            raise ValueError(f"{len(steps)} parent steps for {len(trajectories)} trajectories")
     out: list[SharedSample] = []
     for n, (t, parent_step) in enumerate(zip(trajectories, steps), 1):
         # Two observer passes and a continuation per sample, none of them batched. This is the
@@ -133,7 +142,8 @@ def _lang_of(source: str) -> str:
 
 
 def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: Observer,
-                     max_step_tokens: int = 256, alpha: float = 1.0, beta: float = 1.0):
+                     max_step_tokens: int = 256, alpha: float = 1.0, beta: float = 1.0,
+                     miner_steps: list | None = None):
     """Per-miner half: one batched generation, then one observer pass per usable sample."""
     from .progress import tick
 
@@ -149,7 +159,13 @@ def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: O
     # other — two miners with numerically identical models scored differently by file extension.
     # The parent was prompted the safetensors way, so GGUF submissions were also being compared to
     # a reference step produced under a prompt they never saw.
-    miner_steps = continuation(miner, [s.prefix for s in usable], max_step_tokens)
+    # ONE GENERATION PER SUBMISSION, READ BY EVERY JUDGE. Passing the steps in is how a round with
+    # several judges scores the same answers under each of them: the text is the miner's, the
+    # reading is the judge's, and only the reading should repeat.
+    if miner_steps is None:
+        miner_steps = continuation(miner, [s.prefix for s in usable], max_step_tokens)
+    elif len(miner_steps) != len(usable):
+        raise ValueError(f"{len(miner_steps)} steps for {len(usable)} usable samples")
     samples: list[tuple[str, StepEffect]] = []
     for n, (s, a_step) in enumerate(zip(usable, miner_steps), 1):
         tick("score", f"{getattr(miner, 'name', '?')} {n}/{len(usable)}")
