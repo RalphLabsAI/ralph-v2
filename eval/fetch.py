@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 
 # Matches what gates.inspect_checkpoint will accept. Anything else is refused before download.
@@ -39,6 +40,44 @@ MAX_FILES = 96
 MAX_NAME = 160
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._\-]+$")
+
+# TRANSIENT MEANS RETRY, NOT REFUSE. Hugging Face answers a busy moment with 429 ("maximum queue
+# size reached") or a 5xx, and a rented box fetches UNAUTHENTICATED — no secrets leave the
+# orchestrator — so it sits on the tightest rate limit there is. One such 429 while listing a single
+# miner's repo used to unwind the whole round: it was not a FetchRefused, so nothing caught it.
+# Transient errors are retried with backoff; if the
+# service is still refusing after that, the resolver skips THAT artifact with the reason.
+RETRY_DELAYS_S = (5, 15, 30, 60, 90)   # ~3.3 min of patience per call, ticked so it never reads as a hang
+_TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+_sleep = time.sleep                     # injectable: a test must not wait out real backoff
+
+
+def _is_transient(e: BaseException) -> bool:
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status is not None:
+        return int(status) in _TRANSIENT_STATUS
+    return type(e).__name__ in ("ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout",
+                                "ChunkedEncodingError", "RemoteDisconnected")
+
+
+def _retrying(fn, what: str):
+    """Call `fn()`, retrying transient failures with backoff. A FetchRefused and any permanent
+    error (404, 401, a revision that does not exist) raise at once — retrying a refusal only delays
+    it, and a miner's bad URI must not buy three minutes of the round."""
+    from .progress import tick
+    delays = (0,) + tuple(RETRY_DELAYS_S)
+    for i, delay in enumerate(delays):
+        if delay:
+            tick("retry", f"{what}: transient error, retry {i}/{len(RETRY_DELAYS_S)} in {delay}s",
+                 force=True)
+            _sleep(delay)
+        try:
+            return fn()
+        except FetchRefused:
+            raise
+        except Exception as e:
+            if not _is_transient(e) or i == len(delays) - 1:
+                raise
 
 
 class FetchRefused(Exception):
@@ -99,7 +138,7 @@ def plan(uri: str, lister=None, max_bytes: int = MAX_TOTAL_BYTES,
     `lister(repo, rev) -> [(name, size_bytes)]` is injectable so the refusal logic is testable
     without the network — which matters, because these are the checks that must never regress."""
     _, repo, rev = parse_uri(uri)
-    files = (lister or _hf_list)(repo, rev)
+    files = _retrying(lambda: (lister or _hf_list)(repo, rev), f"list {repo}@{rev}")
     keep, total = [], 0
     for name, size in files:
         base = name.split("/")[-1]
@@ -147,7 +186,11 @@ def fetch(uri: str, dest_root: str, expect_hash: str = "", lister=None,
         out = os.path.join(dest, name.split("/")[-1])
         # flatten: the artifact is a directory of weight files, and honouring nested paths is
         # how a traversal turns into a write outside dest
-        dl(repo, rev, name, out)
+        def _one(name=name, out=out):
+            if os.path.exists(out):
+                os.remove(out)            # a failed attempt must not leave a partial file behind
+            dl(repo, rev, name, out)
+        _retrying(_one, f"download {repo}/{name.split('/')[-1]}")
         actual = os.path.getsize(out)
         got += actual
         if got > max_bytes:
@@ -182,6 +225,12 @@ def resolver(dest_root: str, reveals: dict | None = None, log: list | None = Non
         except FetchRefused as e:
             if log is not None:
                 log.append((hotkey, "refused", str(e)))
+            return ""
+        except Exception as e:
+            # ANY OTHER FAILURE IS STILL ONE MINER'S. Past the retries a network or service error
+            # skips this artifact with its reason; it must never unwind the round for everyone.
+            if log is not None:
+                log.append((hotkey, "failed", f"{type(e).__name__}: {str(e)[:300]}"))
             return ""
 
     return fetch_dir_for
