@@ -386,7 +386,10 @@ def _round_summary(rec: dict, first_live: int = FIRST_LIVE_ROUND) -> dict:
         "events": [{"tier": e.get("tier"), "action": e.get("action")}
                    for e in (rec.get("events") or [])],
         "parent": rec.get("teacher") or "",
-        "observer": (rec.get("manifest") or {}).get("observer") or "",
+        # a multi-judge round lists its judges; a single-judge round names its one observer
+        "observer": (", ".join((rec.get("manifest") or {}).get("observers_scored") or [])
+                     if len((rec.get("manifest") or {}).get("observers_scored") or []) > 1
+                     else (rec.get("manifest") or {}).get("observer") or ""),
         "exam_items": len((rec.get("manifest") or {}).get("item_indices") or []),
         "started_at": started or None,
         "published_at": published or None,

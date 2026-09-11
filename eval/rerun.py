@@ -171,6 +171,16 @@ def audit_arithmetic(rec, a: Audit) -> None:
         if len(s.effects) != n_pts or (s.steps and len(s.steps) != n_pts):
             a.add("L0", f"alignment {tag}", FAIL,
                   f"effects={len(s.effects)} steps={len(s.steps)} vs points={n_pts}")
+        # ONE ANSWER PER ITEM. A multi-judge record repeats each item's frozen step once per judge;
+        # the copies must be identical, or different judges were shown different answers.
+        if s.steps and any(p.get("observer") for p in rec.points):
+            first: dict = {}
+            clash = [p.get("rollout_id") for p, st in zip(rec.points, s.steps)
+                     if first.setdefault(p.get("rollout_id"), st) != st]
+            a.ok("L0", f"one answer per item across judges {tag}", not clash,
+                 fail=f"{len(clash)} items carry different answers under different judges "
+                      f"({clash[:3]}) — the judges did not read the same text",
+                 info=f"{len(first)} items, identical under every judge")
         # THE ARITHMETIC CHECK: rebuild the samples and call THE PRODUCTION SCORER.
         #
         # This used to re-implement score_miner inline — group by slice, mean, take the min — and
@@ -184,12 +194,23 @@ def audit_arithmetic(rec, a: Audit) -> None:
         # Reimplementing the scorer in the auditor is the mistake, not the details: two copies of a
         # rule diverge, and the copy that decides "did this reproduce" is the one nobody runs in
         # anger. So the audit now calls the same function the round did.
-        from .observer_kl import StepEffect, score_miner
-        samples = []
+        from .observer_kl import MinerScore, StepEffect, score_miner
+        from .koth import judge_of
+        # PER JUDGE, THEN THE MEAN — the round's own combination, through the same scorer. A
+        # single-judge record forms one group and recomputes exactly as it always did.
+        groups: dict = {}
         for row in s.effects:
             key, sv, d_g, d_m = row[0], float(row[1]), float(row[2]), float(row[3])
-            samples.append((key, StepEffect(s=sv, d_teacher=d_g, d_miner=d_m, n_positions=1)))
-        ms = score_miner(samples)
+            groups.setdefault(judge_of(key), []).append(
+                (key, StepEffect(s=sv, d_teacher=d_g, d_miner=d_m, n_positions=1)))
+        parts = [score_miner(g) for g in groups.values()]
+        ms = parts[0]
+        if len(parts) > 1:
+            ms = MinerScore()
+            ms.score = sum(x.score for x in parts) / len(parts)
+            for x, j in zip(parts, groups):
+                ms.slice_samples.update(x.slice_samples)
+                ms.reasons.extend(f"{j}: {r}" for r in x.reasons)
         tol = max(float(rec.reproduction_tolerance or 0.0), 1e-6)
         a.ok("L0", f"recompute score {tag}", abs(ms.score - s.retention) <= tol,
              fail=f"recomputed {ms.score:.6f} vs recorded {s.retention:.6f} "
@@ -244,9 +265,11 @@ def audit_arithmetic(rec, a: Audit) -> None:
             nr = NoiseReport()
             nr.max_kl = float(rec.noise.get("max_kl", 0.0) or 0.0)
             safety = float((rec.manifest or {}).get("noise_safety", 3.0))
-            ok_m, why = crownable(claimed, nr, safety)
+            # the statistic that DECIDED the crown: the point lead where the record has one
+            decided = float(e.get("lead", claimed))
+            ok_m, why = crownable(decided, nr, safety)
             a.ok("L0", f"margin clears noise floor {str(e.get('king'))[:12]}…", ok_m,
-                 fail=why, info=f"margin {claimed:+.4f} vs floor "
+                 fail=why, info=f"margin {decided:+.4f} vs floor "
                                 f"{safety:g}x{nr.max_kl:.2e}")
 
     # crowning is only legal above the crownability floor
@@ -363,7 +386,19 @@ def audit_emission(rec, a: Audit) -> None:
         if inc and ch is not None and getattr(ch, "slices", None) and getattr(inc[0], "slices", None):
             lead = float(ch.retention) - float(inc[0].retention)
             by = e.get("dethrone_by", "margin")
-            need = _PM if by == "margin" else _PS
+            # REIGN-ADJUSTED, through the rule's one definition. `king_reign` is written by the
+            # operator; the auditor's trail walk (lineage.replay) is what verifies it.
+            from .koth import margins_for_reign as _mfr
+            _m, _pm = _mfr(int(e.get("king_reign", 0) or 0), _PM)
+            need = _m if by == "margin" else _pm
+            if "margin_applied" in e:
+                a.ok("L0", f"applied margin follows the reign rule {str(e.get('king'))[:12]}…",
+                     abs(float(e["margin_applied"]) - _m) <= 1e-9
+                     and abs(float(e.get("persist_margin_applied", _pm)) - _pm) <= 1e-9,
+                     fail=f"event applied {e.get('margin_applied')}/"
+                          f"{e.get('persist_margin_applied')} but a reign of "
+                          f"{e.get('king_reign')} implies {_m}/{_pm}",
+                     info=f"reign {e.get('king_reign')} -> {_m}/{_pm}")
             a.ok("L0", f"dethrone lead clears the {by} margin {str(e.get('king'))[:12]}…",
                  lead + 1e-9 >= need,
                  fail=f"tier {e.get('tier')} dethroned on a lead of {lead:+.4f} but the {by} path "
@@ -374,12 +409,12 @@ def audit_emission(rec, a: Audit) -> None:
                      int(e.get("contender_streak", 0) or 0) >= _PR,
                      fail=f"streak {e.get('contender_streak')} < {_PR} — the record claims a "
                           f"persistence dethrone without the rounds to back it")
-            kf = min(_st.fmean(v) for v in inc[0].slices.values() if v)
-            low = [ax for ax, v in ch.slices.items() if v and ax in inc[0].slices and _st.fmean(v) < kf]
+            from .koth import floor_regression_slices as _frs
+            low = _frs(ch.slices, inc[0].slices)
             a.ok("L0", f"no challenger slice fell below the old floor {str(e.get('king'))[:12]}…",
-                 not low,
-                 fail=f"tier {e.get('tier')} crowned a model whose {low[:2]} sit below the "
-                      f"incumbent's worst slice {kf:.4f} — the worst case got worse")
+                 low is None,
+                 fail=f"tier {e.get('tier')} crowned a model whose {low} sits below the "
+                      f"incumbent's worst slice under the same judge — the worst case got worse")
         a.ok("L0", f"dethrone names the re-scored incumbent {str(e.get('king'))[:12]}…",
              bool(inc) and e.get("beaten") == inc[0].model_id,
              fail=f"claims to have beaten {str(e.get('beaten'))[:12]}… but the record's incumbent "
@@ -522,7 +557,8 @@ def audit_selection(rec, pool, a: Audit) -> list:
               f"three-quarters replaced by drops is not the exam the nonce drew, whatever the "
               f"stated reasons",
          info=f"{frac:.1%} dropped")
-    dupes = len(scored_ids) - len(set(scored_ids))
+    keyed = [(p.get("rollout_id"), p.get("observer", "")) for p in rec.points]
+    dupes = len(keyed) - len(set(keyed))
     a.ok("L1", "no duplicated items", dupes == 0,
          fail=f"{dupes} duplicated rollout_ids — repeating an easy item inflates its slice")
     # Bind the recorded text to the pinned corpus. Without this the frozen prefixes are just
@@ -549,21 +585,35 @@ def audit_selection(rec, pool, a: Audit) -> list:
     # trajectory and the observer name, so it is recomputable — and now recomputed.
     from .observer_round import _slice_key
     obs = man.get("observer") or ""
-    if obs:
-        want = {}
-        for p in rec.points:
-            t = by_id.get(p.get("rollout_id"))
-            if t is not None:
-                want[p["rollout_id"]] = _slice_key(t, obs)
-        bad = []
+    judges = list(man.get("observers_scored") or ([obs] if obs else []))
+    if judges:
+        # EACH POINT NAMES ITS JUDGE in a multi-judge round; a single-judge record's points do not,
+        # and the manifest's observer is the judge of every one of them.
+        def _judge(p):
+            return p.get("observer") or (judges[0] if len(judges) == 1 else "")
+        unnamed = [p.get("rollout_id") for p in rec.points if not _judge(p)]
+        bad, n = [], 0
         for sub in rec.submissions:
             for p, row in zip(rec.points, sub.effects or []):
-                exp = want.get(p.get("rollout_id"))
-                if exp is not None and row and row[0] != exp:
+                t, j = by_id.get(p.get("rollout_id")), _judge(p)
+                if t is None or not j or not row:
+                    continue
+                n += 1
+                exp = _slice_key(t, j)
+                if row[0] != exp:
                     bad.append(f"{p.get('rollout_id')}: {row[0]} != {exp}")
-        a.ok("L1", "slice keys derive from the items", not bad,
-             fail="; ".join(bad[:3]) + (f" (+{len(bad) - 3} more)" if len(bad) > 3 else ""),
-             info=f"{len(want)} slice keys recomputed from (trajectory, observer)")
+        a.ok("L1", "slice keys derive from the items", not bad and not unnamed,
+             fail=("; ".join(bad[:3]) + (f" (+{len(bad) - 3} more)" if len(bad) > 3 else ""))
+                  if bad else f"{len(unnamed)} points name no judge in a multi-judge round",
+             info=f"{n} slice keys recomputed from (trajectory, judge)")
+        if len(judges) > 1:
+            items_all = sorted({p.get("rollout_id") for p in rec.points})
+            same = all(sorted(p.get("rollout_id") for p in rec.points if p.get("observer") == j)
+                       == items_all for j in judges)
+            a.ok("L1", "every judge read every item", same,
+                 fail="the judges were handed different items — per-judge scores that do not "
+                      "describe the same exam cannot be averaged",
+                 info=f"{len(judges)} judges x {len(items_all)} items")
     return items
 
 
@@ -649,12 +699,23 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: 
     # operator built the registry with, and an auditor has to name a full HuggingFace repo id to
     # download the thing — so a literal string comparison made this check fail for every honest
     # third party while passing for the operator, which is the wrong way round.
-    same_obs = bool(want) and _obs_key(observer_name) == _obs_key(want)
-    a.ok("L2", "audited with the round's observer", same_obs,
+    judges = list((rec.manifest or {}).get("observers_scored") or ([want] if want else []))
+    multi = len(judges) > 1
+    same_obs = bool(judges) and _obs_key(observer_name) in {_obs_key(j) for j in judges}
+    a.ok("L2", "audited with one of the round's judges" if multi
+         else "audited with the round's observer", same_obs,
          fail=f"re-running with {observer_name or '(unnamed)'} but the round used "
-              f"{want or '(unrecorded)'} — a match here would prove nothing about this round",
-         info=f"observer {want}")
-    if pool:
+              f"{', '.join(judges) or '(unrecorded)'} — a match here would prove nothing about "
+              f"this round",
+         info=(f"judge {observer_name} of {len(judges)} (this pass checks that judge's points; "
+               f"run once per judge for full coverage)") if multi else f"observer {want}")
+    if pool and multi:
+        # NOTHING WAS DRAWN, SO NOTHING CAN HAVE BEEN PICKED — provided every candidate scored. A
+        # subset would be a choice the operator made, which is exactly what the draw existed to stop.
+        a.ok("L2", "every candidate judge scored the round", sorted(judges) == sorted(pool),
+             fail=f"the round scored {judges} out of the pool {pool}",
+             info=f"all {len(pool)} candidate judges scored")
+    elif pool:
         from .observer_round import pick_observer
         drawn = pick_observer(rec.commit_root, rec.round_nonce, pool)
         a.ok("L2", "observer derives from the nonce", drawn == want,
@@ -672,6 +733,8 @@ def audit_judgment(rec, items, observer, a: Audit, sub_ids=None, observer_name: 
             continue
         worst, n = 0.0, 0
         for p, step, row in zip(rec.points, s.steps, s.effects):
+            if multi and _obs_key(p.get("observer", "")) != _obs_key(observer_name):
+                continue                  # another judge's reading; its own pass checks it
             t = by_id.get(p.get("rollout_id"))
             if t is None or not p.get("continuation"):
                 continue
@@ -736,7 +799,14 @@ def audit_provenance(rec, items, make_runner, a: Audit, max_items: int = 0) -> N
             a.add("L3", f"steps come from the model {tag}", SKIP,
                   f"artifact not available to this auditor ({s.artifact_uri})")
             continue
-        pts = list(zip(rec.points, s.steps))
+        # ONE REGENERATION PER ITEM. A multi-judge record repeats each item's step once per judge
+        # (L0 checks the copies agree); regenerating every copy would check the same text thrice.
+        seen_ids, pts = set(), []
+        for p, step in zip(rec.points, s.steps):
+            if p.get("rollout_id") in seen_ids:
+                continue
+            seen_ids.add(p.get("rollout_id"))
+            pts.append((p, step))
         if max_items:
             pts = pts[:max_items]
         prefixes, frozen = [], []

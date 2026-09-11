@@ -34,6 +34,38 @@ from .progress import tick as _tick
 from .round_record import RoundRecord, build_round_record
 from .runners import continuation
 
+# EVERY JUDGE SCORES EVERY ROUND. See step 2 of `run_observer_round` for why one drawn judge made
+# the crown a lottery. False restores the single nonce-drawn observer.
+SCORE_ALL_OBSERVERS = True
+
+
+def _combine(parts: dict, steps: list):
+    """One MinerScore from per-judge MinerScores over the SAME answers.
+
+    score = the mean over judges of each judge's worst-slice score. Slices and effects are the union
+    in judge order — the slice keys carry the judge, so nothing collides — and every reason is
+    prefixed with the judge that raised it. One judge returns its score untouched."""
+    from .observer_kl import MinerScore
+    if len(parts) == 1:
+        (ms,) = parts.values()
+        ms.steps = list(steps)
+        return ms
+    out = MinerScore()
+    js = list(parts)
+    out.score = sum(parts[j].score for j in js) / len(js)
+    out.n_scored = sum(parts[j].n_scored for j in js)
+    out.n_discarded = sum(parts[j].n_discarded for j in js)
+    out.mean_effect = sum(parts[j].mean_effect for j in js) / len(js)
+    for j in js:
+        out.per_slice.update(parts[j].per_slice)
+        out.slice_samples.update(parts[j].slice_samples)
+        out.effects.extend(parts[j].effects)
+        out.keyed_effects.extend(parts[j].keyed_effects)
+        out.reasons.extend(f"{j}: {r}" for r in parts[j].reasons)
+    out.steps = list(steps)
+    out.judge_scores = {j: round(parts[j].score, 6) for j in js}
+    return out
+
 
 def _sha(text: str) -> str:
     import hashlib
@@ -358,9 +390,20 @@ def run_observer_round(
         subs.append((sub, runner, c.artifact_uri))
         out.accepted.append(c.hotkey)
 
-    # 2. the observer is post-commit entropy, so it cannot be pre-fitted
-    obs_name = pick_observer(commit_root, round_nonce, sorted(observers))
-    observer = observers[obs_name]
+    # 2. THE JUDGES. Every candidate observer scores every round, and the crown metric is the MEAN
+    #    over judges of each judge's worst-slice score. One judge drawn from the nonce made the crown
+    #    a lottery over judges: the same pair of artifacts could land either side of the margin on
+    #    nothing but which observer the block hash picked, because each judge reads on its own scale
+    #    and weights the slices differently. Averaging
+    #    removes the draw; worst-slice protection still applies within each judge; and fitting one
+    #    judge now moves a third of the score rather than all of it. One observer in the pool, or
+    #    SCORE_ALL_OBSERVERS off, is the old single drawn judge exactly.
+    if SCORE_ALL_OBSERVERS and len(observers) > 1:
+        judges = sorted(observers)
+    else:
+        judges = [pick_observer(commit_root, round_nonce, sorted(observers))]
+    obs_name = judges[0] if len(judges) == 1 else "all"
+    observer = observers[judges[0]]
     out.observer = obs_name
 
     # 2b. WHICH items are scored is post-commit entropy, not an operator choice
@@ -369,17 +412,37 @@ def run_observer_round(
     out.item_indices = list(item_idx)
     out.corpus_spec = corpus_spec
 
-    # 3. shared rollouts — the miner-independent four-fifths of the work, once per round
-    _tick("shared rollouts", f"{len(trajectories)} items, observer {obs_name}", force=True)
-    shared = build_shared(trajectories, parent, observer, obs_name,
-                          max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens)
+    # 3. shared rollouts — the miner-independent four-fifths of the work, once per round. The
+    #    parent generates ONCE; each judge then reads the same parent steps.
+    _tick("shared rollouts", f"{len(trajectories)} items, judges {', '.join(judges)}", force=True)
+    parent_steps = continuation(parent, [t.prefix for t in trajectories], max_step_tokens)
+    shared_by = {j: build_shared(trajectories, parent, observers[j], j,
+                                 max_step_tokens=max_step_tokens, max_cont_tokens=max_cont_tokens,
+                                 parent_steps=parent_steps)
+                 for j in judges}
+    # ONE EXAM FOR EVERY JUDGE. An item any judge cannot use is dropped for all of them, so every
+    # judge reads the same items, a submission's answers line up across judges, and the per-judge
+    # scores describe the same exam.
+    ok_ids = set.intersection(*({x.traj_id for x in sh if x.usable} for sh in shared_by.values()))
+    for sh in shared_by.values():
+        for x in sh:
+            if x.usable and x.traj_id not in ok_ids:
+                x.usable, x.reason = False, "unusable under another judge"
+    shared = shared_by[judges[0]]
     usable = [s for s in shared if s.usable]
+
+    def _why(tid: str) -> str:
+        rs = [(j, next((x.reason for x in shared_by[j] if x.traj_id == tid), "")) for j in judges]
+        rs = [(j, r) for j, r in rs if r and r != "unusable under another judge"]
+        if len(judges) == 1:
+            return rs[0][1] if rs else ""
+        return "; ".join(f"{j}: {r}" for j, r in rs)
     # THE DROPS GO IN THE SIGNED RECORD. An unusable sample (empty parent step, silent observer,
     # parent effect under the floor) is a miner-independent, recomputable fact — but an auditor
     # reading the record can only tell "dropped for a stated reason" from "pruned after the draw"
     # if the record SAYS so. Round 5 scored 143/144 drawn items for exactly this reason and the
     # audit refused to sign its own honest record.
-    out.exam_dropped = [{"id": s.traj_id, "reason": s.reason} for s in shared if not s.usable]
+    out.exam_dropped = [{"id": s.traj_id, "reason": _why(s.traj_id)} for s in shared if not s.usable]
     if not usable:
         out.events.append({"round": round_no, "action": "abort",
                            "reason": "no usable trajectories (parent moved the observer nowhere)"})
@@ -388,11 +451,22 @@ def run_observer_round(
     # 4. measure the validator's OWN noise floor on this round's inputs. A crown decided inside
     #    it is a lottery a miner wins by resubmitting, so it is measured before any scoring and
     #    published either way.
-    probe = usable[0]
     _tick("noise floor", f"{len(usable)} usable samples", force=True)
-    noise = measure_noise(observer, probe.prefix + "\n" + probe.parent_step, probe.continuation,
-                          repeats=3)
+    noises = {}
+    for j in judges:
+        pj = next(x for x in shared_by[j] if x.usable)
+        noises[j] = measure_noise(observers[j], pj.prefix + "\n" + pj.parent_step, pj.continuation,
+                                  repeats=3)
+    # the round is gated on its NOISIEST judge: a floor is only as clean as its worst reader
+    noise = max(noises.values(), key=lambda n: float(getattr(n, "max_kl", 0.0) or 0.0))
     out.noise = noise.as_dict()
+
+    def _score(runner):
+        """Generate the submission's answers once; every judge reads them."""
+        steps = continuation(runner, [x.prefix for x in usable], max_step_tokens)
+        return _combine({j: score_submission(shared_by[j], runner, observers[j],
+                                             max_step_tokens=max_step_tokens, miner_steps=steps)
+                         for j in judges}, steps)
 
     # 4b. IDENTITY CANARY — strictly stronger than the noise probe, and it caught a box the noise
     #     probe passed. The parent scored against itself must be exactly 1.0 by construction; an
@@ -468,12 +542,11 @@ def run_observer_round(
         # to load, and now a runtime raised mid-generation. Whatever the cause, the blast radius has
         # to be one submission. The reason is recorded against that miner rather than swallowed.
         try:
-            ms = score_submission(shared, runner, observer, max_step_tokens=max_step_tokens)
+            ms = _score(runner)
             if sub.model_id == probe_id:
                 _tick("determinism canary", f"re-scoring {sub.miner[:12]}… to check the student "
                                             f"path reproduces", force=True)
-                again = score_submission(shared, runner, observer,
-                                         max_step_tokens=max_step_tokens)
+                again = _score(runner)
                 drift, where = _determinism_drift(ms, again)
                 out.determinism = {"model_id": sub.model_id, "first": round(ms.score, 6),
                                    "second": round(again.score, 6),
@@ -516,14 +589,16 @@ def run_observer_round(
         _b = d_bits.get(sub.model_id)
         s.code_bits = float(getattr(_b, "code_bits", 0.0) or 0.0)
         s.container_bits = float(getattr(_b, "container_bits", 0.0) or 0.0)
-        s.steps = _freeze(ms, runner, usable, max_step_tokens)
+        # one answer per item, repeated per judge so the record keeps steps aligned to points
+        item_steps = _freeze(ms, runner, usable, max_step_tokens)
+        s.steps = item_steps * len(judges)
         # IS THIS OUTPUT LANGUAGE AT ALL. `degeneracy_flags` was imported by this module and never
         # called — `round_engine` and `axis_round` both gate on it, the live v2 path did not. So
         # round 2's ternary tier took four entries, three of them token soup, and only one miner
         # uploading a working model kept `retention_lb > 0.02` from crowning a broken quantiser.
         # Retention cannot refuse that on its own: soup still shifts an observer's distribution a
         # little, and a little is all the floor ever asked for.
-        deg_ok, dflags = degeneracy_flags(s.steps)
+        deg_ok, dflags = degeneracy_flags(item_steps)
         if not deg_ok:
             s.gates_ok = False
             s.reasons.extend(dflags)
@@ -537,7 +612,7 @@ def run_observer_round(
                            f"gates={'ok' if s.gates_ok else 'REJECTED'}", force=True)
         scored[sub.model_id] = s
         by_tier.setdefault(sub.tier, []).append(s)
-        out.scores[sub.model_id] = ms.as_dict()
+        out.scores[sub.model_id] = {**ms.as_dict(), "judges": getattr(ms, "judge_scores", {})}
         # EVERYTHING THAT NEEDED THIS RUNNER HAS RUN: scoring, the capability canary, and the
         # freeze. Release it unless it is a reigning king's, and never let cleanup raise — a
         # failed close would turn a scored submission into a rejected one.
@@ -552,7 +627,7 @@ def run_observer_round(
     for ref_name, ref_tier, ref_runner, ref_uri in (references or []):
         _tick("reference", f"{ref_name} tier={ref_tier}", force=True)
         try:
-            rms = score_submission(shared, ref_runner, observer, max_step_tokens=max_step_tokens)
+            rms = _score(ref_runner)
         except Exception as e:
             out.events.append({"round": round_no, "action": "reference_failed", "tier": ref_tier,
                                "name": ref_name,
@@ -566,7 +641,7 @@ def run_observer_round(
                     gates_ok=True, per_axis=dict(rms.slice_samples))
         rs.role = "reference"
         rs.artifact_uri = ref_uri
-        rs.steps = _freeze(rms, ref_runner, usable, max_step_tokens)
+        rs.steps = _freeze(rms, ref_runner, usable, max_step_tokens) * len(judges)
         rs.effects = _effects(rms)
         scored[rid] = rs          # into the RECORD...
         # ...and deliberately NOT into by_tier. That omission is the whole safety property.
@@ -586,7 +661,7 @@ def run_observer_round(
                 tournament.kings[t.name].reign += 1
                 continue
             _tick("incumbent re-score", f"tier {t.name} king {king.model_id[:12]}…", force=True)
-            kms = score_submission(shared, kr, observer, max_step_tokens=max_step_tokens)
+            kms = _score(kr)
             if kms.score <= MIN_CROWN_LB or kms.reasons:
                 out.events.append({"tier": t.name, "round": round_no, "action": "vacate",
                                    "king": king.model_id, "score": round(kms.score, 5),
@@ -610,7 +685,7 @@ def run_observer_round(
                 king_scored.effects = _effects(kms)
                 # the incumbent's steps must be frozen too, or L2 can re-derive only one side of
                 # a paired comparison — and the dethrone margin is the number that moves emission
-                king_scored.steps = _freeze(kms, kr, usable, max_step_tokens)
+                king_scored.steps = _freeze(kms, kr, usable, max_step_tokens) * len(judges)
                 scored[f"{king.model_id}#incumbent"] = king_scored
         ev = tournament.consider(t.name, by_tier.get(t.name, []), king_scored)
         # A crown has to remember WHERE ITS BYTES ARE. Tournament.consider() mints a King from the
@@ -624,7 +699,11 @@ def run_observer_round(
                 nk.manifest_root = getattr(src, "manifest_root", "")
         # NOISE GATE: a dethrone whose margin sits inside the measured floor is not a result.
         if ev.get("action") == "dethrone" and king_scored is not None:
-            ok_margin, why = crownable(ev.get("margin_lcb", 0.0), noise, noise_safety)
+            # GATED ON THE LEAD, the statistic that decided the crown. Gating on the bootstrap bound
+            # would silently roll back a dethrone that cleared the point margin whenever its bound
+            # sat at or under the floor — the rule changing between the decision and the record.
+            ok_margin, why = crownable(ev.get("lead", ev.get("margin_lcb", 0.0)), noise,
+                                       noise_safety)
             if not ok_margin:
                 tournament.kings[t.name] = king          # roll the dethrone back
                 ev = {"tier": t.name, "round": round_no, "action": "hold",
@@ -643,10 +722,13 @@ def run_observer_round(
     # not have to reproduce batched greedy generation (the noisiest part of the round, and the
     # part the zero-noise measurement never covered) — only the observer's distributions over
     # text the record hands it.
-    pts = [{"rollout_id": s.traj_id, "k": 0, "mode": "observer_kl",
-            "prefix_sha256": _sha(s.prefix), "parent_step": s.parent_step,
-            "continuation": s.continuation, "d_parent": round(s.d_parent, 6)}
-           for s in usable]
+    # One point per (judge, item), judge-major, matching the order effects and steps are written in.
+    # A multi-judge point names its judge; a single-judge record is byte-for-byte the old shape.
+    pts = [dict({"rollout_id": x.traj_id, "k": 0, "mode": "observer_kl",
+                 "prefix_sha256": _sha(x.prefix), "parent_step": x.parent_step,
+                 "continuation": x.continuation, "d_parent": round(x.d_parent, 6)},
+                **({"observer": j} if len(judges) > 1 else {}))
+           for j in judges for x in shared_by[j] if x.usable]
     manifest = {
         "corpus_spec": corpus_spec,
         # The pool's digest lives in the SIGNED body. corpus_spec names the sources; this pins the
@@ -658,6 +740,10 @@ def run_observer_round(
         "exam_dropped": list(out.exam_dropped),
         "observer": obs_name,
         "observer_pool": sorted(observers),
+        # every judge that scored this round and how their scores combine into the crown metric
+        "observers_scored": list(judges),
+        "judge_aggregate": "mean_of_worst_slice" if len(judges) > 1 else "single",
+        "noise_by_judge": {j: n.as_dict() for j, n in noises.items()},
         "parent": parent_id,
         "max_step_tokens": max_step_tokens,
         "max_cont_tokens": max_cont_tokens,
@@ -668,7 +754,8 @@ def run_observer_round(
         "versions": _versions(),
     }
     out.record = build_round_record(round_no, commit_root, round_nonce, parent_id,
-                                    f"observer:{obs_name}", "unconditioned",
+                                    (f"observer:{obs_name}" if len(judges) == 1
+                                     else "observers:" + "+".join(judges)), "unconditioned",
                                     f"trajectories:{len(usable)}", pts, scored, out.events,
                                     out.weights, manifest=manifest, noise=out.noise,
                                     safety=noise_safety, prev_anchor=prev_anchor,
