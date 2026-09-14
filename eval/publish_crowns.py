@@ -158,7 +158,7 @@ tags: [gguf, quantized, compression, bittensor]
 
 # Ralph crowns — Qwen3-8B
 
-The **reigning crowned compressions** from [Bittensor netuid 40](https://github.com/RalphLabsAI/ralph-v2),
+The **reigning crowned compressions** from [Bittensor netuid 40](https://github.com/RalphLabsAI/ralph),
 one file per bit tier. Every round re-scores the incumbents against a fresh exam; when a crown
 changes hands, the file here changes with it.
 

@@ -26,7 +26,7 @@ def render(*, model_id: str, parent: str, parent_params: int, tier: str,
            density: Density, miner: str, round_no: int,
            record_url: str = "", artifact_uri: str = "",
            observer: str = "", languages: dict | None = None,
-           benchmarks: list | None = None, repo: str = "RalphLabsAI/ralph-v2") -> str:
+           benchmarks: list | None = None, repo: str = "RalphLabsAI/ralph") -> str:
     """`benchmarks` is a list of dicts with model/company/size_gb/avg — including competitors.
 
     Left EMPTY until absolute benchmarks have actually been run. An empty table says so out loud

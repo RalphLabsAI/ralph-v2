@@ -20,7 +20,7 @@ refused before any weights load.
 You compress privately, however you like. The subnet never inspects your method, only your artifact.
 
 ```bash
-git clone https://github.com/RalphLabsAI/ralph-v2 && cd ralph-v2
+git clone https://github.com/RalphLabsAI/ralph && cd ralph
 pip install -r requirements.txt
 
 # 1. compress Qwen/Qwen3-8B however you want — GPTQ, AWQ, bitsandbytes, your own scheme.
