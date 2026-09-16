@@ -188,8 +188,21 @@ def score_submission(shared: Sequence[SharedSample], miner: Stepper, observer: O
     return ms
 
 
+# THE ALLOCATION RULE IS PART OF THE EXAM, so the record names it. The remainder of a stratified
+# draw was shared in proportion to stratum size until 2026-08-31 and levelled up to the smallest
+# stratum after; both are deterministic in the nonce, but they draw DIFFERENT exams from the same
+# entropy. An audit that knew only the current rule re-derived a different selection for every
+# earlier round and reported "the operator, not the nonce, chose the exam" — a signed accusation
+# over a rule change. A record produced now carries `selection_rule`, so a future change is a
+# new name rather than a silent break; `eval/rerun.py` reads the name and re-runs that rule.
+SELECTION_RULE = "stratified-level-up"
+LEGACY_SELECTION_RULE = "stratified-proportional"     # rounds drawn before 9bec1ed
+SELECTION_RULES = (SELECTION_RULE, LEGACY_SELECTION_RULE)
+
+
 def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
-                        tag: str = "observer-items", min_per_lang: int = 10):
+                        tag: str = "observer-items", min_per_lang: int = 10,
+                        rule: str = SELECTION_RULE):
     """Draw WHICH trajectories are scored from POST-COMMIT entropy, STRATIFIED BY LANGUAGE.
 
     This closes the largest hole in the crown path. `run_observer_round` used to accept a trajectory
@@ -219,6 +232,9 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
     the corpus spec that produced the pool — an index is only meaningful against a known,
     revision-pinned ordering."""
     import random as _r
+
+    if rule not in SELECTION_RULES:
+        raise ValueError(f"unknown selection rule {rule!r}; known: {list(SELECTION_RULES)}")
 
     # THE EXAM IS CLAMPED AT POOL-BUILD TIME (eval/pool.py), not here. It used to be filtered here
     # by CHARACTER length, which was wrong twice over: measured on the real pool it deleted 267 of
@@ -308,8 +324,12 @@ def select_trajectories(pool, commit_root: str, round_nonce: str, n: int,
         room = [l for l in langs if alloc[l] < len(by_lang[l])]
         if not room:
             break
-        low = min(alloc[l] for l in room)
-        pick = rng.choice([l for l in room if alloc[l] == low])
+        if rule == LEGACY_SELECTION_RULE:
+            # the pre-9bec1ed split: the remainder went where the pool was largest
+            pick = rng.choices(room, weights=[len(by_lang[l]) for l in room], k=1)[0]
+        else:
+            low = min(alloc[l] for l in room)
+            pick = rng.choice([l for l in room if alloc[l] == low])
         alloc[pick] += 1
         remaining -= 1
 

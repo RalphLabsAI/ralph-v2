@@ -511,19 +511,43 @@ def load_pool(path: str):
 
 def audit_selection(rec, pool, a: Audit) -> list:
     """Re-derive the exam from post-commit entropy. Returns the reconstructed items."""
-    from .observer_round import select_trajectories
+    from .observer_round import (LEGACY_SELECTION_RULE, SELECTION_RULE, SELECTION_RULES,
+                                 select_trajectories)
     man = rec.manifest or {}
     claimed = list(man.get("item_indices") or [])
     if not claimed:
         a.add("L1", "item selection", FAIL, "record does not say which items were scored")
         return []
     n_req = int(man.get("n_items_requested") or len(claimed))
-    items, idx = select_trajectories(pool, rec.commit_root, rec.round_nonce, n_req)
+    # WHICH RULE. A record names the allocation rule its draw used; an unknown name is a FAIL, not
+    # a guess. A record that names none is placed by its shape: one that already accounts its
+    # drops (`exam_dropped`) postdates the rule change and gets the current rule only; one older
+    # than that predates the change too, and either rule may reproduce it — a one-bit freedom that
+    # exists for four published rounds and for no record an operator can still produce, since the
+    # loop now always writes the name.
+    named = man.get("selection_rule")
+    if named:
+        if named not in SELECTION_RULES:
+            a.add("L1", "item selection derives from the nonce", FAIL,
+                  f"record names selection rule {named!r}, which this auditor does not know "
+                  f"(known: {list(SELECTION_RULES)}) — upgrade, or the record is not honest")
+            return []
+        candidates, why = [named], f"rule {named} (named by the record)"
+    elif "exam_dropped" in man:
+        candidates, why = [SELECTION_RULE], f"rule {SELECTION_RULE} (record names none; current rule assumed)"
+    else:
+        candidates = [SELECTION_RULE, LEGACY_SELECTION_RULE]
+        why = "legacy record (predates the selection_rule tag): rule inferred"
+    items, idx, used = [], [], candidates[0]
+    for used in candidates:
+        items, idx = select_trajectories(pool, rec.commit_root, rec.round_nonce, n_req, rule=used)
+        if list(idx) == claimed:
+            break
     same_sel = list(idx) == claimed
     a.ok("L1", "item selection derives from the nonce", same_sel,
          fail=f"re-derived {list(idx)[:6]}… but the record claims {claimed[:6]}… — "
-              f"the operator, not the nonce, chose the exam",
-         info=f"re-derived all {len(idx)} indices from commit_root‖nonce")
+              f"the operator, not the nonce, chose the exam (tried {candidates})",
+         info=f"re-derived all {len(idx)} indices from commit_root‖nonce under {used}; {why}")
 
     # NO PRUNING. Checking only that every scored point is IN the drawn selection is one-sided: the
     # operator can simply drop the items their model did badly on and every remaining point still

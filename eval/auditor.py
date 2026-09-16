@@ -834,7 +834,7 @@ def preflight(cfg: AuditorConfig, out=sys.stdout) -> list:
         try:
             import bittensor  # noqa: F401
         except Exception as e:
-            bad.append(f"--set-weights needs bittensor>=10.5,<11: {e}")
+            bad.append(f"--set-weights needs bittensor>=11.1,<12 (requirements-chain.txt): {e}")
     try:
         import huggingface_hub  # noqa: F401
     except Exception:

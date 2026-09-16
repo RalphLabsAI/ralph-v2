@@ -29,7 +29,8 @@ from .economics import RegistrationLedger
 from .gates import TierBudget, degeneracy_flags
 from .intake import intake
 from .koth import MIN_CROWN_LB, Scored, Submission, Tier, Tournament
-from .observer_round import build_shared, pick_observer, score_submission, select_trajectories
+from .observer_round import (SELECTION_RULE, build_shared, pick_observer, score_submission,
+                             select_trajectories)
 from .progress import tick as _tick
 from .round_record import RoundRecord, build_round_record
 from .runners import continuation
@@ -737,6 +738,8 @@ def run_observer_round(
         "pool_sha256": _pool_sha(trajectory_pool),
         "item_indices": list(out.item_indices),
         "n_items_requested": n_items,
+        # the allocation rule the draw used, so an auditor re-runs THAT rule (see select_trajectories)
+        "selection_rule": SELECTION_RULE,
         "exam_dropped": list(out.exam_dropped),
         "observer": obs_name,
         "observer_pool": sorted(observers),
