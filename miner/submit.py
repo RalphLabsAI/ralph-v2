@@ -33,6 +33,29 @@ from pathlib import Path
 #      gets published with the model, which would hand everyone the salt.
 STATE_SUFFIX = ".ralph-submission.json"
 
+# ONE SLOT IS THREE FIELDS OF 128 BYTES. The pallet's `Data` variants are RawN for N up to 128,
+# and `MaxFields` on this chain is 3, so a commitment holds at most 384 bytes. A reveal — the
+# committed envelope plus a 64-char content hash and the salt — runs ~350 bytes with a normal
+# `hf://owner/name@sha` locator, and a long repo name pushes it over. The chain would reject that
+# reveal AFTER the commitment had already sealed the bytes, so the reveal-shaped size is checked
+# at commit time, when shortening the repo name still costs nothing.
+RAW_FIELD_BYTES = 128
+MAX_FIELDS = 3
+MAX_SLOT_BYTES = RAW_FIELD_BYTES * MAX_FIELDS
+
+
+def commitment_fields(envelope: str) -> list:
+    """The slot's field list for one envelope: 128-byte Raw chunks, in order. This is the exact
+    layout every reveal already on netuid 40 uses (Raw128 ‖ Raw128 ‖ RawN), and what the validator's
+    `_decode_commitment` concatenates back."""
+    payload = envelope.encode("utf-8")
+    if len(payload) > MAX_SLOT_BYTES:
+        raise ValueError(f"envelope is {len(payload)} bytes but a commitment slot holds "
+                         f"{MAX_SLOT_BYTES} ({MAX_FIELDS} fields x {RAW_FIELD_BYTES}) — shorten "
+                         f"the artifact repo name in --uri")
+    chunks = [payload[i:i + RAW_FIELD_BYTES] for i in range(0, len(payload), RAW_FIELD_BYTES)]
+    return [{f"Raw{len(c)}": c} for c in chunks]
+
 
 def _state_path(ckpt):
     from pathlib import Path as _P
@@ -83,6 +106,16 @@ def cmd_commit(a) -> int:
     cv = commit_value(h, salt)
     env = envelope(a.tier, cv, a.uri, a.compute_h100h, a.bond)
 
+    # The commitment fits by construction; it is the REVEAL that can overflow the slot, and by then
+    # the bytes are sealed. Size the reveal now, with the real hash and salt.
+    body = json.loads(env)
+    body["ch"], body["salt"] = h, salt
+    try:
+        commitment_fields(json.dumps(body, separators=(",", ":"), sort_keys=True))
+    except ValueError as e:
+        print(f"REJECT: the reveal would not fit on chain — {e}")
+        return 1
+
     state = {"content_hash": h, "salt": salt, "commit_value": cv, "tier": a.tier,
              "artifact_uri": a.uri, "envelope": env, "manifest": m.as_dict()}
     sp = _state_path(ckpt)
@@ -114,7 +147,7 @@ def cmd_reveal(a) -> int:
     st = json.loads(sf.read_text())
 
     # Verify the bytes STILL match what was committed, before telling the chain they do.
-    _, _, _, _, content_hash = _load_eval()
+    _, build_envelope, _, _, content_hash = _load_eval()
     now = content_hash(ckpt)
     if now != st["content_hash"]:
         print(f"REFUSING TO REVEAL: the artifact changed since you committed.\n"
@@ -127,7 +160,16 @@ def cmd_reveal(a) -> int:
     # was, so no miner could complete a submission and the validator skipped the seal check on
     # every one. The slot is the only channel a miner has; `cv` stays in the envelope, so the
     # validator still checks H(content_hash‖salt) == cv and a rewritten reveal cannot forge it.
-    env = envelope(st["tier"], st["commit_value"], st["artifact_uri"])
+    # Rebuild the base envelope through the same canonical encoder as commit. Preserve optional
+    # declaration fields from the committed envelope instead of silently dropping them on reveal.
+    committed = json.loads(st.get("envelope") or "{}")
+    env = build_envelope(
+        st["tier"],
+        st["commit_value"],
+        st["artifact_uri"],
+        committed.get("h100h", 0.0),
+        committed.get("bond", 0.0),
+    )
     body = json.loads(env)
     body["ch"], body["salt"] = st["content_hash"], st["salt"]
     revealed = json.dumps(body, separators=(",", ":"), sort_keys=True)
@@ -137,6 +179,9 @@ def cmd_reveal(a) -> int:
     # bittensor SDK is missing) copied the printed shape, and the validator read no reveal at all.
     # One string, the one that is written.
     print(f"reveal envelope ({len(revealed)} bytes) — THIS is what goes on chain:\n  {revealed}")
+    if a.dry_run:
+        print("\n--dry-run: nothing written to chain. Re-run without it to publish.")
+        return 0
     return _write_chain(a, revealed)
 
 
@@ -149,9 +194,26 @@ def _write_chain(a, envelope: str) -> int:
               f"Then publish this string to your hotkey's commitment slot:\n  {envelope}")
         return 2
     try:
-        w = bt.wallet(name=a.wallet, hotkey=a.hotkey)
-        sub = bt.subtensor(network=a.network)
-        sub.set_commitment(wallet=w, netuid=a.netuid, data=envelope)
+        wallet_cls = getattr(bt, "Wallet", None) or bt.wallet
+        subtensor_cls = getattr(bt, "Subtensor", None) or bt.subtensor
+        w = wallet_cls(name=a.wallet, hotkey=a.hotkey)
+        sub = subtensor_cls(network=a.network)
+        if getattr(bt, "calls", None) is not None and hasattr(sub, "submit_call"):
+            # bittensor >= 11: `Subtensor.set_commitment` is gone. An extrinsic is a generated
+            # call submitted with a wallet — and a raw call names no signer role, so the hotkey
+            # has to be said or `resolve_signer` asks for a coldkey that should not be on a
+            # serving box. Same layout the SDK used to write behind `set_commitment`.
+            call = bt.calls.Commitments.set_commitment(
+                a.netuid, {"fields": commitment_fields(envelope)})
+            res = sub.submit_call(call, w, signer="hotkey")
+            ok = bool(getattr(res, "success", getattr(res, "is_success", res)))
+            if not ok:
+                print(f"\ncommit was submitted but not accepted: {res!r}")
+                print(f"Publish manually to your commitment slot:\n  {envelope}")
+                return 3
+        else:
+            commitment_fields(envelope)          # same size rule, whichever SDK writes it
+            sub.set_commitment(wallet=w, netuid=a.netuid, data=envelope)
         print(f"\ncommitted on netuid {a.netuid} as {w.hotkey.ss58_address}")
         return 0
     except Exception as e:
@@ -160,7 +222,15 @@ def _write_chain(a, envelope: str) -> int:
         return 3
 
 
-def main() -> int:
+def _add_chain_args(parser, *, dry_run_help: str) -> None:
+    parser.add_argument("--wallet", default="default")
+    parser.add_argument("--hotkey", default="default")
+    parser.add_argument("--netuid", type=int, default=40)
+    parser.add_argument("--network", default="finney")
+    parser.add_argument("--dry-run", action="store_true", help=dry_run_help)
+
+
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Ralph SN40 v2 miner submission")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -172,19 +242,15 @@ def main() -> int:
     c.add_argument("--salt", default="", help="omit to generate one")
     c.add_argument("--compute-h100h", dest="compute_h100h", type=float, default=0.0)
     c.add_argument("--bond", type=float, default=0.0)
-    c.add_argument("--wallet", default="default")
-    c.add_argument("--hotkey", default="default")
-    c.add_argument("--netuid", type=int, default=40)
-    c.add_argument("--network", default="finney")
-    c.add_argument("--dry-run", action="store_true",
-                   help="compute and print everything, write nothing to chain")
+    _add_chain_args(c, dry_run_help="compute and print everything, write nothing to chain")
     c.set_defaults(fn=cmd_commit)
 
     r = sub.add_parser("reveal", help="publish content_hash + salt after the round opens")
     r.add_argument("--ckpt", required=True)
+    _add_chain_args(r, dry_run_help="print the reveal envelope, write nothing to chain")
     r.set_defaults(fn=cmd_reveal)
 
-    a = p.parse_args()
+    a = p.parse_args(argv)
     return a.fn(a)
 
 
