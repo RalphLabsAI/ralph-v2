@@ -1457,6 +1457,7 @@ def test_gguf_intake():
     from eval.gates import inspect_checkpoint
     from eval.gguf import GGML_TYPES, read_gguf, type_bits
     from eval.identity import HASHED_SUFFIXES, content_hash
+    from eval.publish_crowns import artifact_metadata
 
     # published block layouts must give the published widths
     assert type_bits(8) == 8.5, "Q8_0 != 8.5 bpw"
@@ -1469,14 +1470,17 @@ def test_gguf_intake():
     # and make a post-commit swap free — the two lists must move together.
     assert ".gguf" in HASHED_SUFFIXES, "gguf allowed at intake but excluded from the identity hash"
 
-    def write_gguf(path, tensors, arch="qwen2"):
-        """Minimal valid GGUF: magic, version, counts, one metadata string, tensor table."""
+    def write_gguf(path, tensors, arch="qwen2", chat_template=None):
+        """Minimal valid GGUF: magic, version, string metadata, tensor table."""
+        metadata = [("general.architecture", arch)]
+        if chat_template is not None:
+            metadata.append(("tokenizer.chat_template", chat_template))
         out = bytearray(b"GGUF" + struct.pack("<I", 3))
-        out += struct.pack("<QQ", len(tensors), 1)
-        k = b"general.architecture"
-        out += struct.pack("<Q", len(k)) + k + struct.pack("<I", 8)
-        v = arch.encode()
-        out += struct.pack("<Q", len(v)) + v
+        out += struct.pack("<QQ", len(tensors), len(metadata))
+        for key, value in metadata:
+            k, v = key.encode(), value.encode()
+            out += struct.pack("<Q", len(k)) + k + struct.pack("<I", 8)
+            out += struct.pack("<Q", len(v)) + v
         for name, (dims, tt) in tensors.items():
             nb = name.encode()
             out += struct.pack("<Q", len(nb)) + nb
@@ -1492,10 +1496,15 @@ def test_gguf_intake():
             "blk.0.ffn_down.weight": ((4096, 4096), 35),
             "output.weight": ((4096, 4096), 1),
             "blk.0.attn_norm.weight": ((4096,), 0),      # 1-D: the negligible tail, excluded
-        })
+        }, chat_template="{{ messages }}")
         gi = read_gguf(Path(d) / "model.gguf")
         assert gi.ok, gi.reasons
         assert gi.arch == "qwen2" and gi.n_tensors == 4
+        assert gi.chat_template_present is True
+        meta = artifact_metadata(str(Path(d) / "model.gguf"), "crown.gguf")
+        assert meta["filename"] == "crown.gguf"
+        assert meta["file_bytes"] == (Path(d) / "model.gguf").stat().st_size
+        assert len(meta["file_sha256"]) == 64 and meta["chat_template_present"] is True
         # (2 x 1.6875... no: TQ2_0 = 2.0625) two ternary tensors + one fp16 head
         expect = (2 * 2.0625 + 16.0) / 3
         assert abs(gi.bits_per_weight - expect) < 1e-3, f"{gi.bits_per_weight} != {expect}"
@@ -3254,25 +3263,37 @@ def test_density_and_model_card_are_derived_not_asserted():
     # ---- the card ----
     card = render(model_id="RalphLabsAI/Qwen3-8B-ternary", parent="Qwen/Qwen3-8B",
                   parent_params=P, tier="ternary", density=d, miner="hot1", round_no=7,
-                  observer="qwen1.5b", languages={"en": 30, "hi": 12, "zh": 12},
-                  record_url="https://example/record.json")
+                  observers=["judge-a", "judge-b", "judge-c"],
+                  languages={"en": 30, "hi": 12, "zh": 12},
+                  record_url="https://example/record.json", filename="ternary.gguf",
+                  chat_template_present=True)
 
     # their structure, adopted deliberately: functional headline, three ratios, quickstart BEFORE
     # benchmarks, density section, stated limitations
-    for section in ("## Quickstart", "## Model overview", "## Intelligence density",
-                    "## Benchmarks", "## How this was scored", "## Limitations"):
+    for section in ("## Quickstart", "## Model overview", "## Recorded fidelity per GB",
+                    "## Benchmarks", "## How this was scored", "## What the audit levels",
+                    "## Limitations"):
         assert section in card, section
     assert card.index("## Quickstart") < card.index("## Benchmarks"), \
         "quickstart must precede benchmarks — you can run it before you argue about it"
-    assert "architecture unchanged" in card
-    assert "not a smaller model trained to imitate" in card
+    assert "hf download RalphLabsAI/Qwen3-8B-ternary ternary.gguf" in card
+    assert "./Qwen3-8B-ternary/ternary.gguf" in card
+    assert "-cnv --jinja" in card
+    assert "pipeline_tag: text-generation" in card and "base_model: Qwen/Qwen3-8B" in card
 
     # the honesty rules that must survive contact with a marketing surface
-    assert "have not been run" in card, "an unmeasured benchmark table must say so out loud"
-    assert "saturates on badly damaged models" in card, "the known limitation must ship with it"
+    assert "have not been supplied" in card, "an unmeasured benchmark table must say so out loud"
+    assert "saturate" in card, "the known limitation must ship with it"
     # assert the word, not the formatting — the card renders it as *not* interchangeable and a
     # literal match on the phrase breaks the moment someone adjusts the emphasis
     assert "interchangeable" in card, "retention must not be passed off as absolute capability"
+    assert "All 3 recorded judges" in card and "arithmetic mean" in card
+    assert "point-estimate lead" in card and "paired bootstrap lower confidence bound" in card
+    assert all(f"**L{i}**" in card for i in range(4))
+    assert "not cryptographic proof" in card
+    assert "license: other" in card and "license: apache-2.0" not in card
+    assert "runs on llama.cpp and MLX" not in card and "On iPhone" not in card
+    assert "Independent judge" not in card
     assert "Retention says nothing about how good the parent was" in card
     assert "worst-slice" in card and "hi 12" in card
     assert "python -m eval.rerun" in card, "the card must tell you how to check it"
@@ -4996,6 +5017,138 @@ def test_a_published_crown_merges_the_two_rows_a_held_throne_leaves():
                               "retention": 0.24, "code_bits": 1.714, "container_bits": 2.36,
                               "params": 1, "artifact_uri": "hf://a/b@c"}]}
     assert current_kings(fresh)["ternary"]["code_bits"] == 1.714
+
+
+def test_crown_publication_metadata_and_copy_are_evidence_bounded():
+    """A metadata repair is not a new crown, and a release must become visible atomically.
+
+    Incumbents are re-scored every round. Replacing the old crown round/retention with that later
+    re-score during a metadata backfill fabricates a transition. The model card has a second class
+    of failure: its old static copy asserted licenses and device/runtime behavior that no round
+    measured. Guard both paths together because the manifest is the card's only data source.
+    """
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from eval.publish_crowns import (commit_release, manifest_entry, needs_metadata_refresh,
+                                     readme)
+    from eval.model_card import from_record
+    import eval.publish_crowns as pc
+
+    # The manifest is read at the resolved head that later guards the atomic commit, not at a
+    # mutable `main` ref independently of that guard.
+    real_get = pc._get
+    seen = []
+    try:
+        def fake_get(url):
+            seen.append(url)
+            return {"sha": "resolved-head"} if "/api/models/" in url else {"ternary": {}}
+
+        pc._get = fake_get
+        loaded, head = pc.published_state("org/crowns")
+        assert head == "resolved-head" and loaded == {"ternary": {}}
+        assert any("/resolve/resolved-head/crowns.json" in u for u in seen)
+    finally:
+        pc._get = real_get
+
+    previous = {
+        "model_id": "same", "tier": "ternary", "round": 5, "retention": 0.253732,
+        "miner": "original-miner", "source_repo": "miner/original", "source_revision": "abc",
+        "code_bits": 1.714, "container_bits": 2.3986,
+        "record": "https://example/round-5.json",
+    }
+    sub = {
+        "model_id": "same", "tier": "ternary", "retention": 0.239685,
+        "miner": "original-miner", "artifact_uri": "hf://miner/original@abc",
+        "code_bits": 1.714, "container_bits": 2.3986,
+    }
+    meta = {"filename": "ralph-qwen3-8b-ternary.gguf", "file_bytes": 2_477_212_736,
+            "file_sha256": "a" * 64, "chat_template_present": True}
+    assert needs_metadata_refresh(previous, meta["filename"])
+    refreshed = manifest_entry(tier="ternary", sub=sub, round_no=7,
+                               record_url="https://example/round-7.json",
+                               metadata=meta, previous=previous)
+    # Only direct GGUF metadata moves. The later re-score remains in round 7, not in the crown row.
+    for key in ("round", "retention", "record", "source_repo", "source_revision"):
+        assert refreshed[key] == previous[key], (key, refreshed)
+    assert all(refreshed[k] == v for k, v in meta.items())
+    assert not needs_metadata_refresh(refreshed, meta["filename"])
+
+    new = dict(sub, model_id="new", artifact_uri="hf://miner/new@def", retention=0.3)
+    crowned = manifest_entry(tier="ternary", sub=new, round_no=7,
+                             record_url="https://example/round-7.json", metadata=meta,
+                             previous=previous)
+    assert crowned["round"] == 7 and crowned["retention"] == 0.3
+    assert crowned["source_repo"] == "miner/new" and crowned["source_revision"] == "def"
+
+    manifest = {"ternary": refreshed}
+    record = {"manifest": {"observers_scored": ["judge-a", "judge-b", "judge-c"]}}
+    card = readme(manifest, "https://example/round-7.json", "org/crowns", record=record)
+    assert "license: other" in card and "license: apache-2.0" not in card
+    assert "pipeline_tag: text-generation" in card and "base_model: Qwen/Qwen3-8B" in card
+    assert "conversational" in card, "PocketPal only discovers GGUF repos with this tag"
+    # Exact per-file commands, not a glob or a guessed default.
+    assert "hf download org/crowns ralph-qwen3-8b-ternary.gguf" in card
+    assert "./ralph-crowns/ralph-qwen3-8b-ternary.gguf" in card
+    assert "-cnv --jinja" in card
+    assert "All 3 recorded judges" in card and "arithmetic mean" in card
+    assert "point-estimate lead" in card and "lower confidence bound is a separate rule" in card
+    assert all(f"**L{i}**" in card for i in range(4))
+    assert "do **not**\ncryptographically prove" in card
+    for unsupported in ("On iPhone", "MLX", "tokens/s", "fit comfortably"):
+        assert unsupported not in card, unsupported
+
+    # A held throne has separate rows for the incumbent re-score and the original measured bit
+    # metadata. The single-artifact renderer must merge them just like the crown mirror does.
+    P = 8_190_735_360
+    held = SimpleNamespace(
+        round=7,
+        events=[{"tier": "ternary", "action": "hold", "king": "same"}],
+        submissions=[
+            SimpleNamespace(model_id="same", role="challenger", tier="ternary",
+                            retention=0.25, miner="m", params=P, code_bits=1.714,
+                            container_bits=2.3986, artifact_uri="hf://miner/original@abc"),
+            SimpleNamespace(model_id="same", role="incumbent", tier="ternary",
+                            retention=0.20, miner="m", params=0, code_bits=0.0,
+                            container_bits=0.0, artifact_uri=""),
+        ],
+        manifest={"observers_scored": ["a", "b", "c"]},
+    )
+    held_card = from_record(held, "org/one-crown", "Qwen/Qwen3-8B", P,
+                            tier="ternary", filename="one.gguf")
+    assert "20.0% recorded fidelity" in held_card
+    assert "1.71** code bits · 2.40 container bits" in held_card
+    assert "hf://miner/original@abc" in held_card
+    assert "llama-cli" not in held_card, "unknown chat metadata must not produce a chat command"
+
+    no_chat = {"ternary": dict(refreshed, chat_template_present=False)}
+    no_chat_card = readme(no_chat, "https://example/round-7.json", "org/crowns", record=record)
+    assert "hf download org/crowns ralph-qwen3-8b-ternary.gguf" in no_chat_card
+    assert "llama-cli" not in no_chat_card
+    assert "does not print a canonical chat command" in no_chat_card
+
+    class FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        def create_commit(self, **kwargs):
+            self.calls.append(kwargs)
+            return kwargs
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "crown.gguf"
+        p.write_bytes(b"GGUF bytes are passed through, never repacked")
+        api = FakeApi()
+        commit_release(api, repo="org/crowns", staged=[("ternary", str(p), meta["filename"])],
+                       manifest=manifest, card=card, round_no=7, parent_commit="head-sha")
+        assert len(api.calls) == 1, "weights/card/manifest must advance the Hub ref once"
+        call = api.calls[0]
+        assert call["parent_commit"] == "head-sha"
+        assert {op.path_in_repo for op in call["operations"]} == {
+            meta["filename"], "crowns.json", "README.md"}
+        weight = next(op for op in call["operations"] if op.path_in_repo == meta["filename"])
+        assert weight.path_or_fileobj == str(p), "publication must pass through the original bytes"
 
 
 def test_preflight_actually_runs():

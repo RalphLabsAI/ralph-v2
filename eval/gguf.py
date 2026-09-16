@@ -69,8 +69,10 @@ GGML_TYPES: dict[int, tuple[str, int, int]] = {
     # llama.cpp's own `ggml.h` / `ggml-common.h`, not inferred from the names:
     #   block_q1_0 = ggml_half + QK1_0/8 bytes over QK1_0=128 elems -> 18*8/128 = 1.125 bpw
     #   block_q2_0 = ggml_half + QK2_0/4 bytes over QK2_0=64  elems -> 18*8/64  = 2.25  bpw
-    41: ("Q1_0",   128, 18),      # 1.125 bpw — PrismML's format; needs THEIR fork to run
-    42: ("Q2_0",    64, 18),      # 2.25 bpw — mainline llama.cpp + Metal. The phone-native one.
+    # Runtime support for these newer formats is build- and backend-specific. Intake measures
+    # their bytes here; it does not make a universal device-compatibility claim.
+    41: ("Q1_0",   128, 18),      # 1.125 bpw
+    42: ("Q2_0",    64, 18),      # 2.25 bpw
 }
 
 _NON_WEIGHT = ("norm", "bias", "_scale", "rope_freqs")
@@ -118,6 +120,9 @@ class GGUFInfo:
     weight_type_hist: dict = field(default_factory=dict)   # weight-bearing elements per ggml type
     file_bytes: int = 0
     arch: str = ""
+    # Presence of GGUF's standard tokenizer chat-template metadata. This says only that a
+    # template was embedded; it does not certify that a particular runtime can execute it.
+    chat_template_present: bool = False
     type_hist: dict = field(default_factory=dict)
     reasons: list = field(default_factory=list)
 
@@ -169,6 +174,11 @@ def read_gguf(path) -> GGUFInfo:
                 val = _skip_value(f, vtype)
                 if key == "general.architecture" and isinstance(val, str):
                     info.arch = val
+                if key == "tokenizer.chat_template":
+                    # Record key presence rather than interpreting the Jinja. An empty or invalid
+                    # template is still metadata a publisher should report accurately, and
+                    # runtime compatibility remains a separate test.
+                    info.chat_template_present = True
 
             bits_total, code_total, params = 0.0, 0.0, 0
             for _ in range(n_tensors):
