@@ -1,0 +1,3 @@
+# Contributor test runner. Runtime-only and chain/GPU dependencies remain split deliberately.
+-r requirements.txt
+pytest>=8,<10

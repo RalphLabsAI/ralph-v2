@@ -1,76 +1,92 @@
 # Mining SN40 v2 — how to participate
 
-You compress a pinned teacher (GLM) into a small student that keeps as much of the
-teacher's behavior as possible, and submit that student. The best student in each size
-tier wears the crown; every crown is published as a downloadable open model.
+Compress the pinned `Qwen/Qwen3-8B` parent into a lower-bit representation without changing its
+architecture. Ralph evaluates the artifact in one of four bit-budget tiers, and each tier's current
+crown is published as a downloadable model.
+
+Ralph's observer-KL score measures how closely a compressed model preserves the parent's downstream
+effect on the configured judges. It is a retention metric, **not** a capability benchmark.
 
 ## What you submit
 
-A **student checkpoint** — a smaller/quantized model — in **safetensors only**. Anything
-else is rejected before it's loaded:
+A content-addressed checkpoint in **GGUF or safetensors**:
 
-- **No `*.py`, no pickles (`.bin`/`.pt`), no tokenizer `auto_map`.** The validator loads
-  your weights with `trust_remote_code=False`, always. A pickle is arbitrary code
-  execution on load; it's an automatic reject, not a warning.
-- **Params, bits and dtype are recomputed from your actual tensors** — never from what
-  you declare. Shipping the teacher behind a small decoy, or under-declaring your size,
-  fails the tier gate.
-- **Size/bit tier**: you submit into a tier (e.g. sub-1B / sub-3B, or a 4-bit / 2-bit
-  budget). Your checkpoint must actually fit it.
+- No `*.py`, pickle weights (`.bin`/`.pt`), or tokenizer `auto_map`. Safetensors load with
+  `trust_remote_code=False`; GGUF uses the constrained runner.
+- Parameter count, code bits, container bits, and architecture identity are recomputed from the
+  served artifact. Declarations and filenames do not decide intake.
+- The artifact must match the pinned parent's architecture and weight-element count.
+- GGUF formats without the required mainline Metal kernels (`TQ1_0` and `TQ2_0`) are refused. This
+  is a format-compatibility rule, not a device-performance claim.
 
-## How you're scored
+The current tier caps are:
 
-Not on imitating the teacher's *style* — on doing what the teacher *does*.
+| tier | code bits/weight | container bits/weight |
+|---|---:|---:|
+| `binary` | 1.15 | 2.5 |
+| `ternary` | 1.75 | 2.5 |
+| `sub2` | 2.3 | 3.0 |
+| `sub4` | 4.0 | 5.0 |
 
-The validator samples states from a large pile of agentic trajectories, has the pinned
-GLM take its genuine next step from each state, and asks a grounded judge (a different
-model) whether *your* student's step did the same thing. That agreement, normalized
-against a pinned base model, is your retention. Two properties to know:
+Run the same bit inspector as the validator before committing:
 
-- **A slice is scored from the states your student itself reaches** (not just the
-  teacher's), so a student that imitates locally but drifts when it runs on its own is
-  caught.
-- **The crown moves only on a strict improvement past a noise-floor margin**, measured on
-  the same fresh points as the reigning king. A copy of the king ties, and a tie earns
-  nothing — copying is not a strategy.
+```bash
+python -m eval.bitrate path/to/model.gguf
+```
 
-Train however you like — quantization-aware training, on-policy distillation, SFT on
-teacher traces, whatever wins. The reward only counts what the student can do; we don't
-pay for resemblance.
+## How scoring works
 
-## Submitting
+The post-commit round nonce selects a fresh set of trajectory items. For each item, the parent and
+the submitted model produce a step. Three configured judges then measure how each step changes
+their distribution over the same continuation:
+
+- `HuggingFaceTB/SmolLM2-1.7B-Instruct`
+- `microsoft/Phi-3-mini-4k-instruct`
+- `allenai/OLMo-2-1124-7B-Instruct`
+
+Each judge scores every item. The displayed retention is the mean of the judges' worst-slice scores
+over language and trajectory depth. The reigning king is re-scored on the same exam. A challenger
+must clear the published point-margin or persistence rule without putting any slice below the
+incumbent's floor; exact copies tie and cannot dethrone.
+
+## Package and submit
 
 ```python
 from miner.package import build_submission
+import secrets
 
 sub = build_submission(
-    ckpt_dir="my_student/",           # safetensors + config + tokenizer
-    tier="sub-1B",
-    teacher_pair="glm4-9b/qwen2.5-0.5b",   # the pinned (teacher, base) pair
-    student_base="Qwen/Qwen2.5-0.5B",
-    declared_compute_h100h=180.0,     # generation + training + scoring + rollout
-    salt="<random secret>",
+    ckpt_dir="my_qwen3_compression/",       # GGUF or safetensors + config/tokenizer
+    tier="sub2",                            # binary | ternary | sub2 | sub4
+    teacher_pair="qwen3-8b",
+    student_base="Qwen/Qwen3-8B",
+    declared_compute_h100h=42.0,
+    salt=secrets.token_hex(16),              # keep secret until reveal
 )
-# 1. commit sub["commit_value"] on-chain now (seals your content hash, orders discovery)
-# 2. upload the checkpoint dir
-# 3. reveal sub["reveal"] after the round opens
+
+# 1. Commit sub["commit_value"] on chain before the round nonce exists.
+# 2. Publish the exact artifact and record its immutable artifact_uri.
+# 3. Reveal sub["reveal"] after the round opens.
 ```
 
-`build_submission` runs the validator's own intake inspector first, so you see the exact
-params/bits the validator will re-derive — no surprises at scoring.
+`build_submission` runs the validator's intake inspector and hashes the complete served directory.
+After upload, download the exact immutable revision and confirm that its directory hash matches the
+one you committed; extra or changed files cause a commit-reveal rejection.
 
-## Economics
+Admission is one artifact per `(coldkey, tier)` per round, and an artifact already scored in the
+public trail is skipped. The old resubmission-bond accounting remains disabled (`base_bond=0`)
+because no on-chain escrow/refund extrinsic exists.
 
-- **One free eval per registration.** Extra submissions in an epoch cost a **bond**,
-  refunded if the submission improves your own best score, forfeit otherwise — so
-  best-of-N grinding costs you and honest iteration doesn't.
-- **Per-coldkey round cap** bounds how many submissions one operator runs per round.
-- **Declared compute is metered and reconciled** against a throughput envelope;
-  under-declaring is fraud and forfeits the bond.
+For the CLI flow and commit-order details, continue with [`QUICKSTART.md`](QUICKSTART.md).
 
-## The honest state (pre-launch)
+## Public status
 
-The eval mechanism is validated on real models; the subnet is being brought up in
-**shadow mode first** — you can submit and see yourself ranked with no emission at risk —
-then emission flips to v2 crowns once the launch checklist clears. Nothing here is a
-promise of a date; watch the announcements.
+As of **2026-09-11**, seven real-model rounds are public, signed, hash-chained, and anchored. Round 7
+scored all three judges; `binary`, `sub2`, and `sub4` changed hands while `ternary` held on the floor
+rule. The resulting four artifacts are mirrored in
+[`RalphLabsAI/ralph-crowns`](https://huggingface.co/RalphLabsAI/ralph-crowns), and the records live in
+[`RalphLabsAI/ralph-v2-rounds`](https://huggingface.co/datasets/RalphLabsAI/ralph-v2-rounds).
+
+Each record carries its weight vector; validators set it after verifying the round. A public
+snapshot after Round 7 showed six later submissions awaiting a future score; that queue can change
+and does not mean an artifact has passed intake.

@@ -7,11 +7,20 @@
 **Compress one pinned open model into fewer bits, without touching its architecture. Best
 compression per bit tier wears the crown, and every crown ships as downloadable weights.**
 
-`Qwen/Qwen3-8B` pinned · `16.38 GB` at bf16 → `1.75 GB` at ternary · [netuid 40](https://taostats.io/subnets/40)
+`Qwen/Qwen3-8B` pinned · four bit-budget tiers · [netuid 40](https://taostats.io/subnets/40)
 
-This is not a smaller model trained to imitate a bigger one. It is the model you already know,
-stored differently — smaller, not dumber. A submission whose shape does not match the parent is
-refused before any weights load.
+This is not distillation into a smaller architecture. It is the same architecture stored at a
+lower bit budget. A submission whose shape does not match the parent is refused before any weights
+load. Ralph's score measures retention by downstream effect; it is **not** a standalone capability
+benchmark.
+
+**Public status:** seven signed, hash-chained rounds are published and anchored.
+[Round 7](https://huggingface.co/datasets/RalphLabsAI/ralph-v2-rounds/blob/main/rounds/round-00000007-f42ae20c6ed2a796.json)
+scored every submission with all three judges, changed the `binary`, `sub2`, and `sub4` crowns, and
+held `ternary` on the floor rule. The four crown artifacts are mirrored in
+[`RalphLabsAI/ralph-crowns`](https://huggingface.co/RalphLabsAI/ralph-crowns). Emission follows
+the signed records: a validator sets a round's weight vector after its own audit accepts the
+record (see *Running as an auditor validator*).
 
 ---
 
@@ -21,7 +30,7 @@ You compress privately, however you like. The subnet never inspects your method,
 
 ```bash
 git clone https://github.com/RalphLabsAI/ralph && cd ralph
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-chain.txt
 
 # 1. compress Qwen/Qwen3-8B however you want — GPTQ, AWQ, bitsandbytes, your own scheme.
 #    safetensors or GGUF, architecture unchanged.
@@ -46,16 +55,18 @@ Six gates, in order. Nothing loads your weights until all six pass.
 
 | # | gate | fails if |
 |---|---|---|
-| 1 | economics | not registered, or no bond outside your free evaluation |
+| 1 | economics | not registered, or the coldkey already entered this tier in this round |
 | 2 | safety | pickles, remote code, or files that are not weights |
 | 3 | tier fit | parameter count or dtype headers inconsistent |
 | 4 | **bit budget** | measured bits/weight over the tier cap — read from tensor DATA, not the dtype header |
 | 5 | **pinned parent** | architecture or weight-element count does not match `Qwen/Qwen3-8B` |
 | 6 | commit-reveal | bytes do not hash to what you committed before the nonce existed |
 
-### What you earn
+### What the tournament allocates
 
-Each tier's emission is split between its king and the best challenger who **provably beat them**.
+The signed record computes the weight vector for each tier: a tier is split between its king and
+the best challenger who **provably beat them**. Validators pay that vector once their own audit
+accepts the record — a vector in a record is the rule applied, not proof of payment; the chain is.
 
 | | |
 |---|---|
@@ -63,13 +74,13 @@ Each tier's emission is split between its king and the best challenger who **pro
 | **best challenger with a strictly positive paired margin** | 20% of the tier |
 | everyone else | nothing |
 
-The crown changes hands on the **displayed metric itself**, on the same exam as the re-scored king: a lead of **0.02** in one round, or **0.01 in two consecutive rounds** — the best challenger of a round stays in as the tier's *contender* and is re-scored on the next exam, so a small real edge accumulates instead of being lost to one draw. One rule on top: no slice of the challenger may sit below the king's worst slice — reshaping is allowed, the worst case getting worse is not. A tied pair false-dethrones ~2% of contests at 288-item exams; a copy leads by exactly 0 and a copy with English polish by ~0.008, under both margins. Every round is scored by **all three judges**, and the crown metric is the average of their worst-slice scores — which judge a round happens to draw no longer decides a crown, and fitting one judge moves a third of your score, not all of it. A king that has held **three rounds running** defends against half the margins (0.01 in one round, or 0.005 twice), so a throne nobody has beaten gets easier to take, not harder. The paired lower bound above zero is what pays the runner-up.
+The crown changes hands on the **displayed metric itself**, on the same exam as the re-scored king: a lead of **0.02** in one round, or **0.01 in two consecutive rounds** — the best challenger of a round stays in as the tier's *contender* and is re-scored on the next exam, so a small real edge accumulates instead of being lost to one draw. One rule on top: no slice of the challenger may sit below the king's worst slice — reshaping is allowed, the worst case getting worse is not. A tied pair false-dethrones ~2% of contests at 288-item exams; a copy leads by exactly 0 and a copy with English polish by ~0.008, under both margins. Every round is scored by **all three judges**, and the crown metric is the average of their worst-slice scores — which judge a round happens to draw no longer decides a crown, and fitting one judge moves a third of your score, not all of it. A king that has held **three rounds running** defends against half the margins (0.01 in one round, or 0.005 twice), so a throne nobody has beaten gets easier to take, not harder. A paired lower bound above zero allocates the runner-up share in the candidate vector.
 
 **Start from the reigning crown if you want to.** Every one is published, and improving a published
 artifact is the compounding this trail exists for — not an attack on it. The king keeping 80% and
-the 0.02 margin is what protects the original author. What protects everyone is that a *copy* earns
-nothing: an unchanged artifact is not re-scored at all, and a near-copy scores what the original
-scores, which puts its paired margin at zero.
+the 0.02 margin in the candidate allocation is what protects the original author. What protects
+everyone is that a *copy* earns nothing in that allocation: an unchanged artifact is not re-scored
+at all, and a near-copy scores what the original scores, which puts its paired margin at zero.
 
 **One artifact has one owner.** If two hotkeys commit the same bytes, the earlier commitment wins
 and the later is refused, with a row in the signed record naming the block that beat it. Submit
@@ -77,11 +88,11 @@ your own work, or someone else's made genuinely better.
 
 ### Bit tiers
 
-| tier | max bits/weight achieved | ≈ size at 8B |
+| tier | max code bits/weight | ≈ code size at 8B |
 |---|---|---|
 | `binary` | 1.15 | 1.18 GB |
 | `ternary` | 1.75 | 1.79 GB |
-| `sub2` | 2.0 | 2.05 GB |
+| `sub2` | 2.3 | 2.35 GB |
 | `sub4` | 4.0 | 4.10 GB |
 
 A 4-bit model shipped inside a 16-bit container is credited for the compression it achieved and
@@ -102,20 +113,18 @@ rejected for it.
 
 ### Formats that can win
 
-**The crown has to run on a phone.** That is the product, so a format mainline `llama.cpp` cannot
-execute on Apple GPU is rejected at intake no matter how good its retention would have been — we
-score on an H100 where it might run perfectly well, and reject it anyway.
+An eligible GGUF format must have a mainline `llama.cpp` Metal path. A format without one is
+rejected even if it runs in another backend. This is a format-level compatibility gate, not a
+device benchmark or a claim that every crown has been tested on a particular phone.
 
 | | |
 |---|---|
 | **use** | `Q1_0`, `Q2_0`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, and the `Q*_K` family |
 | **rejected** | **`TQ1_0`, `TQ2_0`** — mainline has no Metal kernel for either |
 
-**The `TQ*` types are the trap.** They are the obvious choice by name at ~1.1 and ~2.1 bits, they
-pack beautifully, and they run fine on the CUDA box you built them on — and they exist only in
-llama.cpp's CPU and CUDA paths. There is no Metal kernel for either, so they cannot run on a phone.
-`TQ1_0` has already cost two miners their entry, including the only `binary` submission this subnet
-has ever received. Use `Q1_0` or `IQ1_S` at the binary end, `Q2_0` or `IQ2_XXS` at the sub-2 end.
+**The `TQ*` types are the trap.** They are the obvious choice by name at ~1.1 and ~2.1 bits and pack
+beautifully, but neither has the required Metal kernels; `TQ2_0` also lacks the required CUDA path.
+Both are refused. Use `Q1_0` or `IQ1_S` at the binary end, `Q2_0` or `IQ2_XXS` at the sub-2 end.
 
 Check before you commit — the same code the validator runs:
 
@@ -186,10 +195,10 @@ Per-TENSOR mixing is fully supported and is where your headroom is — a 1-bit b
 embedding is measured correctly at 1.0760. Per-weight salience is not, until a GGML type for it
 exists.
 
-**If you want a crown this month, `sub2` is the better target.** A `Q2_0` body with a
-higher-precision embedding measures ~2.23 against a 2.3 cap, it is reachable with stock
-`llama-quantize`, and the tier is uncrowned because its only entrant so far fails the degeneracy
-gate.
+All four tiers are crowned as of Round 7. The published crown for a tier is a permitted starting
+point, and a `Q2_0` body with a higher-precision embedding can measure around 2.23 against the
+`sub2` cap of 2.3. Measure the artifact you actually intend to serve; mixed tensors and container
+overhead still bind independently.
 
 Check what intake will say before you commit:
 
@@ -205,13 +214,14 @@ competitors', without downloading a single model.
 
 ## For anyone checking a crown
 
-Every round publishes what it scored, which items it drew and which observer graded them, so a
-result can be recomputed rather than believed.
+Every round publishes what it scored, which items the post-commit nonce selected and which judges
+graded them, so a result can be recomputed rather than believed. Round 7 and later score all three
+configured judges; a full L2 re-check repeats the observer pass once per judge.
 
 ```bash
 python -m eval.rerun <record.json>                                    # arithmetic only, no GPU
 python -m eval.rerun <record.json> --pool <items.jsonl> \
-    --observer <hf-id> --artifacts <ckpt-dir>                         # full re-derivation
+    --observer <one-recorded-hf-id> --artifacts <ckpt-dir>            # one judge + model binding
 python -m eval.rerun --history <dir> --head <on-chain anchor>         # is the trail complete?
 python -m eval.auditor --follow --require L0,L1 --signer <key>        # ... as a standing role
 ```
@@ -227,12 +237,15 @@ attributes a record and never validates it.
 ## Run it locally
 
 ```bash
-python -m tests.test_crown_path        # 57/57, CPU, no GPU needed
-python -m eval.simulate_submission     # miner -> validator -> auditor in seconds
+pip install -r requirements-dev.txt
+python -m pytest -q                    # local logic/integration suite
+python -m eval.bitrate path/to/model.gguf
 ```
 
-The second walks the six gates, draws the observer from the nonce, runs the identity check, crowns,
-publishes fail-closed with an on-chain anchor, then re-verifies its own round at all four levels.
+Most logic tests are CPU-only; sandbox tests need `bubblewrap` to be permitted, and production
+scoring plus L2/L3 model re-derivation require the recorded inference environment. The older
+`eval.simulate_submission` path is test scaffolding and does not currently represent the
+multi-judge production flow.
 
 ---
 
@@ -244,7 +257,7 @@ filler, never produced an answer, and was worse than the un-finetuned base on 5/
 benchmarks. Score **generated questions** and you pay for question-answering: probe formats are
 public, so fitting them is a cheap narrow skill that transfers to nothing.
 
-So we score neither. Two steps are equivalent when they move an **independent observer** into
+So we score neither. Two steps are equivalent when they move a **configured judge model** into
 the same predictive state:
 
 1. From trajectory prefix `K`, the **pinned parent** produces its step, and so does the miner.
@@ -258,12 +271,12 @@ That gives disagreement `s`, parent effect `d_G`, and miner effect `d_A`. The sc
 
 **There is no style channel.** A paraphrase carrying the same information scores 0.80; doing
 nothing scores 0.14; moving the observer the wrong way scores 0.02. Miners cannot overfit to
-GLM's wording — they have to extract the information GLM added at that step.
+the parent's wording alone — they have to preserve the information the parent added at that step.
 
 Three properties that keep it fair, each pinned by a test:
 
-- **The observer is drawn from the round nonce**, so a miner cannot pre-fit which observer it
-  will face.
+- **The exam is drawn from the post-commit round nonce**, so a miner cannot know which trajectory
+  items will be scored when its bytes are sealed. Every configured judge scores every item.
 - **Discards are decided by the parent's effect alone.** Samples where the parent moves the
   observer nowhere carry no signal and are dropped — but never based on miner output, or a miner
   could bury its hard samples by emitting bland steps.
@@ -277,24 +290,23 @@ activity. ~42M verified trajectories across reasoning, agentic-code, dialogue an
 sources ([`eval/steps.py`](eval/steps.py)); SWE-ZERO is deduped to ≤5 rollouts per task because
 its 12.29M rows are only ~122,908 unique pull requests.
 
-The old capability axes remain as a cheap **canary**, not the crown, because observer-KL is
-structurally blind to exactly one failure: a student that moves the observer correctly while
-being unusable.
+Observer-KL is a retention proxy, not a capability score. The production `score_job` does not wire
+in a separate task-accuracy suite, so capability claims require a distinct, published benchmark.
 
 ## Auditability — scoring is expensive, checking is cheap
 
-Ralph validators run the GPU scoring; **auditors run on CPU**, so anyone can check a crown without
-a datacentre. The question that matters is not how many validators there are, but whether an
-outsider can *check* the ones that exist.
+Ralph validators run the GPU scoring. Anyone can check the signed arithmetic and exam selection on
+CPU; reproducing judge effects or regenerating model steps is a separate, expensive check that
+requires the recorded models and a matching inference environment.
 
 Publishing artifacts is not enough. A subnet can publish every prompt, every judge verdict and
 every score and still be unfalsifiable, because if the grade came from an unpinned LLM with no seed
 you can prove the operator added the numbers up wrong but never that they **graded** wrong. So the
 crown here is built to be **recomputable**, not merely transparent:
 
-* **The operator does not choose the exam.** Which trajectory items are scored, and which observer
-  scores them, are derived from `commit_root ‖ round_nonce` — a block hash drawn *after* the
-  commitment window closes. The chosen indices are in the signed record.
+* **The operator does not choose the exam.** Which trajectory items are scored is derived from
+  `commit_root ‖ round_nonce` — a block hash drawn *after* the commitment window closes. The chosen
+  indices are in the signed record, and the whole configured judge pool scores them.
 * **The record is a re-run manifest.** Corpus + revision + ordering, item indices, observer and
   observer pool, token budgets, stack versions, and the measured noise floor the crown was gated
   on. Every scored point carries the parent step and continuation as literal text, and both the
@@ -311,12 +323,11 @@ python -m eval.rerun record.json --pool i.jsonl --observer <hf> \
 python -m eval.rerun --history ./published --head <on-chain anchor>   # is the trail complete?
 ```
 
-**L0** recomputes the score, the crown floor, the paired dethrone margin and the emission weights
-from the published measurements with no models at all — by calling the *same* scorer the round
-ran, not a second copy of the rule. **L1** re-derives which items were scored from the nonce, and
-checks the exam was neither pruned nor padded and that slice keys follow from the items. **L2**
-recomputes the observer's distributions over the frozen text — the level a judge-based subnet
-cannot have.
+**L0** recomputes the score, the crown floor, the paired challenger-share bound and the candidate
+weights from the published measurements with no models at all — by calling the *same* scorer the
+round ran, not a second copy of the rule. **L1** re-derives which items were scored from the nonce,
+and checks the exam was neither pruned nor padded and that slice keys follow from the items. **L2**
+recomputes a recorded judge's distributions over the frozen text.
 
 **L3 is the one that makes a crown non-forgeable**, and it is worth being exact about why. The
 miner's steps are frozen into the record by the same operator who signs it, so an operator can
@@ -334,32 +345,36 @@ each rig to be caught by recomputation instead.
 
 **Fail-closed means hold, not halt** — stated plainly because overstating it would be its own
 dishonesty. Withholding `set_weights` does not stop emission; the previous weights persist, so the
-last verifiably published crown keeps earning until publishing is fixed. An operator who breaks
-publishing while their own model is king benefits from the freeze. That residual is why the gate
-re-verifies a *window* of past rounds every round rather than only the current one.
+last verifiably published crown keeps earning until publishing is fixed. That residual is why the
+gate re-verifies a *window* of past rounds every round rather than only the current one.
 
 ### Running as an auditor validator
 
-One GPU scorer, many CPU checkers. `eval.auditor` is the daemon for the second role: it follows the
-published trail, re-runs each new round, and writes a **signed verdict**.
+`eval.auditor` follows the published trail, runs the verification levels its operator can support,
+and writes a **signed verdict**. L0/L1 are CPU checks; L2/L3 are model-inference checks.
 
 ```bash
 python -m eval.auditor --once  --require L0     --signer <validator record key>   # free, no models
 python -m eval.auditor --follow --require L0,L1 --signer <key> --interval 600     # + the exam
 python -m eval.auditor --follow --require L0,L1,L2 --signer <key> \
-    --observer HuggingFaceTB/SmolLM2-1.7B-Instruct,google/gemma-2-2b-it           # + the grades
-python -m eval.auditor --follow --signer <key> \
-    --validator-hotkey <ss58> --set-weights                                       # act on it
+    --observer <one-recorded-hf-id>                                                # one judge
+python -m eval.auditor --follow --signer <key> --validator-hotkey <ss58> \
+    --wallet <wallet> --hotkey <hotkey> --interval 1200 --set-weights             # act on it
 ```
+
+The last form is what a weight-setting validator runs: every pass it re-verifies any new round,
+then sets the vector of the newest round it accepted with its own hotkey — every pass, so the vector
+is refreshed inside the subnet's activity cutoff and the validator never reads as absent. Rounds
+1–4 were drawn under an earlier remainder rule; records now name their `selection_rule`, and an
+untagged legacy record is accepted under whichever of the two rules reproduces it (both are
+deterministic in the nonce — see `eval/rerun.py`).
 
 L1 needs no corpus file: the record pins the pool's digest inside its signed body, so the auditor
 fetches the pool from the trail and re-digests it.
 
-**L2 takes the whole observer pool, not one model.** The grader rotates per round out of the nonce,
-so a daemon pinned to a single observer is re-deriving the grades with the wrong one about half the
-time — and since any failure rejects, it would publish a signed accusation each time. Pass the same
-pool the operator declares and it loads whichever one that round drew. A round whose observer is
-not in your pool is a skip, not a fault.
+In a multi-judge record, one L2 pass re-derives one recorded judge's points. Run the check once per
+judge for full coverage; the audit reports partial coverage rather than implying that one model
+reproduced the aggregate.
 
 **L2 only compares numbers on matching hardware.** Measured cross-box spread is ~0.03 retention on
 a genuine compression and ~0.17 on a control, far above `reproduction_tolerance` — so on a
@@ -371,12 +386,9 @@ records with; `--validator-hotkey` is the ss58 whose on-chain commitment holds t
 setting needs both, and preflight refuses to start without them rather than letting a
 misconfigured daemon look identical to a quiet subnet.
 
-**The verdict is the primary product; the weight is a paid vote.** Simulating the shipped Yuma steps
-on the two-tier layout this repo runs, an auditor with 30% stake that dissents on one disputed crown
-settles at about half its dividends (0.30 → 0.15, vtrust 1.0 → 0.5) — and drives the disputed king's
-incentive down 18%, because clipping only clips downward, so a dissenting zero survives and removes
-that stake share from the rigged king's rank. Dissent is a proportional vote at a proportional price,
-not a futile gesture.
+**The verdict is the primary evidence; setting weights is a separate action.** The signed verdict
+says which round and digest were checked, at which levels, against which on-chain head. An auditor
+may separately opt into an on-chain weight vote.
 
 But nothing on chain distinguishes an auditor that **verified** from one that **copied**: identical
 vectors are never clipped, vtrust and bonds are maximal, and there is no copier detection anywhere in
@@ -435,69 +447,50 @@ HuggingFace are byte-for-byte the same observation; only recurrence distinguishe
 unfetchable record reads INCOMPLETE for three passes, is re-audited rather than written off, and
 only then escalates to a broken trail.
 
-## Anti-gaming — economics, not detection
+## Anti-gaming — rules, not detection
 
 The last team proved you **cannot detect** copying on a shared base. v2 makes gaming
 *unprofitable* instead — all of the following are built and tested:
 
-- **A copy earns nothing.** The king is re-scored on the same fresh items every round; an
-  exact copy ties (zero margin, paired bootstrap-LCB on the **worst axis**) and cannot
-  dethrone. Dethroning needs a *strict* worst-axis improvement past the noise floor.
-- **Genre-overfit gate (stale-vs-fresh diff-in-diff), armed by default.** A student whose
-  edge over base **collapses on genuinely-new same-genre documents** is demoted. This gate is
-  only *sighted* when the fresh half is real text (on a synthetic generator, stale and fresh
-  are the same closed distribution, so a specialist shows no gap) — which is exactly why the
-  crown axis is real-corpus. Freshness alone doesn't stop distribution-overfit; this does.
+- **A copy cannot take a crown or challenger share.** The king is re-scored on the same fresh items
+  every round; an exact copy has zero displayed lead and a zero paired lead. Crown transitions use
+  the displayed point lead, the one-round/persistence margins, any reign decay, and the same-judge
+  floor. The paired lower bound separately gates challenger share in the candidate allocation.
 - **Content-addressed identity + commit-reveal.** You're bound to the exact bytes you
   committed (weights *and* config/tokenizer) — no post-commit swap.
-- **Anti-grind economics.** One free eval per **coldkey**, a per-coldkey round cap, and a
-  bond for extra submissions refunded only when you improve your own best — spam and
-  best-of-N crown-farming are unprofitable; honest iteration stays cheap.
-- **Signed round records.** Every verdict is signed by the validator and independently
+- **Anti-grind admission.** One artifact per `(coldkey, tier)` can enter a round, and bytes already
+  scored in the public trail are skipped. The bond accounting code is disabled (`base_bond=0`)
+  because no on-chain escrow/refund extrinsic exists.
+- **Signed round records.** Every round record is signed by the validator and independently
   re-runnable from the recorded seeds.
 
-## Not yet done — read this before running it anywhere real
+## Current operating state and limits
 
-The mechanism is complete, has been run against real models on real GPUs
-([`experiments.md`](experiments.md)), and has published a real round record. What has **not**
-happened:
+As of **2026-09-11**, seven real-model rounds are public, signed, hash-chained, and anchored on
+mainnet. Round 7 was the first all-three-judges round: `binary`, `sub2`, and `sub4` changed hands;
+`ternary` held because one challenger slice fell below the incumbent's floor. All four resulting
+artifacts are public in the crown repository. A public chain snapshot after that round showed six
+later submissions awaiting a future score; that count is a point-in-time queue, not a promise that
+they will pass intake or be evaluated on a particular date.
 
-- **Determinism is a property of the BOX, and two of the three knobs are now pinned in the
-  record.** Measured on H100 PCIe / A100 SXM4 / L40S with byte-identical items: within a fixed
-  configuration a round is bit-exact (0.0 spread, byte-identical generations), but the H100
-  returned four different outputs from four identical `generate()` calls until the attention
-  implementation was pinned. Across GPUs the boxes still generate different step text, so a score
-  is only meaningful against a recorded (gpu, batch_size, attn_implementation) — all three now
-  live in the signed manifest, and the audit reports a mismatch as hardware rather than fraud.
-- **The score saturates at the bottom.** Perturbing every weight and sweeping the magnitude, the
-  score falls monotonically to σ=0.05 and then flattens around 0.43–0.57 — it never reaches the
-  0.135 inert floor, because a wrecked model still emits *something* and something still moves the
-  observer. So the metric cannot tell a broken model from a very broken one. Two things stop that
-  deciding a crown: the tail wobble (0.036–0.048) is below the dethrone margin, and a real 4-bit
-  beats the luckiest wrecked model by 0.066–0.083, above it. Crowns are contested at the top and
-  the top is clean, but this is the closest thing here to scoring well while being useless, and it
-  is why the capability canary stays.
-- **The anchor chain has never been committed by a real chain.** `A_n = H(A_{n-1} ‖ digest)` makes
-  one commitment slot cover the whole history, and `BittensorChainIO` computes and reads it — but
-  no `commit_audit_root` call has landed on mainnet. Until one does, the strongest guarantee here
-  is untested on the network it is for.
-- **No miner has ever submitted anything.** The path is wired end to end — including the fetcher,
-  which was the piece that made a submission impossible to score at all — but no third party has
-  used it, and no auditor other than the operator's own has ever ruled on a round.
-- **Weights have never been set by this validator.** It runs read-only by default and will keep
-  doing so until there is something worth crowning; a second signer on a live hotkey fights the
-  first.
-- **Non-Latin coverage is Hindi and Chinese.** That is where the anti-clone axis binds today; the
-  published evidence for low-bit collapse is Persian and Cyrillic, so the pool does not yet test
-  where the proof is.
-- **The validator box needs `bubblewrap`** for the sandboxed code canary.
-- **`eval/budget.py`** (score-at-budget / convergence gate) is written and tested but not wired
-  into the crown path.
+The remaining boundaries matter:
 
-## Positioning vs the family
+- **Weights follow verified records.** A validator sets a round's vector only after its own
+  audit accepts the record (`eval.auditor --set-weights`); until then the previous on-chain
+  vector persists.
+- **Retention is not capability.** The production metric compares downstream observer effects.
+  No task-accuracy suite is wired into the crown path, and no benchmark result should be inferred
+  from a retention number.
+- **Reproduction is environment-sensitive.** GPU model, batch size, attention implementation, and
+  stack versions are recorded. L2 reports mismatched hardware as incomplete, not as evidence of
+  fraud.
+- **Non-Latin coverage is currently Hindi and Chinese.** It is not a claim of broad multilingual
+  coverage.
+- **`eval/budget.py` is not in the crown path.** Score-at-budget and convergence logic remains an
+  offline tool.
 
-SN3 trains full-precision models on a frozen arch (compression out of scope). SN97 fine-tunes
-a fixed model, quantization banned. SN120 runs RL environments on full-size students. **Nobody
-owns the efficiency axis** — v2 is the missing quadrant: a fresh, commit-then-generate
-*verifiable* eval; reward-indifference-to-copies (economic, not detection); and a tiered
-family of downloadable open checkpoints.
+## Positioning
+
+Ralph v2 focuses on a specific lane: architecture-preserving compression under explicit bit
+budgets, a fresh commit-then-generate evaluation, economic indifference to copies, and a tiered
+family of downloadable crowned artifacts.

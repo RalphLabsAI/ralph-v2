@@ -1,146 +1,152 @@
-# Capability-retention harness (Phase 0)
+# Ralph v2 evaluation and audit
 
-Runnable, CPU-only, no GPU required for the mechanism proof.
+The production crown path evaluates lower-bit, architecture-preserving compressions of
+`Qwen/Qwen3-8B`. Its metric is observer-KL retention: how closely a submitted step moves the
+configured judges toward the predictive state produced by the parent step.
+
+This is a **retention metric, not a capability benchmark**. The production `score_job` does not
+attach a separate task-accuracy canary, so a crown or retention value must not be presented as a
+general capability result.
+
+## Public state
+
+As of **2026-09-11**, seven real-model rounds are published in
+[`RalphLabsAI/ralph-v2-rounds`](https://huggingface.co/datasets/RalphLabsAI/ralph-v2-rounds). They are
+signed, hash-chained, and anchored on mainnet. Round 7 was the first round to score all three judges:
+
+- `HuggingFaceTB/SmolLM2-1.7B-Instruct`
+- `microsoft/Phi-3-mini-4k-instruct`
+- `allenai/OLMo-2-1124-7B-Instruct`
+
+In that round `binary`, `sub2`, and `sub4` changed hands; `ternary` held on the floor rule. The four
+resulting artifacts are mirrored in
+[`RalphLabsAI/ralph-crowns`](https://huggingface.co/RalphLabsAI/ralph-crowns).
+
+Each signed record carries the round's weight vector; validators set it after their own audit
+accepts the record. A public chain snapshot after Round 7 showed six later submissions waiting for
+a future score; that count is a point-in-time queue, not an intake result or schedule.
+
+## Production round
+
+The split production path is:
+
+```text
+CPU orchestrator: chain read -> round identity -> rent GPU -> audit returned record
+GPU score job:    fetch -> intake -> parent + all judges -> score -> unsigned record
+CPU orchestrator: L0/L1 -> sign -> publish -> anchor -> optional weight write -> destroy GPU
+```
+
+The scoring validator's entrypoint is `python -m eval.run_orchestrated`. `eval/score_job.py` runs
+on the rented GPU and holds no signing or chain-write keys.
+
+For every accepted artifact:
+
+1. The sealed commitments and a later block hash establish `commit_root` and `round_nonce`.
+2. The nonce selects trajectory items from the pinned pool under the allocation rule the record
+   names (`selection_rule`). It does **not** select one judge.
+3. The parent and every accepted submission generate a step on the same selected items.
+4. All three judges measure the parent and submission effects over fixed continuations.
+5. Each judge is reduced to its worst `(language, depth)` slice; the displayed retention is the mean
+   of the three judge-level worst slices.
+6. The incumbent is re-scored on the same exam and the tournament applies the point-margin,
+   persistence, floor, and reign-decay rules.
+7. The round record freezes the exam, model outputs, effects, decisions, and candidate vector before
+   it is signed and published.
+
+Round 7 requested 288 trajectory items. One item was dropped because the parent effect was below the
+minimum signal threshold; the reason is recorded rather than silently changing the denominator.
+
+## Intake and admission
+
+No miner model loads before the cheap gates complete:
+
+1. registration and one-artifact-per-`(coldkey, tier)` admission;
+2. file safety;
+3. tier fit;
+4. measured code and container bit budgets;
+5. pinned-parent architecture identity; and
+6. commit-reveal binding to the served bytes.
+
+The active tier code-bit caps are `binary=1.15`, `ternary=1.75`, `sub2=2.3`, and `sub4=4.0`.
+Container caps bind independently. GGUF and safetensors are accepted; `TQ1_0` and `TQ2_0` GGUFs are
+refused because they lack the required mainline Metal kernels.
+
+The old resubmission-bond bookkeeping is disabled (`RegistrationLedger.base_bond=0`). No chain
+extrinsic escrows or refunds that value. The enforceable anti-grind controls are the per-coldkey,
+per-tier round cap, registered identities, and skipping bytes already scored in the public trail.
+
+## Crown decision
+
+The current rules operate on the displayed point estimate:
+
+- lead `>= 0.02` on one fresh round, or lead `>= 0.01` on two consecutive rounds by the same
+  artifact;
+- both thresholds halve after an incumbent has held three rounds;
+- no challenger slice may fall below the incumbent's worst slice under the same judge; and
+- an exact copy has lead zero and cannot dethrone.
+
+A positive paired lower bound can allocate the 20% challenger share in the weight vector without
+moving the crown.
+
+## Audit levels
 
 ```bash
-python -m eval.adversarial     # the Phase-2 adversarial proof
+python -m eval.rerun record.json                                      # L0
+python -m eval.rerun record.json --pool pool.jsonl                    # L0 + L1
+python -m eval.rerun record.json --pool pool.jsonl --observer <hf-id> # + one judge's L2
+python -m eval.rerun record.json --pool pool.jsonl --observer <hf-id> \
+    --artifacts ./ckpts                                                # + L3 model binding
+python -m eval.rerun --history ./published --head <on-chain-anchor>
 ```
 
-## What's here
+- **L0** verifies signatures and recomputes arithmetic, crown decisions, and the candidate vector
+  from the published measurements. It needs no models.
+- **L1** re-derives item selection under the rule the record names and checks the pool digest and
+  recorded prefixes. It is a CPU data-integrity check.
+- **L2** re-runs one recorded judge over the frozen text. A multi-judge round needs one pass per
+  judge for complete coverage, and numeric comparison requires the recorded GPU, batch size,
+  attention implementation, and stack.
+- **L3** reloads crowned/submitted artifacts and regenerates their frozen steps. It binds the record
+  to the actual model bytes and is not a cheap CPU-only check.
 
-| file | role |
+Exit code `0` means the requested checks reproduced, `1` means a demonstrated divergence, and `2`
+means incomplete. Running only L0/L1 does not verify the model inference that produced the scores.
+
+`eval.auditor` follows the trail and publishes signed verdicts at configured levels. Its
+`--signer` is the record-signing identity; `--validator-hotkey` is the separate ss58 identity whose
+on-chain commitment slot carries the anchor. L2 configuration should name recorded judges, and
+full multi-judge coverage requires separate passes for all three.
+
+## Useful local commands
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+python -m eval.precheck
+python -m eval.bitrate path/to/model.gguf
+```
+
+The test suite exercises local logic and plumbing; it does not reproduce a public GPU round. Most
+tests are CPU-only, while the code-execution sandbox requires `bubblewrap` to be permitted.
+Production scoring and L2/L3 model checks require the appropriate model runtime and recorded
+environment. `eval.simulate_submission` belongs to the older simulated path and does not currently
+represent the multi-judge production flow.
+
+## Main modules
+
+| module | role |
 |---|---|
-| `core.py` | `Item` / `Axis` / `ModelRunner` types; a model is a black box (prompt in, text out) |
-| `seeds.py` | commit-then-generate seeding: `seed = H(commit_root ‖ round_nonce ‖ axis)` |
-| `scoring.py` | normalized retention, Wilson lower bound, worst-domain soft-min, gates |
-| `axes/math_gsm.py` | GSM-Symbolic-style templated word problems + NoOp distractors, exact numeric checker |
-| `axes/code_exec.py` | function-implementation tasks graded by **executing** hidden unit tests |
-| `runners.py` | `HFRunner` (real, transformers) + simulated adversaries |
-| `adversarial.py` | the proof: honest student must beat every cheater |
+| `run_orchestrated.py` | key-holding CPU orchestration, publish/anchor gate, optional weights |
+| `score_job.py` | keyless rented-GPU scoring job |
+| `validator_observer_loop.py` | production observer-KL intake and round assembly |
+| `observer_kl.py` | downstream-effect measurement |
+| `bitrate.py` / `gates.py` | bit budgets, format compatibility, and intake |
+| `koth.py` / `lineage.py` | crown decisions and history-derived throne state |
+| `round_record.py` / `publish.py` | signed records, hash chain, and public trail |
+| `rerun.py` / `auditor.py` | layered re-derivation and independent verdicts |
+| `pool.py` / `steps.py` | pinned trajectory pool and balanced exam construction |
 
-## Current result
-
-```
-student                     math ret    code ret     SCORE  gates
-student-honest                 0.511       0.481     0.357  ok
-naive-quant-control            0.174      -0.025     0.000  negative retention on: code
-student-style-only            -0.641      -0.815     0.000  negative retention on: math, code
-student-narrow-math            0.891      -0.630     0.000  negative retention on: code
-student-noop-brittle           0.196       0.370     0.072  ok
-
-PASS: honest 0.357 beats every adversary (best cheater 0.072, margin 0.285)
-```
-
-**Laundering sensitivity.** Independently of the negative-retention gate, worst-domain
-soft-min (p = −6) means a student that maxes math to 1.25 — i.e. *beats the teacher* —
-must still keep code retention ≥ 0.446 to match an honest balanced 0.50/0.50 student.
-It can only sell an axis down to ~89% of honest level before losing. Selling one
-capability to buy another is not a profitable strategy, which is the central claim.
-
-Note the score is nearly invariant to the strong axis (1.25 vs 1.00 math ≈ identical
-score) — it is set by the weakest axis, by design.
-
-## Honest limits of this proof
-
-1. **Simulated students, not real models.** This validates the SCORING LOGIC and the
-   aggregation properties. It does not tell us how real compressed models behave —
-   per-axis accuracies here were chosen, so the ranking is partly assumed.
-2. **Two axes.** The design calls for ~6 plus a rotating surprise pool.
-3. **No teacher yet.** `HFRunner` is written but unrun: a 9B teacher needs a GPU.
-4. **Sandboxing.** `code_exec` runs candidate code in a subprocess with a timeout —
-   fine for our own generated solutions, NOT sufficient for untrusted miner output
-   (no network isolation, no fs/resource caps). Must be hardened before real use.
-
-## Next
-
-- run the real teacher (pinned GLM) on a GPU box and replace simulated competence
-  with measured per-axis pass rates
-- add instruction-following (programmatic checkers) and long-context axes
-- calibrate difficulty so the teacher sits near its saturation frontier
-
----
-
-# Subnet core (the round engine)
-
-The mechanism is **const's trajectory step-agreement**: score a student by how much of
-what GLM does at a step the student also does, sampled over (rollout, step) pairs from a
-large experience pile. No fixed test set, no RL env on the validator. See `trajectory.py`
-and the `teacher_state` / `self_state` note there.
-
-```
-python -m eval.sim_round     # full KOTH loop, simulated end-to-end on CPU
-```
-
-| file | role |
-|---|---|
-| `trajectory.py` | the eval substrate: sample points, cache GLM references once, score a student (paired) |
-| `koth.py` | tournament state machine: per-tier kings, **dethrone on bootstrap-LCB margin**, weights |
-| `round_engine.py` | one full round: points → refs → score every submission + the reigning king on the same points → crown → weights |
-| `sim_round.py` | multi-round proof of the dynamics |
-
-## Loop result
-
-```
-round 1: crown     king=m_good    (open throne -> best challenger)
-round 2: hold      margin_lcb=+0.000   (an EXACT copy ties -> no dethrone)
-round 3: dethrone  margin_lcb=+0.072   (a genuine improvement clears the margin)
-weights track the crown throughout
-```
-
-The `+0.000` is the anti-copy property, rigorously: the reigning king is re-scored every
-round on the same fresh points, an identical checkpoint produces identical per-point
-agreement, the paired difference is exactly zero, and zero clears no margin. No detector,
-no fingerprint — copying is simply unprofitable. Genuine improvement past the noise floor
-is the only way to dethrone.
-
-## What's built vs what remains
-
-Built and CPU-runnable: the full scoring + tournament + weight loop, model access behind
-a `ModelRunner` interface so it runs against a real pinned GLM on a GPU box unchanged.
-
-Remaining (wraps this core, reuses Ralph's existing validator):
-- chain I/O — read commitments, set weights, publish the signed round record
-- real pinned GLM teacher + rotated rubric judge on a GPU (replaces the sim models)
-- compute metering reconciliation (declared vs throughput envelope), the bond
-- the experience pile — real agentic rollouts, salted with degraded states
-
-## Superseded (kept for reference)
-
-`axes/math_gsm.py`, `axes/code_exec.py`, `adversarial.py`, `provenance.py` are the earlier
-task-set / covering-eval approach. The mechanism moved to trajectory step-agreement, which
-makes covering + provenance structural rather than bolted-on. `scoring.py` (normalized
-retention, worst-domain soft-min, bootstrap-LCB) carries over unchanged and sits under both.
-
----
-
-# First real-model run (H100, ~$2)
-
-Qwen2.5-7B as teacher + judge, 0.5B base, 3B & 1.5B students as stand-ins. Goal: does the
-mechanism work outside simulation? `python -m eval.gpu_run`.
-
-**Results / findings:**
-1. **Pipeline runs end-to-end on real models** — teacher, grounded judge, base, students,
-   the full round + KOTH loop complete on real inference. (c) validated.
-2. **The grounded judge works** — genuine YES/NO, discriminating (not rubber-stamping):
-   it says NO when a candidate step does something different, YES when it matches.
-3. **Segmentation is the #1 practical requirement** (the real finding). Naive line-based
-   splitting turned steps into bare markdown headers (`2. **Calculate the average:**`),
-   so a student continuing the header with actual content always "mismatched" → retention
-   collapsed to ~0. Fixed to content-bearing semantic steps (`rollouts_gen._split_steps`).
-   After the fix, discrimination appears: **3B student agrees with teacher steps 100%,
-   0.5B base 73%** — real capability separation, judge-verified.
-4. **Exposure-bias signal is visible even here**: full-run retention 0.519 sits below the
-   teacher-state ceiling because the self-state axis (student's own prefix) drags the
-   worst-domain soft-min down — the on-policy gap is real, faintly, even on easy tasks.
-
-**Honest limits of this run:** grade-school tasks are too easy to separate a 3B from a
-1.5B (both ceiling on teacher-state → identical 0.519); n=48 points makes the Wilson lower
-bound very conservative; judge == teacher (self-preference not controlled). **Next run:**
-harder tasks (competition math / real agentic rollouts), more points, a distinct judge
-model, and a genuinely distilled-vs-drifter student pair to measure the real exposure-bias
-gap. Raw logs in `runs/` (gitignored).
-
-**Takeaway:** the mechanism works on real models and discriminates capability. Its
-validity hinges on trajectory segmentation quality — agentic rollouts (the intended
-source) have natural step boundaries; reasoning CoT needs semantic chunking, not line
-splits. Better to learn that here than in production.
+Files such as `adversarial.py`, `axes/*`, `gpu_run.py`, and the older simulated round paths are
+research history and test scaffolding. They are useful for mechanism experiments but do not
+describe the current production Round 7 path. Likewise, `eval/budget.py` is an offline tool and is
+not wired into crown decisions.

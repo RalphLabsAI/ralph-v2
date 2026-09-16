@@ -1,111 +1,138 @@
-# Miner quickstart — Ralph SN40 v2 (compression subnet)
+# Miner quickstart — Ralph SN40 v2
 
-You take a **pinned parent** model, leave its architecture untouched, and re-store its weights at
-a **low bit budget**. The best compression per bit tier wears the crown and earns emissions, and
-every crown ships as a downloadable, runnable model.
+Take the pinned `Qwen/Qwen3-8B` parent, preserve its architecture, and store its weights at a lower
+bit budget. Ralph runs a separate crown in each of four tiers: `binary`, `ternary`, `sub2`, and
+`sub4`.
 
-This is Bonsai's task, not distillation-into-a-different-model: same architecture, fewer bits.
+Crown records and artifacts are public; a crown earns its tier's share once validators verify the
+round that awarded it.
 
 ## TL;DR
 
-1. Take the tier's **pinned parent** (the validator publishes it; you do not choose it).
-2. Compress it — QAT, PTQ, whatever you like. The architecture must stay unchanged.
-3. Ship **safetensors or GGUF**. GGUF is preferred: it is what runs on a phone, and its
-   per-tensor `ggml_type` gives an exact bit budget with no estimation.
-4. Package (`miner/package.py`), commit `H(hash‖salt)` on-chain, reveal after the round opens.
-5. You are scored on whether your model's steps carry the **same information** the parent's do.
+1. Compress `Qwen/Qwen3-8B` without changing its architecture or weight-element count.
+2. Ship GGUF or safetensors. GGUF exposes exact per-tensor types for the bit-budget check.
+3. Run `python -m eval.bitrate your-model.gguf` before committing.
+4. `python -m miner.submit commit` seals `H(content_hash ‖ salt)` on chain; `python -m miner.submit
+   reveal` publishes the hash and salt only after the round opens (see below).
+5. Serve the exact immutable bytes you committed.
+6. Read the signed record for intake, score, and crown results.
 
-## How you are scored — read this part
+## What the score means
 
-Not on wording. Not on answering generated questions. On **downstream effect**.
+Ralph measures **retention by downstream effect**, not wording agreement and not benchmark task
+accuracy. For a trajectory prefix `K`:
 
-For a trajectory prefix `K`:
+1. The pinned parent and your model each produce a next step.
+2. A judge continues from the parent's step to establish a fixed continuation `C`.
+3. The judge's distribution over `C` is measured after the parent step, after your step, and after
+   the prefix alone.
+4. Your score reflects whether your step moved that judge in the same direction and by a similar
+   amount as the parent's step.
 
-1. The pinned parent produces a step `K → K+1`. So do you.
-2. An **independent observer model** continues from `K + parent_step`; call it `C`.
-3. The validator measures the observer's distribution over that same `C`, conditioned on
-   `K + parent_step`, on `K + your_step`, and on `K` alone.
+Every item is scored by all three configured judges:
 
-You score well when your step moves the observer **in the same direction** and **by about as
-much**. Measured:
+- `HuggingFaceTB/SmolLM2-1.7B-Instruct`
+- `microsoft/Phi-3-mini-4k-instruct`
+- `allenai/OLMo-2-1124-7B-Instruct`
 
-| what you did | score |
-|---|---|
-| identical effect | 1.00 |
-| same information, different words | **0.80** |
-| half the effect | 0.36 |
-| contributed nothing | 0.14 |
-| moved it the wrong way | 0.02 |
+Each judge is reduced to its worst language/depth slice, and the displayed metric is the mean of
+those three values. The post-commit nonce selects the trajectory items; it does not select a single
+judge.
 
-**Design around these consequences:**
+This score is a competition-specific retention proxy. It is **not** evidence of general capability,
+accuracy, or device performance.
 
-- **Copying the parent's style earns nothing.** There is no wording channel. A paraphrase
-  carrying the same information scores as well as an exact match, and mimicking phrasing while
-  losing content scores near zero. You have to extract what the parent knew at that step.
-- **You cannot pre-fit the questions, because there are none** — nor the observer, which is
-  drawn from the round nonce after your weights are sealed.
-- **Your worst slice is your score.** Aggregation is worst-slice over
-  (observer × language × depth). Excellent English and broken Chinese does not average out.
-- **Saying nothing is not a hedge.** An inert step is scored as inert, never skipped.
-- **Copying the king earns nothing.** An exact copy ties on every sample and cannot dethrone.
+## Crown rule
 
-## Rules and limits
+The incumbent is re-scored on the same fresh exam as the challengers. A challenger may dethrone by:
 
-- **Formats:** safetensors or GGUF. No `*.py`, no pickle, no `auto_map`. Every behaviour-
-  affecting file is hashed into your commitment — including config and tokenizer.
-- **Bit budget:** measured from your actual tensor data, not a dtype header or a filename. A
-  1-bit model stored in a bf16 container is credited as real compression **and rejected as an
-  unshippable artifact** — ship it packed.
-- **Pinned parent:** your artifact must be shape-compatible with the tier's parent (architecture,
-  weight-element count, config essentials). A different model fails at the door.
-- **Decoding is validator-owned.** Your `generation_config.json` does not affect scoring.
-- **Economics:** one free eval per **coldkey** per round; extra submissions cost a refundable
-  bond, returned only if you improve your own best. Rotating hotkeys does not reset this.
-- **Publish your bytes.** Include an `artifact_uri` so the crown resolves to something people can
-  actually download.
+- a displayed-metric lead of at least `0.02` in one round, or
+- a lead of at least `0.01` in two consecutive rounds with the same artifact.
 
-## Package + submit
+After a king has held three rounds, both thresholds are halved. In every case, the floor rule also
+requires that no challenger slice fall below the incumbent's worst slice under the same judge. An
+exact copy has a zero paired lead and cannot dethrone.
+
+## Intake rules
+
+| tier | maximum code bits/weight | maximum container bits/weight |
+|---|---:|---:|
+| `binary` | 1.15 | 2.5 |
+| `ternary` | 1.75 | 2.5 |
+| `sub2` | 2.3 | 3.0 |
+| `sub4` | 4.0 | 5.0 |
+
+- **Formats:** GGUF or safetensors; no `*.py`, pickle weights, or tokenizer `auto_map`.
+- **Measured budgets:** code and container bits come from the served tensor data and GGUF types,
+  not a filename or declaration. Both caps bind.
+- **Pinned parent:** architecture, weight-element count, and essential config must match
+  `Qwen/Qwen3-8B`.
+- **Runtime format:** `TQ1_0` and `TQ2_0` are refused because they lack the required mainline Metal
+  kernels. This gate is not a benchmark of any particular device.
+- **Admission:** one artifact per `(coldkey, tier)` per round. Previously scored bytes are skipped.
+  There is no operational resubmission bond; `base_bond` is zero because no escrow extrinsic exists.
+- **Commit-reveal:** every behaviour-affecting file is included in the content hash. The fetched
+  artifact must match the revealed hash.
+- **Decoding:** validator-owned generation settings are used during scoring.
+
+## Commit and reveal (the CLI does the chain writes)
+
+```bash
+pip install -r requirements.txt -r requirements-chain.txt
+
+# 1. seal the exact bytes you will serve — BEFORE the artifact is public, before the round's nonce
+python -m miner.submit commit --ckpt ./my-model --tier sub2 \
+    --uri hf://you/your-repo@<commit-sha> --wallet <wallet> --hotkey <hotkey>   # add --dry-run first
+# 2. publish the artifact (flip it public if you uploaded private), then, once the round opens:
+python -m miner.submit reveal --ckpt ./my-model --wallet <wallet> --hotkey <hotkey>
+```
+
+`commit` writes the salt to `my-model.ralph-submission.json` beside the checkpoint — keep it; no
+salt, no reveal, no score. A commitment slot holds 384 bytes (three 128-byte fields), and the
+reveal is the bigger write, so `commit` sizes the reveal first and refuses a `--uri` that would not
+fit. Both commands accept `--dry-run`, which prints exactly what would go on chain.
+
+## Package and submit
 
 ```python
 from miner.package import build_submission
 import secrets
 
 sub = build_submission(
-    ckpt_dir="path/to/your/compressed/model",   # safetensors or .gguf + config/tokenizer
-    tier="ternary",                              # binary | ternary | sub2 | sub4
-    teacher_pair="qwen3-8b",                     # the pinned parent (Qwen/Qwen3-8B)
+    ckpt_dir="path/to/your/compressed/model",
+    tier="ternary",                         # binary | ternary | sub2 | sub4
+    teacher_pair="qwen3-8b",
     student_base="Qwen/Qwen3-8B",
     declared_compute_h100h=42.0,
-    salt=secrets.token_hex(16),                  # keep secret until reveal
+    salt=secrets.token_hex(16),             # keep secret until reveal
 )
-# 1) commit sub["commit_value"] on-chain BEFORE the round's nonce is drawn
-# 2) publish the checkpoint and note its artifact_uri
-# 3) after the round opens, reveal sub["reveal"] = {content_hash, salt}
+
+# 1) Commit sub["commit_value"] before the round nonce exists   (`miner.submit commit` does this)
+# 2) Publish the exact checkpoint and record an immutable artifact_uri.
+# 3) Reveal sub["reveal"] after the round opens                   (`miner.submit reveal`)
 ```
 
-**The order of 1 and 2 is protection, not pedantry.** A commitment binds bytes, not authorship:
-anyone can hash a *public* artifact and seal a commitment to it, and duplicate reveals are settled
-first-commit-wins — so an artifact that sits public before your commitment lands is, for that
-window, up for grabs by whoever commits it faster. Commit first, or upload to a **private** repo,
-commit, and only then flip it public: a private upload cannot be hashed by anyone else, so the
-race disappears. (Salt discipline is the same idea at reveal time: the salt stays secret until
-you reveal, or your sealed value can be replayed.)
+`build_submission` writes `manifest.json`, runs the validator's own inspector, and hashes the full
+directory. That means the correct hash is the hash of what the validator will fetch, not an earlier
+local file. Download your published immutable revision into a clean directory and verify it before
+you commit.
 
-`build_submission` runs the validator's own inspector, so an artifact that would fail intake
-tells you immediately rather than at scoring time.
+Commit before making the artifact public. Duplicate content is first-commit-wins, so publishing the
+bytes first gives someone else a chance to commit the same hash. A private upload can be made public
+after your commitment lands; keep the salt secret until reveal.
 
-## Winning strategy, honestly
+## Start from a crown
 
-The moat is compression quality at a fixed bit budget — nothing else is paid for. Two places the
-incumbent is measurably weak, and where a downloaded artifact loses:
+All four tiers had crowns after Round 7. The mirrored files and their provenance are in
+[`RalphLabsAI/ralph-crowns`](https://huggingface.co/RalphLabsAI/ralph-crowns). Reusing a crown as a
+starting point is allowed, but serving identical bytes cannot win; the same artifact has a zero
+paired lead and previously scored content is skipped.
 
-- **Non-Latin languages.** Independent testing puts 1-bit Bonsai at 45.2% on Persian against
-  79.8% for a conventional 4-bit build, while English holds at 97–100%. Multilingual is its own
-  scored slice here, so it cannot be averaged away.
-- **Long-horizon, multi-step work**, where compression damage compounds.
+## Status snapshot
 
-## Status
-
-The subnet has not run on mainnet, and the scoring stack has not yet had a run against real
-models on a GPU. Read the "Not yet done" section of the top-level README before treating any of
-this as live.
+As of **2026-09-11**, seven real-model rounds are public, signed, hash-chained, and anchored in
+[`RalphLabsAI/ralph-v2-rounds`](https://huggingface.co/datasets/RalphLabsAI/ralph-v2-rounds). Round 7
+was the first round scored by all three judges: `binary`, `sub2`, and `sub4` changed hands, while
+`ternary` held on the floor rule. A public chain snapshot after the round showed six later
+submissions waiting for a future score; the count is point-in-time and does not imply intake
+acceptance or a schedule.
